@@ -270,6 +270,7 @@ fn object_references(object: &Obj) -> Vec<ObjRef> {
             .flat_map(|(key, value)| [key.as_obj_ref(), value.as_obj_ref()])
             .flatten()
             .collect(),
+        Obj::Upvalue(value) => value.as_obj_ref().into_iter().collect(),
         Obj::Closure { captures, .. } => captures.iter().filter_map(Value::as_obj_ref).collect(),
         Obj::String(_) | Obj::Function(_) | Obj::NativeFunction(_) | Obj::Module(_) => Vec::new(),
     }
