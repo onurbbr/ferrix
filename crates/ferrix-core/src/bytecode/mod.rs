@@ -15,14 +15,23 @@ pub mod verifier;
 pub use chunk::{Chunk, ChunkBuildError};
 pub use disassembler::{Disassembler, format_instruction};
 pub use format::{
-    BYTECODE_MAGIC, BytecodeFormat, BytecodeLimits, CURRENT_BYTECODE_VERSION, NO_FEATURE_FLAGS,
+    BYTECODE_CONTAINER_MAGIC, BYTECODE_MAGIC, BytecodeFeature, BytecodeFormat, BytecodeLimits,
+    CURRENT_BYTECODE_VERSION, CURRENT_CONTAINER_VERSION, FEATURE_ARRAYS, FEATURE_CLOSURES,
+    FEATURE_CUSTOM_EXTENSIONS, FEATURE_DEBUG_SYMBOLS, FEATURE_EXCEPTIONS, FEATURE_MAPS,
+    FEATURE_MODULES, FEATURE_NATIVE_CALLS, FEATURE_OPTIMIZED_INT_OPS, FEATURE_RECORDS,
+    NO_FEATURE_FLAGS, SUPPORTED_BYTECODE_FEATURE_FLAGS, bytecode_features,
+    infer_program_feature_flags, unsupported_feature_flags,
 };
 pub use instruction::{
     CaptureId, ConstId, FunctionId, Instruction, JumpTarget, Register, StringId,
 };
 pub use optimizer::optimize_chunk;
 pub use program::{Function, FunctionKind, Program, ProgramBuildError};
-pub use serialization::{BytecodeDecodeError, BytecodeEncodeError, decode_program, encode_program};
+pub use serialization::{
+    BytecodeContainer, BytecodeContainerMetadata, BytecodeDecodeError, BytecodeEncodeError,
+    BytecodeSectionEntry, BytecodeSectionKind, decode_bytecode, decode_container, decode_program,
+    encode_container, encode_program, inspect_container,
+};
 pub use verifier::{
     ProgramVerifier, StructuralVerifier, VerificationError, VerificationErrorKind, VerifiedChunk,
     VerifiedProgram,
