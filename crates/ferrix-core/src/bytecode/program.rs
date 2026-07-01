@@ -25,6 +25,8 @@ pub struct Function {
     pub arity: u8,
     /// Register count required by this function.
     pub register_count: u8,
+    /// Captured values required by this function.
+    pub capture_count: u8,
     /// Bytecode or native implementation kind.
     pub kind: FunctionKind,
 }
@@ -88,6 +90,7 @@ impl Function {
             name: chunk.name.clone(),
             arity: chunk.arity,
             register_count: chunk.register_count,
+            capture_count: chunk.capture_count,
             kind: FunctionKind::Bytecode(chunk),
         }
     }
@@ -99,6 +102,7 @@ impl Function {
             name: name.clone(),
             arity,
             register_count: arity,
+            capture_count: 0,
             kind: FunctionKind::Native { name },
         }
     }
