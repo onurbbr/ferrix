@@ -181,6 +181,79 @@ fn assignment_type_mismatch_is_compile_error() {
 }
 
 #[test]
+fn annotated_let_type_mismatch_is_compile_error() {
+    let err = compile_source_with_file_id("let value: int = false;\nreturn value;\n", FileId(0))
+        .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "int".to_string(),
+            found: "bool".to_string(),
+        }
+    );
+}
+
+#[test]
+fn annotated_function_argument_mismatch_is_compile_error() {
+    let err = compile_source_with_file_id(
+        "\
+fn id(value: int): int {
+    return value;
+}
+
+return id(false);
+",
+        FileId(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "int".to_string(),
+            found: "bool".to_string(),
+        }
+    );
+}
+
+#[test]
+fn annotated_function_return_mismatch_is_compile_error() {
+    let err = compile_source_with_file_id(
+        "\
+fn bad(): int {
+    return false;
+}
+
+return bad();
+",
+        FileId(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "int".to_string(),
+            found: "bool".to_string(),
+        }
+    );
+}
+
+#[test]
+fn unknown_type_annotation_is_compile_error() {
+    let err = compile_source_with_file_id("let value: integer = 1;\nreturn value;\n", FileId(0))
+        .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::UnknownType {
+            name: "integer".to_string(),
+        }
+    );
+}
+
+#[test]
 fn array_index_type_mismatch_is_compile_error() {
     let err =
         compile_source_with_file_id("let values = [1, 2];\nreturn values[false];\n", FileId(0))
