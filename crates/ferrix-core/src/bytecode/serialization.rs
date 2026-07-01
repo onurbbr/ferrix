@@ -233,6 +233,21 @@ impl Encoder {
                 self.reg(*args_start);
                 self.u8(*arg_count);
             }
+            Instruction::MakeUpvalue { dst, src } => {
+                self.u8(28);
+                self.reg(*dst);
+                self.reg(*src);
+            }
+            Instruction::LoadUpvalue { dst, upvalue } => {
+                self.u8(29);
+                self.reg(*dst);
+                self.reg(*upvalue);
+            }
+            Instruction::StoreUpvalue { upvalue, src } => {
+                self.u8(30);
+                self.reg(*upvalue);
+                self.reg(*src);
+            }
             Instruction::MakeClosure {
                 dst,
                 function,
@@ -249,6 +264,16 @@ impl Encoder {
                 self.u8(26);
                 self.reg(*dst);
                 self.u8(capture.0);
+            }
+            Instruction::LoadCaptureCell { dst, capture } => {
+                self.u8(31);
+                self.reg(*dst);
+                self.u8(capture.0);
+            }
+            Instruction::StoreCapture { capture, src } => {
+                self.u8(32);
+                self.u8(capture.0);
+                self.reg(*src);
             }
             Instruction::CallValue {
                 dst,
@@ -519,6 +544,18 @@ impl Decoder<'_> {
                 args_start: self.reg()?,
                 arg_count: self.u8()?,
             },
+            28 => Instruction::MakeUpvalue {
+                dst: self.reg()?,
+                src: self.reg()?,
+            },
+            29 => Instruction::LoadUpvalue {
+                dst: self.reg()?,
+                upvalue: self.reg()?,
+            },
+            30 => Instruction::StoreUpvalue {
+                upvalue: self.reg()?,
+                src: self.reg()?,
+            },
             25 => Instruction::MakeClosure {
                 dst: self.reg()?,
                 function: FunctionId(self.u16()?),
@@ -528,6 +565,14 @@ impl Decoder<'_> {
             26 => Instruction::LoadCapture {
                 dst: self.reg()?,
                 capture: crate::bytecode::CaptureId(self.u8()?),
+            },
+            31 => Instruction::LoadCaptureCell {
+                dst: self.reg()?,
+                capture: crate::bytecode::CaptureId(self.u8()?),
+            },
+            32 => Instruction::StoreCapture {
+                capture: crate::bytecode::CaptureId(self.u8()?),
+                src: self.reg()?,
             },
             27 => Instruction::CallValue {
                 dst: self.reg()?,
