@@ -17,9 +17,9 @@ use ferrix_compiler::{
 use ferrix_core::{
     Obj, Value,
     bytecode::{FunctionId, VerifiedProgram, decode_program, encode_program, format_instruction},
-    diagnostics::SourceManager,
+    diagnostics::{SourceLocation, SourceManager},
 };
-use ferrix_vm::{DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
+use ferrix_vm::{CallFrame, DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
 
 const USAGE: &str = "\
 Ferrix
@@ -437,11 +437,14 @@ fn module_key(path: &Path) -> PathBuf {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Breakpoint {
+enum Breakpoint {
     /// Specific function to stop in, or `None` for any function.
-    function: Option<FunctionId>,
-    /// Instruction pointer within the selected function scope.
-    instruction_ip: usize,
+    Instruction {
+        function: Option<FunctionId>,
+        instruction_ip: usize,
+    },
+    /// Source line breakpoint, optionally scoped to a file name/path.
+    SourceLine { file: Option<String>, line: usize },
 }
 
 enum DebugMode {
@@ -462,6 +465,8 @@ where
     sources: &'a SourceManager,
     mode: DebugMode,
     breakpoints: HashSet<Breakpoint>,
+    selected_frame: usize,
+    watches: Vec<String>,
 }
 
 impl<'a, I, W> CliDebugger<'a, I, W>
@@ -476,6 +481,8 @@ where
             sources,
             mode: DebugMode::Step,
             breakpoints: HashSet::new(),
+            selected_frame: 0,
+            watches: Vec::new(),
         }
     }
 
@@ -483,17 +490,49 @@ where
         // Function-scoped breakpoints win when present; global breakpoints are
         // useful for tiny programs where instruction ids are enough.
         matches!(self.mode, DebugMode::Step)
-            || self.breakpoints.contains(&Breakpoint {
+            || self.breakpoints.contains(&Breakpoint::Instruction {
                 function: Some(event.function),
                 instruction_ip: event.instruction_ip,
             })
-            || self.breakpoints.contains(&Breakpoint {
+            || self.breakpoints.contains(&Breakpoint::Instruction {
                 function: None,
                 instruction_ip: event.instruction_ip,
             })
+            || self.matches_source_breakpoint(event)
+    }
+
+    fn matches_source_breakpoint(&self, event: &DebugEvent<'_>) -> bool {
+        let Some((location, line_text_ip)) = self.source_line_hit(event) else {
+            return false;
+        };
+
+        self.breakpoints.iter().any(|breakpoint| {
+            let Breakpoint::SourceLine { file, line } = breakpoint else {
+                return false;
+            };
+            *line == location.line
+                && line_text_ip == event.instruction_ip
+                && file
+                    .as_deref()
+                    .is_none_or(|file| source_file_matches(self.sources, location, file))
+        })
+    }
+
+    fn source_line_hit(&self, event: &DebugEvent<'_>) -> Option<(SourceLocation, usize)> {
+        let location = self.sources.location(event.source_span?)?;
+        let function = event.program.function(event.function)?;
+        let chunk = function.chunk()?;
+        let first_ip = chunk.source_map.iter().enumerate().find_map(|(ip, span)| {
+            let span = span.as_ref().copied()?;
+            let span_location = self.sources.location(span)?;
+            (span_location.file_id == location.file_id && span_location.line == location.line)
+                .then_some(ip)
+        })?;
+        Some((location, first_ip))
     }
 
     fn print_stop(&mut self, event: &DebugEvent<'_>) {
+        self.normalize_selected_frame(event);
         writeln!(
             self.output,
             "stopped at {} {} ip={}: {}",
@@ -521,6 +560,7 @@ where
                 writeln!(self.output, "  | {line}").expect("stdout write failed");
             }
         }
+        self.print_watches(event);
     }
 
     fn command_loop(&mut self, event: &DebugEvent<'_>) -> DebugAction {
@@ -552,12 +592,48 @@ where
                 self.print_registers(event);
                 continue;
             }
-            if matches!(command, "bt" | "stack") {
+            if matches!(command, "bt" | "stack" | "frames") {
                 self.print_stack(event);
+                continue;
+            }
+            if matches!(command, "frame") {
+                self.print_selected_frame(event);
+                continue;
+            }
+            if let Some(spec) = command.strip_prefix("frame ") {
+                self.select_frame(event, spec.trim());
                 continue;
             }
             if matches!(command, "i" | "instruction") {
                 self.print_stop(event);
+                continue;
+            }
+            if matches!(command, "disasm" | "disassemble" | "u") {
+                self.print_disassembly(event, 2);
+                continue;
+            }
+            if let Some(spec) = command
+                .strip_prefix("disasm ")
+                .or_else(|| command.strip_prefix("disassemble "))
+                .or_else(|| command.strip_prefix("u "))
+            {
+                let radius = spec.trim().parse().unwrap_or(2);
+                self.print_disassembly(event, radius);
+                continue;
+            }
+            if let Some(expr) = command.strip_prefix("watch ") {
+                self.add_watch(event, expr.trim());
+                continue;
+            }
+            if matches!(command, "watches" | "watch") {
+                self.print_watches(event);
+                continue;
+            }
+            if let Some(spec) = command
+                .strip_prefix("unwatch ")
+                .or_else(|| command.strip_prefix("uw "))
+            {
+                self.remove_watch(spec.trim());
                 continue;
             }
             if matches!(command, "h" | "help") {
@@ -590,12 +666,25 @@ where
     }
 
     fn print_registers(&mut self, event: &DebugEvent<'_>) {
-        if event.registers.is_empty() {
+        let Some(frame) = self.selected_frame_view(event) else {
+            writeln!(self.output, "frame #{} is unavailable", self.selected_frame)
+                .expect("stdout write failed");
+            return;
+        };
+
+        writeln!(
+            self.output,
+            "registers for frame #{} {} ({}, ip={})",
+            self.selected_frame, frame.name, frame.function, frame.ip
+        )
+        .expect("stdout write failed");
+
+        if frame.registers.is_empty() {
             writeln!(self.output, "registers: <empty>").expect("stdout write failed");
             return;
         }
 
-        for (index, value) in event.registers.iter().copied().enumerate() {
+        for (index, value) in frame.registers.iter().copied().enumerate() {
             writeln!(
                 self.output,
                 "r{index} = {}",
@@ -606,16 +695,182 @@ where
     }
 
     fn print_stack(&mut self, event: &DebugEvent<'_>) {
-        for frame in event.frames.iter().rev() {
-            let name = event
-                .program
-                .function(frame.function_id)
-                .map(|function| function.name.as_str())
-                .unwrap_or("<unknown>");
+        self.normalize_selected_frame(event);
+        for (index, frame) in event.frames.iter().rev().enumerate() {
+            let view = self.frame_view(event, index, frame);
+            let selected = if index == self.selected_frame {
+                " *"
+            } else {
+                ""
+            };
             writeln!(
                 self.output,
-                "at {name} ({}, ip={})",
-                frame.function_id, frame.ip
+                "#{index}{selected} at {} ({}, ip={})",
+                view.name, view.function, view.ip
+            )
+            .expect("stdout write failed");
+        }
+    }
+
+    fn print_selected_frame(&mut self, event: &DebugEvent<'_>) {
+        self.normalize_selected_frame(event);
+        let Some(frame) = self.selected_frame_view(event) else {
+            writeln!(self.output, "frame #{} is unavailable", self.selected_frame)
+                .expect("stdout write failed");
+            return;
+        };
+
+        writeln!(
+            self.output,
+            "selected frame #{} at {} ({}, ip={})",
+            self.selected_frame, frame.name, frame.function, frame.ip
+        )
+        .expect("stdout write failed");
+    }
+
+    fn select_frame(&mut self, event: &DebugEvent<'_>, spec: &str) {
+        let Ok(index) = spec.parse::<usize>() else {
+            writeln!(self.output, "invalid frame `{spec}`").expect("stdout write failed");
+            return;
+        };
+
+        if index >= event.frames.len() {
+            writeln!(
+                self.output,
+                "frame #{index} is unavailable; stack has {} frame(s)",
+                event.frames.len()
+            )
+            .expect("stdout write failed");
+            return;
+        }
+
+        self.selected_frame = index;
+        self.print_selected_frame(event);
+    }
+
+    fn add_watch(&mut self, event: &DebugEvent<'_>, expr: &str) {
+        if expr.is_empty() {
+            writeln!(self.output, "watch expression is empty").expect("stdout write failed");
+            return;
+        }
+
+        self.watches.push(expr.to_string());
+        let index = self.watches.len() - 1;
+        match self.evaluate_watch(event, expr) {
+            Ok(value) => writeln!(
+                self.output,
+                "watch #{index}: {expr} = {}",
+                display_heap_value(event.heap, value)
+            ),
+            Err(error) => writeln!(self.output, "watch #{index}: {expr} ({error})"),
+        }
+        .expect("stdout write failed");
+    }
+
+    fn remove_watch(&mut self, spec: &str) {
+        let Ok(index) = spec.parse::<usize>() else {
+            writeln!(self.output, "invalid watch `{spec}`").expect("stdout write failed");
+            return;
+        };
+
+        if index >= self.watches.len() {
+            writeln!(self.output, "watch #{index} is unavailable").expect("stdout write failed");
+            return;
+        }
+
+        let expr = self.watches.remove(index);
+        writeln!(self.output, "removed watch #{index}: {expr}").expect("stdout write failed");
+    }
+
+    fn print_watches(&mut self, event: &DebugEvent<'_>) {
+        for (index, expr) in self.watches.iter().enumerate() {
+            match self.evaluate_watch(event, expr) {
+                Ok(value) => writeln!(
+                    self.output,
+                    "watch #{index}: {expr} = {}",
+                    display_heap_value(event.heap, value)
+                ),
+                Err(error) => writeln!(self.output, "watch #{index}: {expr} ({error})"),
+            }
+            .expect("stdout write failed");
+        }
+    }
+
+    fn evaluate_watch(&self, event: &DebugEvent<'_>, expr: &str) -> Result<Value, String> {
+        let frame = self
+            .selected_frame_view(event)
+            .ok_or_else(|| format!("frame #{} is unavailable", self.selected_frame))?;
+
+        if let Some(register) = parse_register(expr) {
+            return frame
+                .registers
+                .get(register)
+                .copied()
+                .ok_or_else(|| format!("register r{register} is unavailable"));
+        }
+
+        let function = event
+            .program
+            .function(frame.function)
+            .ok_or_else(|| format!("function {} is unavailable", frame.function))?;
+        let chunk = function
+            .chunk()
+            .ok_or_else(|| format!("{} is native and has no locals", frame.function))?;
+        let Some((register, _)) = chunk
+            .debug_local_names
+            .iter()
+            .enumerate()
+            .find(|(_, name)| name.as_deref() == Some(expr))
+        else {
+            return Err(format!("unknown watch expression `{expr}`"));
+        };
+
+        frame
+            .registers
+            .get(register)
+            .copied()
+            .ok_or_else(|| format!("local `{expr}` is unavailable"))
+    }
+
+    fn print_disassembly(&mut self, event: &DebugEvent<'_>, radius: usize) {
+        let Some(frame) = self.selected_frame_view(event) else {
+            writeln!(self.output, "frame #{} is unavailable", self.selected_frame)
+                .expect("stdout write failed");
+            return;
+        };
+        let Some(function) = event.program.function(frame.function) else {
+            writeln!(self.output, "function {} is unavailable", frame.function)
+                .expect("stdout write failed");
+            return;
+        };
+        let Some(chunk) = function.chunk() else {
+            writeln!(
+                self.output,
+                "{} is native and has no bytecode",
+                frame.function
+            )
+            .expect("stdout write failed");
+            return;
+        };
+
+        let start = frame.ip.saturating_sub(radius);
+        let end = frame
+            .ip
+            .saturating_add(radius)
+            .saturating_add(1)
+            .min(chunk.instructions.len());
+        writeln!(
+            self.output,
+            "disassembly for frame #{} {} ({}, ip={})",
+            self.selected_frame, frame.name, frame.function, frame.ip
+        )
+        .expect("stdout write failed");
+        for ip in start..end {
+            let marker = if ip == frame.ip { "=>" } else { "  " };
+            writeln!(
+                self.output,
+                "{marker} {ip:04} {}",
+                format_instruction(&chunk.instructions[ip])
             )
             .expect("stdout write failed");
         }
@@ -630,9 +885,16 @@ commands:
   continue | c          run until program end or breakpoint
   break <ip>            stop at instruction ip in any function
   break <fn>:<ip>       stop at instruction ip in function id or name
+  break line <line>     stop at source line in any file
+  break <file>:<line>   stop at source line in a file/path
   clear [breakpoint]    clear one breakpoint or all breakpoints
-  registers | r         print current registers
-  stack | bt            print call stack
+  registers | r         print selected-frame registers
+  stack | bt | frames   print call stack
+  frame [index]         select or print the inspected frame
+  watch <expr>          watch register rN or a debug local name
+  watches               print watch expressions
+  unwatch <index>       remove a watch expression
+  disasm [radius]       print bytecode around selected frame
   instruction | i       print current instruction
   quit | q              stop debugging"
         )
@@ -661,19 +923,70 @@ commands:
     }
 
     fn print_breakpoint(&mut self, prefix: &str, breakpoint: &Breakpoint) {
-        match breakpoint.function {
-            Some(function) => writeln!(
+        match breakpoint {
+            Breakpoint::Instruction {
+                function: Some(function),
+                instruction_ip,
+            } => writeln!(
                 self.output,
-                "{prefix} breakpoint at {function}:{}",
-                breakpoint.instruction_ip
+                "{prefix} breakpoint at {function}:{instruction_ip}"
             ),
-            None => writeln!(
-                self.output,
-                "{prefix} breakpoint at ip={}",
-                breakpoint.instruction_ip
-            ),
+            Breakpoint::Instruction {
+                function: None,
+                instruction_ip,
+            } => writeln!(self.output, "{prefix} breakpoint at ip={instruction_ip}"),
+            Breakpoint::SourceLine {
+                file: Some(file),
+                line,
+            } => writeln!(self.output, "{prefix} breakpoint at {file}:{line}"),
+            Breakpoint::SourceLine { file: None, line } => {
+                writeln!(self.output, "{prefix} breakpoint at line {line}")
+            }
         }
         .expect("stdout write failed");
+    }
+
+    fn normalize_selected_frame(&mut self, event: &DebugEvent<'_>) {
+        if self.selected_frame >= event.frames.len() {
+            self.selected_frame = 0;
+        }
+    }
+
+    fn selected_frame_view<'event>(
+        &self,
+        event: &'event DebugEvent<'_>,
+    ) -> Option<FrameView<'event>> {
+        let frame = event.frames.iter().rev().nth(self.selected_frame)?;
+        Some(self.frame_view(event, self.selected_frame, frame))
+    }
+
+    fn frame_view<'event>(
+        &self,
+        event: &'event DebugEvent<'_>,
+        index: usize,
+        frame: &'event CallFrame,
+    ) -> FrameView<'event> {
+        let function = event.program.function(frame.function_id);
+        let name = function
+            .map(|function| function.name.as_str())
+            .unwrap_or("<unknown>");
+        let registers = if index == 0 {
+            event.registers
+        } else {
+            &frame.registers
+        };
+        let ip = if index == 0 {
+            event.instruction_ip
+        } else {
+            frame.ip
+        };
+
+        FrameView {
+            name,
+            function: frame.function_id,
+            ip,
+            registers,
+        }
     }
 }
 
@@ -694,17 +1007,58 @@ where
 }
 
 fn parse_breakpoint(event: &DebugEvent<'_>, spec: &str) -> Option<Breakpoint> {
-    if let Some((function, ip)) = spec.split_once(':') {
-        return Some(Breakpoint {
-            function: Some(parse_function(event, function.trim())?),
-            instruction_ip: ip.trim().parse().ok()?,
+    if let Some(line) = spec.strip_prefix("line ") {
+        return Some(Breakpoint::SourceLine {
+            file: None,
+            line: line.trim().parse().ok()?,
         });
     }
 
-    Some(Breakpoint {
+    if let Some((function, ip)) = spec.split_once(':') {
+        let target = function.trim();
+        let ip_or_line = ip.trim().parse().ok()?;
+        if let Some(function) = parse_function(event, target) {
+            return Some(Breakpoint::Instruction {
+                function: Some(function),
+                instruction_ip: ip_or_line,
+            });
+        }
+
+        return Some(Breakpoint::SourceLine {
+            file: Some(target.to_string()),
+            line: ip_or_line,
+        });
+    }
+
+    Some(Breakpoint::Instruction {
         function: None,
         instruction_ip: spec.parse().ok()?,
     })
+}
+
+struct FrameView<'a> {
+    name: &'a str,
+    function: FunctionId,
+    ip: usize,
+    registers: &'a [Value],
+}
+
+fn parse_register(expr: &str) -> Option<usize> {
+    expr.strip_prefix('r')?.parse().ok()
+}
+
+fn source_file_matches(sources: &SourceManager, location: SourceLocation, spec: &str) -> bool {
+    let Some(file) = sources.file(location.file_id) else {
+        return false;
+    };
+    if file.name == spec || file.name.ends_with(spec) {
+        return true;
+    }
+
+    Path::new(&file.name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == spec)
 }
 
 fn parse_function(event: &DebugEvent<'_>, spec: &str) -> Option<FunctionId> {
