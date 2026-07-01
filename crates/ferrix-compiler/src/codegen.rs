@@ -97,6 +97,7 @@ struct Codegen {
     captures: HashMap<String, CaptureId>,
     functions: HashMap<String, FunctionId>,
     next_register: u16,
+    free_registers: Vec<Register>,
     next_function_id: u16,
     generated_functions: Vec<(FunctionId, Function)>,
 }
@@ -116,6 +117,7 @@ impl Codegen {
             captures: HashMap::new(),
             functions,
             next_register: 0,
+            free_registers: Vec::new(),
             next_function_id,
             generated_functions: Vec::new(),
         }
@@ -145,6 +147,7 @@ impl Codegen {
             captures: HashMap::new(),
             functions,
             next_register: params.len() as u16,
+            free_registers: Vec::new(),
             next_function_id,
             generated_functions: Vec::new(),
         };
@@ -361,6 +364,9 @@ impl Codegen {
                     },
                     Some(*span),
                 );
+                self.release_register_if_temporary(target);
+                self.release_register_if_temporary(index);
+                self.release_register_if_temporary(value);
                 Ok(())
             }
             Stmt::FieldAssign {
@@ -383,6 +389,8 @@ impl Codegen {
                     },
                     Some(*span),
                 );
+                self.release_register_if_temporary(target);
+                self.release_register_if_temporary(value);
                 Ok(())
             }
             Stmt::Return { value, span } => {
@@ -398,7 +406,8 @@ impl Codegen {
                 Ok(())
             }
             Stmt::Expr { value, .. } => {
-                self.compile_expr(value)?;
+                let register = self.compile_expr(value)?;
+                self.release_register_if_temporary(register);
                 Ok(())
             }
             Stmt::TryCatch {
@@ -655,6 +664,12 @@ impl Codegen {
                 };
                 self.chunk
                     .push_instruction_with_span(instruction, Some(*span));
+                if lhs_register != dst {
+                    self.release_register_if_temporary(lhs_register);
+                }
+                if rhs_register != dst && rhs_register != lhs_register {
+                    self.release_register_if_temporary(rhs_register);
+                }
                 Ok(())
             }
             Expr::Array { elements, span } => self.compile_array_into(elements, dst, *span),
@@ -671,6 +686,12 @@ impl Codegen {
                     Instruction::IndexGet { dst, target, index },
                     Some(*span),
                 );
+                if target != dst {
+                    self.release_register_if_temporary(target);
+                }
+                if index != dst && index != target {
+                    self.release_register_if_temporary(index);
+                }
                 Ok(())
             }
             Expr::Field {
@@ -693,6 +714,9 @@ impl Codegen {
                     Instruction::FieldGet { dst, target, field },
                     Some(*span),
                 );
+                if target != dst {
+                    self.release_register_if_temporary(target);
+                }
                 Ok(())
             }
             Expr::Call { callee, args, span } => self.compile_call_into(callee, args, dst, *span),
@@ -721,13 +745,10 @@ impl Codegen {
         let elements_start = if elements.is_empty() {
             Register(0)
         } else {
-            let start = self.alloc_register()?;
-            let mut element_registers = vec![start];
-            for _ in elements.iter().skip(1) {
-                element_registers.push(self.alloc_register()?);
-            }
+            let start = self.alloc_register_range(elements.len())?;
+            let element_registers = register_range(start, elements.len())?;
 
-            for (element, register) in elements.iter().zip(element_registers) {
+            for (element, register) in elements.iter().zip(element_registers.iter().copied()) {
                 self.compile_expr_into(element, register)?;
             }
             start
@@ -741,6 +762,7 @@ impl Codegen {
             },
             Some(span),
         );
+        self.release_register_range(elements_start, elements.len());
         Ok(())
     }
 
@@ -762,11 +784,8 @@ impl Codegen {
         let entries_start = if entries.is_empty() {
             Register(0)
         } else {
-            let start = self.alloc_register()?;
-            let mut entry_registers = vec![start];
-            for _ in 1..entries.len() * 2 {
-                entry_registers.push(self.alloc_register()?);
-            }
+            let start = self.alloc_register_range(entries.len().saturating_mul(2))?;
+            let entry_registers = register_range(start, entries.len().saturating_mul(2))?;
 
             for ((key, value), registers) in entries.iter().zip(entry_registers.chunks_exact(2)) {
                 self.compile_expr_into(key, registers[0])?;
@@ -783,6 +802,7 @@ impl Codegen {
             },
             Some(span),
         );
+        self.release_register_range(entries_start, entries.len().saturating_mul(2));
         Ok(())
     }
 
@@ -812,13 +832,10 @@ impl Codegen {
         let fields_start = if fields.is_empty() {
             Register(0)
         } else {
-            let start = self.alloc_register()?;
-            let mut field_registers = vec![start];
-            for _ in fields.iter().skip(1) {
-                field_registers.push(self.alloc_register()?);
-            }
+            let start = self.alloc_register_range(fields.len())?;
+            let field_registers = register_range(start, fields.len())?;
 
-            for ((_, value), register) in fields.iter().zip(field_registers) {
+            for ((_, value), register) in fields.iter().zip(field_registers.iter().copied()) {
                 self.compile_expr_into(value, register)?;
             }
             start
@@ -832,6 +849,7 @@ impl Codegen {
             },
             Some(span),
         );
+        self.release_register_range(fields_start, fields.len());
         Ok(())
     }
 
@@ -853,13 +871,10 @@ impl Codegen {
         let args_start = if args.is_empty() {
             Register(0)
         } else {
-            let start = self.alloc_register()?;
-            let mut arg_registers = vec![start];
-            for _ in args.iter().skip(1) {
-                arg_registers.push(self.alloc_register()?);
-            }
+            let start = self.alloc_register_range(args.len())?;
+            let arg_registers = register_range(start, args.len())?;
 
-            for (arg, register) in args.iter().zip(arg_registers) {
+            for (arg, register) in args.iter().zip(arg_registers.iter().copied()) {
                 self.compile_expr_into(arg, register)?;
             }
             start
@@ -879,6 +894,7 @@ impl Codegen {
                 },
                 Some(span),
             );
+            self.release_register_if_temporary(callee);
         } else if let Some(function) = self.functions.get(callee).copied() {
             self.chunk.push_instruction_with_span(
                 Instruction::CallFunction {
@@ -903,7 +919,9 @@ impl Codegen {
                 },
                 Some(span),
             );
+            self.release_register_if_temporary(callee);
         }
+        self.release_register_range(args_start, args.len());
         Ok(())
     }
 
@@ -946,12 +964,9 @@ impl Codegen {
         let captures_start = if captures.is_empty() {
             Register(0)
         } else {
-            let start = self.alloc_register()?;
-            let mut capture_registers = vec![start];
-            for _ in captures.iter().skip(1) {
-                capture_registers.push(self.alloc_register()?);
-            }
-            for (name, register) in captures.iter().zip(capture_registers) {
+            let start = self.alloc_register_range(captures.len())?;
+            let capture_registers = register_range(start, captures.len())?;
+            for (name, register) in captures.iter().zip(capture_registers.iter().copied()) {
                 if let Some(local) = self.lookup_local(name) {
                     if self.boxed_locals.contains(name) {
                         if local != register {
@@ -994,14 +1009,69 @@ impl Codegen {
             },
             Some(span),
         );
+        self.release_register_range(captures_start, captures.len());
         Ok(())
     }
 
     fn alloc_register(&mut self) -> Result<Register, CompileError> {
+        if let Some(register) = self.free_registers.pop() {
+            return Ok(register);
+        }
+
         let register = u8::try_from(self.next_register)
             .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
         self.next_register += 1;
         Ok(Register(register))
+    }
+
+    fn alloc_register_range(&mut self, count: usize) -> Result<Register, CompileError> {
+        if count == 0 {
+            return Ok(Register(0));
+        }
+
+        if count == 1 {
+            return self.alloc_register();
+        }
+
+        let start = self.next_register;
+        let count = u16::try_from(count)
+            .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
+        let next_register = self
+            .next_register
+            .checked_add(count)
+            .ok_or_else(|| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
+        if next_register > u16::from(u8::MAX) + 1 {
+            return Err(CompileError::new(CompileErrorKind::TooManyRegisters, None));
+        }
+
+        self.next_register = next_register;
+        Ok(Register(start as u8))
+    }
+
+    fn release_register_range(&mut self, start: Register, count: usize) {
+        for offset in 0..count {
+            let Some(register) = u8::try_from(offset)
+                .ok()
+                .and_then(|offset| start.0.checked_add(offset))
+                .map(Register)
+            else {
+                break;
+            };
+            self.release_register_if_temporary(register);
+        }
+    }
+
+    fn release_register_if_temporary(&mut self, register: Register) {
+        if self.is_register_bound(register) || self.free_registers.contains(&register) {
+            return;
+        }
+        self.free_registers.push(register);
+    }
+
+    fn is_register_bound(&self, register: Register) -> bool {
+        self.locals
+            .values()
+            .any(|bindings| bindings.contains(&register))
     }
 
     fn lookup_local(&self, name: &str) -> Option<Register> {
@@ -1028,14 +1098,22 @@ impl Codegen {
             .scopes
             .pop()
             .expect("codegen always has an active scope");
+        let mut released = Vec::new();
 
         for name in names.into_iter().rev() {
             if let Some(bindings) = self.locals.get_mut(&name) {
-                bindings.pop();
+                let register = bindings.pop();
                 if bindings.is_empty() {
                     self.locals.remove(&name);
                 }
+                if let Some(register) = register {
+                    released.push(register);
+                }
             }
+        }
+
+        for register in released {
+            self.release_register_if_temporary(register);
         }
     }
 
@@ -1610,6 +1688,20 @@ fn namespaced_field_name(target: &Expr, field: &str) -> Option<String> {
         return None;
     };
     Some(format!("{name}.{field}"))
+}
+
+fn register_range(start: Register, count: usize) -> Result<Vec<Register>, CompileError> {
+    (0..count)
+        .map(|offset| {
+            let offset = u8::try_from(offset)
+                .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
+            start
+                .0
+                .checked_add(offset)
+                .map(Register)
+                .ok_or_else(|| CompileError::new(CompileErrorKind::TooManyRegisters, None))
+        })
+        .collect()
 }
 
 fn map_program_error(error: ProgramBuildError) -> CompileError {
