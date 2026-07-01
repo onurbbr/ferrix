@@ -5,8 +5,8 @@ use ferrix_core::{
     bytecode::{
         BytecodeContainerMetadata, BytecodeDecodeError, BytecodeSectionKind, CaptureId, Chunk,
         FEATURE_CUSTOM_EXTENSIONS, FEATURE_NATIVE_CALLS, Function, FunctionId, Instruction,
-        JumpTarget, Program, Register, VerifiedProgram, decode_bytecode, decode_container,
-        decode_program, encode_container, encode_program, inspect_container,
+        JumpTarget, Program, Register, StringId, VerifiedProgram, decode_bytecode,
+        decode_container, decode_program, encode_container, encode_program, inspect_container,
     },
 };
 
@@ -115,6 +115,45 @@ fn bytecode_container_preserves_declared_feature_flags() {
 
     assert!(metadata.feature_flags & FEATURE_CUSTOM_EXTENSIONS != 0);
     assert!(metadata.feature_flags & FEATURE_NATIVE_CALLS != 0);
+}
+
+#[test]
+fn bytecode_program_roundtrips_custom_extension_instruction() {
+    let mut main = Chunk::new("main", 2);
+    let extension = main.add_string("math.double").unwrap();
+    let value = main.add_constant(Value::Int(21)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: value,
+    });
+    main.push_instruction(Instruction::CallExtension {
+        dst: Register(1),
+        extension,
+        args_start: Register(0),
+        arg_count: 1,
+    });
+    main.push_instruction(Instruction::Return { src: Register(1) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let bytes = encode_container(program.as_program(), None).unwrap();
+    let decoded = decode_container(&bytes).unwrap();
+    let metadata = inspect_container(&bytes).unwrap();
+
+    assert_eq!(decoded.program.as_program(), program.as_program());
+    assert!(metadata.feature_flags & FEATURE_CUSTOM_EXTENSIONS != 0);
+    assert!(matches!(
+        decoded.program.as_program().functions[0]
+            .chunk()
+            .unwrap()
+            .instructions[1],
+        Instruction::CallExtension {
+            extension: StringId(0),
+            arg_count: 1,
+            ..
+        }
+    ));
 }
 
 #[test]
