@@ -48,7 +48,7 @@ Compile source to Ferrix bytecode and run it later:
 
 ```sh
 cargo run -p ferrix-cli -- compile path/to/file.fx path/to/file.fxb
-cargo run -p ferrix-cli -- run-bytecode path/to/file.fxb
+cargo run -p ferrix-cli -- run --type bytecode path/to/file.fxb
 ```
 
 Run a source file under the instruction-level debugger:
@@ -74,7 +74,9 @@ quit | q              stop debugging
 Other commands:
 
 ```sh
-cargo run -p ferrix-cli -- --help
+cargo run -p ferrix-cli -- help
+cargo run -p ferrix-cli -- help run
+cargo run -p ferrix-cli -- ps list
 cargo run -p ferrix-cli -- --version
 cargo run -p ferrix-benchmarks --release
 ```
