@@ -1,0 +1,863 @@
+//! Compiler pipeline and bytecode generation for Ferrix source programs.
+//!
+//! Public helpers expose common entry points: parse source, compile a single
+//! AST, or compile an entry file with named imported modules. Internally,
+//! [`Codegen`] lowers AST nodes into register-based bytecode.
+
+use std::collections::HashMap;
+
+use ferrix_core::{
+    Value,
+    bytecode::{
+        Chunk, ChunkBuildError, Function, FunctionId, Instruction, JumpTarget, Program,
+        ProgramBuildError, Register, VerifiedProgram,
+    },
+    diagnostics::FileId,
+};
+
+use crate::{
+    ast::{BinaryOp, Expr, Literal, ProgramAst, Stmt},
+    error::{CompileError, CompileErrorKind},
+    lexer::lex,
+    parser::parse,
+    sema::{analyze, analyze_with_function_aliases},
+};
+
+const BUILTIN_FUNCTIONS: &[(&str, u8)] = &[("print", 1), ("len", 1), ("type_of", 1)];
+
+/// Imported module AST paired with the namespace visible from the entry file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedModuleAst {
+    /// Namespace prefix used by calls such as `math.add(...)`.
+    pub name: String,
+    /// Parsed program for the imported source file.
+    pub ast: ProgramAst,
+}
+
+/// Parses, analyzes, compiles, and verifies a source string using file id `0`.
+pub fn compile_source(source: &str) -> Result<VerifiedProgram, CompileError> {
+    compile_source_with_file_id(source, FileId(0))
+}
+
+/// Parses, analyzes, compiles, and verifies a source string with a source file id.
+pub fn compile_source_with_file_id(
+    source: &str,
+    file_id: FileId,
+) -> Result<VerifiedProgram, CompileError> {
+    let ast = parse_source_with_file_id(source, file_id)?;
+    compile_program_ast(ast)
+}
+
+/// Lexes and parses a source string into an AST with stable source spans.
+pub fn parse_source_with_file_id(
+    source: &str,
+    file_id: FileId,
+) -> Result<ProgramAst, CompileError> {
+    let tokens = lex(source, file_id)?;
+    parse(tokens)
+}
+
+/// Analyzes, compiles, and verifies one AST without external modules.
+pub fn compile_program_ast(program_ast: ProgramAst) -> Result<VerifiedProgram, CompileError> {
+    analyze(&program_ast)?;
+    Codegen::compile_program(program_ast, &[])
+}
+
+/// Compiles an entry AST with anonymous module ASTs linked before codegen.
+pub fn compile_program_ast_with_modules(
+    entry: ProgramAst,
+    modules: Vec<ProgramAst>,
+) -> Result<VerifiedProgram, CompileError> {
+    compile_program_ast_with_aliases(link_modules(entry, modules), Vec::new())
+}
+
+/// Compiles an entry AST with modules exposed through namespace aliases.
+pub fn compile_program_ast_with_named_modules(
+    entry: ProgramAst,
+    modules: Vec<ImportedModuleAst>,
+) -> Result<VerifiedProgram, CompileError> {
+    let (linked, aliases) = link_named_modules(entry, modules);
+    compile_program_ast_with_aliases(linked, aliases)
+}
+
+fn compile_program_ast_with_aliases(
+    program_ast: ProgramAst,
+    aliases: Vec<(String, String)>,
+) -> Result<VerifiedProgram, CompileError> {
+    analyze_with_function_aliases(&program_ast, &aliases)?;
+    Codegen::compile_program(program_ast, &aliases)
+}
+
+struct Codegen {
+    chunk: Chunk,
+    locals: HashMap<String, Register>,
+    functions: HashMap<String, FunctionId>,
+    next_register: u16,
+}
+
+impl Codegen {
+    fn new_main(functions: HashMap<String, FunctionId>) -> Self {
+        Self {
+            chunk: Chunk::new("main", 0),
+            locals: HashMap::new(),
+            functions,
+            next_register: 0,
+        }
+    }
+
+    fn new_function(
+        name: &str,
+        params: &[String],
+        functions: HashMap<String, FunctionId>,
+    ) -> Result<Self, CompileError> {
+        let arity = u8::try_from(params.len()).map_err(|_| {
+            CompileError::new(
+                CompileErrorKind::TooManyParameters {
+                    max: u8::MAX as usize,
+                },
+                None,
+            )
+        })?;
+        let mut locals = HashMap::new();
+        for (index, param) in params.iter().enumerate() {
+            locals.insert(param.clone(), Register(index as u8));
+        }
+
+        Ok(Self {
+            chunk: Chunk::new(name, 0).with_arity(arity),
+            locals,
+            functions,
+            next_register: params.len() as u16,
+        })
+    }
+
+    fn compile_program(
+        program_ast: ProgramAst,
+        aliases: &[(String, String)],
+    ) -> Result<VerifiedProgram, CompileError> {
+        let referenced_builtins = referenced_builtins(&program_ast);
+        let function_ids = function_ids(&program_ast, &referenced_builtins, aliases)?;
+        let main_function_index = program_ast
+            .statements
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Function { .. }))
+            .count()
+            + referenced_builtins.len();
+        let main_id = FunctionId(main_function_index.try_into().map_err(|_| {
+            CompileError::new(
+                CompileErrorKind::TooManyFunctions {
+                    max: u16::MAX as usize,
+                },
+                None,
+            )
+        })?);
+        let mut program = Program::new(main_id);
+
+        for stmt in &program_ast.statements {
+            if let Stmt::Function {
+                name, params, body, ..
+            } = stmt
+            {
+                let mut compiler = Self::new_function(name, params, function_ids.clone())?;
+                compiler.compile_block(body)?;
+                program
+                    .add_function(Function::bytecode(compiler.finish_chunk()?))
+                    .map_err(map_program_error)?;
+            }
+        }
+        for (name, arity) in &referenced_builtins {
+            program
+                .add_function(Function::native(*name, *arity))
+                .map_err(map_program_error)?;
+        }
+
+        let mut main_compiler = Self::new_main(function_ids);
+        for stmt in &program_ast.statements {
+            if !matches!(stmt, Stmt::Function { .. }) {
+                main_compiler.compile_stmt(stmt)?;
+            }
+        }
+        program
+            .add_function(Function::bytecode(main_compiler.finish_chunk()?))
+            .map_err(map_program_error)?;
+
+        VerifiedProgram::new(program)
+            .map_err(|error| CompileError::new(CompileErrorKind::BytecodeVerification(error), None))
+    }
+
+    fn finish_chunk(mut self) -> Result<Chunk, CompileError> {
+        self.chunk.register_count = self
+            .next_register
+            .try_into()
+            .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
+
+        Ok(self.chunk)
+    }
+
+    fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+        match stmt {
+            Stmt::Import { .. } => Ok(()),
+            Stmt::Function { .. } => Ok(()),
+            Stmt::Let {
+                name, initializer, ..
+            } => {
+                let dst = self.alloc_register()?;
+                self.compile_expr_into(initializer, dst)?;
+                self.locals.insert(name.clone(), dst);
+                Ok(())
+            }
+            Stmt::Assign { name, value, span } => {
+                let dst = self.locals.get(name).copied().ok_or_else(|| {
+                    CompileError::new(
+                        CompileErrorKind::UndefinedVariable { name: name.clone() },
+                        Some(*span),
+                    )
+                })?;
+                self.compile_expr_into(value, dst)
+            }
+            Stmt::IndexAssign {
+                target,
+                index,
+                value,
+                span,
+            } => {
+                let target = self.compile_expr(target)?;
+                let index = self.compile_expr(index)?;
+                let value = self.compile_expr(value)?;
+                self.chunk.push_instruction_with_span(
+                    Instruction::IndexSet {
+                        target,
+                        index,
+                        value,
+                    },
+                    Some(*span),
+                );
+                Ok(())
+            }
+            Stmt::Return { value, span } => {
+                let src = self.compile_expr(value)?;
+                self.chunk
+                    .push_instruction_with_span(Instruction::Return { src }, Some(*span));
+                Ok(())
+            }
+            Stmt::Expr { value, .. } => {
+                self.compile_expr(value)?;
+                Ok(())
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                span,
+            } => self.compile_if(condition, then_branch, else_branch, *span),
+            Stmt::While {
+                condition,
+                body,
+                span,
+            } => self.compile_while(condition, body, *span),
+            Stmt::Block { statements, .. } => self.compile_block(statements),
+        }
+    }
+
+    fn compile_block(&mut self, statements: &[Stmt]) -> Result<(), CompileError> {
+        for stmt in statements {
+            self.compile_stmt(stmt)?;
+        }
+
+        Ok(())
+    }
+
+    fn compile_if(
+        &mut self,
+        condition: &Expr,
+        then_branch: &[Stmt],
+        else_branch: &[Stmt],
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        let condition = self.compile_expr(condition)?;
+        let jump_to_else = self.emit_jump_if_false(condition, span)?;
+        self.compile_block(then_branch)?;
+
+        if else_branch.is_empty() {
+            self.patch_jump(jump_to_else, self.current_instruction_index()?)?;
+        } else {
+            let jump_to_end = if statements_definitely_return(then_branch) {
+                None
+            } else {
+                Some(self.emit_jump(span)?)
+            };
+            self.patch_jump(jump_to_else, self.current_instruction_index()?)?;
+            self.compile_block(else_branch)?;
+            if let Some(jump_to_end) = jump_to_end {
+                self.patch_jump(jump_to_end, self.current_instruction_index()?)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compile_while(
+        &mut self,
+        condition: &Expr,
+        body: &[Stmt],
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        let loop_start = self.current_instruction_index()?;
+        let condition = self.compile_expr(condition)?;
+        let jump_to_end = self.emit_jump_if_false(condition, span)?;
+        self.compile_block(body)?;
+        self.chunk.push_instruction_with_span(
+            Instruction::Jump {
+                target: JumpTarget(loop_start),
+            },
+            Some(span),
+        );
+        self.patch_jump(jump_to_end, self.current_instruction_index()?)?;
+        Ok(())
+    }
+
+    fn compile_expr(&mut self, expr: &Expr) -> Result<Register, CompileError> {
+        match expr {
+            Expr::Variable { name, span } => self.locals.get(name).copied().ok_or_else(|| {
+                CompileError::new(
+                    CompileErrorKind::UndefinedVariable { name: name.clone() },
+                    Some(*span),
+                )
+            }),
+            _ => {
+                let dst = self.alloc_register()?;
+                self.compile_expr_into(expr, dst)?;
+                Ok(dst)
+            }
+        }
+    }
+
+    fn compile_expr_into(&mut self, expr: &Expr, dst: Register) -> Result<(), CompileError> {
+        match expr {
+            Expr::Literal { value, span } => {
+                let value = match value {
+                    Literal::Int(value) => Value::Int(*value),
+                    Literal::Bool(value) => Value::Bool(*value),
+                    Literal::Nil => Value::Nil,
+                    Literal::String(value) => {
+                        let string = self
+                            .chunk
+                            .add_string(value.clone())
+                            .map_err(map_chunk_error)?;
+                        self.chunk.push_instruction_with_span(
+                            Instruction::LoadString { dst, string },
+                            Some(*span),
+                        );
+                        return Ok(());
+                    }
+                };
+                let constant = self.chunk.add_constant(value).map_err(map_chunk_error)?;
+                self.chunk.push_instruction_with_span(
+                    Instruction::LoadConst { dst, constant },
+                    Some(*span),
+                );
+                Ok(())
+            }
+            Expr::Variable { name, span } => {
+                let src = self.locals.get(name).copied().ok_or_else(|| {
+                    CompileError::new(
+                        CompileErrorKind::UndefinedVariable { name: name.clone() },
+                        Some(*span),
+                    )
+                })?;
+                if src != dst {
+                    self.chunk
+                        .push_instruction_with_span(Instruction::Move { dst, src }, Some(*span));
+                }
+                Ok(())
+            }
+            Expr::Binary { op, lhs, rhs, span } => {
+                let lhs_register = self.compile_expr(lhs)?;
+                let rhs_register = self.compile_expr(rhs)?;
+                let instruction = match op {
+                    BinaryOp::Add => Instruction::Add {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::Sub => Instruction::Sub {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::Mul => Instruction::Mul {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::Div => Instruction::Div {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::Equal => Instruction::Equal {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::NotEqual => Instruction::NotEqual {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::Less => Instruction::Less {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::LessEqual => Instruction::LessEqual {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::Greater => Instruction::Greater {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    BinaryOp::GreaterEqual => Instruction::GreaterEqual {
+                        dst,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                };
+                self.chunk
+                    .push_instruction_with_span(instruction, Some(*span));
+                Ok(())
+            }
+            Expr::Array { elements, span } => self.compile_array_into(elements, dst, *span),
+            Expr::Map { entries, span } => self.compile_map_into(entries, dst, *span),
+            Expr::Index {
+                target,
+                index,
+                span,
+            } => {
+                let target = self.compile_expr(target)?;
+                let index = self.compile_expr(index)?;
+                self.chunk.push_instruction_with_span(
+                    Instruction::IndexGet { dst, target, index },
+                    Some(*span),
+                );
+                Ok(())
+            }
+            Expr::Call { callee, args, span } => self.compile_call_into(callee, args, dst, *span),
+            Expr::Grouping { expr, .. } => self.compile_expr_into(expr, dst),
+        }
+    }
+
+    fn compile_array_into(
+        &mut self,
+        elements: &[Expr],
+        dst: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        if elements.len() > u8::MAX as usize {
+            return Err(CompileError::new(
+                CompileErrorKind::TooManyArrayElements {
+                    max: u8::MAX as usize,
+                },
+                Some(span),
+            ));
+        }
+
+        let elements_start = if elements.is_empty() {
+            Register(0)
+        } else {
+            let start = self.alloc_register()?;
+            let mut element_registers = vec![start];
+            for _ in elements.iter().skip(1) {
+                element_registers.push(self.alloc_register()?);
+            }
+
+            for (element, register) in elements.iter().zip(element_registers) {
+                self.compile_expr_into(element, register)?;
+            }
+            start
+        };
+
+        self.chunk.push_instruction_with_span(
+            Instruction::ArrayNew {
+                dst,
+                elements_start,
+                element_count: elements.len() as u8,
+            },
+            Some(span),
+        );
+        Ok(())
+    }
+
+    fn compile_map_into(
+        &mut self,
+        entries: &[(Expr, Expr)],
+        dst: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        if entries.len() > u8::MAX as usize {
+            return Err(CompileError::new(
+                CompileErrorKind::TooManyMapEntries {
+                    max: u8::MAX as usize,
+                },
+                Some(span),
+            ));
+        }
+
+        let entries_start = if entries.is_empty() {
+            Register(0)
+        } else {
+            let start = self.alloc_register()?;
+            let mut entry_registers = vec![start];
+            for _ in 1..entries.len() * 2 {
+                entry_registers.push(self.alloc_register()?);
+            }
+
+            for ((key, value), registers) in entries.iter().zip(entry_registers.chunks_exact(2)) {
+                self.compile_expr_into(key, registers[0])?;
+                self.compile_expr_into(value, registers[1])?;
+            }
+            start
+        };
+
+        self.chunk.push_instruction_with_span(
+            Instruction::MapNew {
+                dst,
+                entries_start,
+                entry_count: entries.len() as u8,
+            },
+            Some(span),
+        );
+        Ok(())
+    }
+
+    fn compile_call_into(
+        &mut self,
+        callee: &str,
+        args: &[Expr],
+        dst: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        if args.len() > u8::MAX as usize {
+            return Err(CompileError::new(
+                CompileErrorKind::TooManyArguments {
+                    max: u8::MAX as usize,
+                },
+                Some(span),
+            ));
+        }
+        let function = self.functions.get(callee).copied().ok_or_else(|| {
+            CompileError::new(
+                CompileErrorKind::UndefinedFunction {
+                    name: callee.to_string(),
+                },
+                Some(span),
+            )
+        })?;
+        let args_start = if args.is_empty() {
+            Register(0)
+        } else {
+            let start = self.alloc_register()?;
+            let mut arg_registers = vec![start];
+            for _ in args.iter().skip(1) {
+                arg_registers.push(self.alloc_register()?);
+            }
+
+            for (arg, register) in args.iter().zip(arg_registers) {
+                self.compile_expr_into(arg, register)?;
+            }
+            start
+        };
+
+        self.chunk.push_instruction_with_span(
+            Instruction::CallFunction {
+                dst,
+                function,
+                args_start,
+                arg_count: args.len() as u8,
+            },
+            Some(span),
+        );
+        Ok(())
+    }
+
+    fn alloc_register(&mut self) -> Result<Register, CompileError> {
+        let register = u8::try_from(self.next_register)
+            .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
+        self.next_register += 1;
+        Ok(Register(register))
+    }
+
+    fn emit_jump_if_false(
+        &mut self,
+        condition: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<usize, CompileError> {
+        let index = self.chunk.instructions.len();
+        self.chunk.push_instruction_with_span(
+            Instruction::JumpIfFalse {
+                condition,
+                target: JumpTarget(u32::MAX),
+            },
+            Some(span),
+        );
+        Ok(index)
+    }
+
+    fn emit_jump(
+        &mut self,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<usize, CompileError> {
+        let index = self.chunk.instructions.len();
+        self.chunk.push_instruction_with_span(
+            Instruction::Jump {
+                target: JumpTarget(u32::MAX),
+            },
+            Some(span),
+        );
+        Ok(index)
+    }
+
+    fn patch_jump(&mut self, instruction_index: usize, target: u32) -> Result<(), CompileError> {
+        let instruction = self
+            .chunk
+            .instructions
+            .get_mut(instruction_index)
+            .expect("compiler emits jump before patching it");
+
+        match instruction {
+            Instruction::Jump {
+                target: jump_target,
+            }
+            | Instruction::JumpIfFalse {
+                target: jump_target,
+                ..
+            } => *jump_target = JumpTarget(target),
+            _ => unreachable!("only jump instructions are patched"),
+        }
+
+        Ok(())
+    }
+
+    fn current_instruction_index(&self) -> Result<u32, CompileError> {
+        u32::try_from(self.chunk.instructions.len())
+            .map_err(|_| CompileError::new(CompileErrorKind::TooManyInstructions, None))
+    }
+}
+
+fn link_modules(entry: ProgramAst, modules: Vec<ProgramAst>) -> ProgramAst {
+    let mut statements = Vec::new();
+
+    for module in modules {
+        statements.extend(
+            module
+                .statements
+                .into_iter()
+                .filter(|stmt| matches!(stmt, Stmt::Function { .. })),
+        );
+    }
+
+    statements.extend(
+        entry
+            .statements
+            .into_iter()
+            .filter(|stmt| !matches!(stmt, Stmt::Import { .. })),
+    );
+
+    ProgramAst { statements }
+}
+
+fn link_named_modules(
+    entry: ProgramAst,
+    modules: Vec<ImportedModuleAst>,
+) -> (ProgramAst, Vec<(String, String)>) {
+    let mut statements = Vec::new();
+    let mut aliases = Vec::new();
+
+    for module in modules {
+        for stmt in module.ast.statements {
+            if let Stmt::Function { name, .. } = &stmt {
+                aliases.push((format!("{}.{}", module.name, name), name.clone()));
+                statements.push(stmt);
+            }
+        }
+    }
+
+    statements.extend(
+        entry
+            .statements
+            .into_iter()
+            .filter(|stmt| !matches!(stmt, Stmt::Import { .. })),
+    );
+
+    (ProgramAst { statements }, aliases)
+}
+
+fn map_chunk_error(error: ChunkBuildError) -> CompileError {
+    match error {
+        ChunkBuildError::TooManyConstants { max } => {
+            CompileError::new(CompileErrorKind::TooManyConstants { max }, None)
+        }
+        ChunkBuildError::TooManyStrings { max } => {
+            CompileError::new(CompileErrorKind::TooManyStrings { max }, None)
+        }
+    }
+}
+
+fn map_program_error(error: ProgramBuildError) -> CompileError {
+    match error {
+        ProgramBuildError::TooManyFunctions { max } => {
+            CompileError::new(CompileErrorKind::TooManyFunctions { max }, None)
+        }
+    }
+}
+
+fn function_ids(
+    program_ast: &ProgramAst,
+    referenced_builtins: &[(&'static str, u8)],
+    aliases: &[(String, String)],
+) -> Result<HashMap<String, FunctionId>, CompileError> {
+    let mut ids = HashMap::new();
+
+    for stmt in &program_ast.statements {
+        if let Stmt::Function { name, span, .. } = stmt {
+            let id = FunctionId(ids.len().try_into().map_err(|_| {
+                CompileError::new(
+                    CompileErrorKind::TooManyFunctions {
+                        max: u16::MAX as usize,
+                    },
+                    Some(*span),
+                )
+            })?);
+            ids.insert(name.clone(), id);
+        }
+    }
+
+    for (name, _) in referenced_builtins {
+        let id = FunctionId(ids.len().try_into().map_err(|_| {
+            CompileError::new(
+                CompileErrorKind::TooManyFunctions {
+                    max: u16::MAX as usize,
+                },
+                None,
+            )
+        })?);
+        ids.insert((*name).to_string(), id);
+    }
+
+    for (alias, target) in aliases {
+        if let Some(function) = ids.get(target).copied() {
+            ids.entry(alias.clone()).or_insert(function);
+        }
+    }
+
+    Ok(ids)
+}
+
+fn referenced_builtins(program_ast: &ProgramAst) -> Vec<(&'static str, u8)> {
+    let mut referenced = Vec::new();
+    for (name, arity) in BUILTIN_FUNCTIONS {
+        if program_ast
+            .statements
+            .iter()
+            .any(|stmt| stmt_references_call(stmt, name))
+        {
+            referenced.push((*name, *arity));
+        }
+    }
+    referenced
+}
+
+fn stmt_references_call(stmt: &Stmt, name: &str) -> bool {
+    match stmt {
+        Stmt::Import { .. } => false,
+        Stmt::Let { initializer, .. } => expr_references_call(initializer, name),
+        Stmt::Function { body, .. }
+        | Stmt::Block {
+            statements: body, ..
+        } => body.iter().any(|stmt| stmt_references_call(stmt, name)),
+        Stmt::Assign { value, .. } => expr_references_call(value, name),
+        Stmt::IndexAssign {
+            target,
+            index,
+            value,
+            ..
+        } => {
+            expr_references_call(target, name)
+                || expr_references_call(index, name)
+                || expr_references_call(value, name)
+        }
+        Stmt::Return { value, .. } | Stmt::Expr { value, .. } => expr_references_call(value, name),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_references_call(condition, name)
+                || then_branch
+                    .iter()
+                    .any(|stmt| stmt_references_call(stmt, name))
+                || else_branch
+                    .iter()
+                    .any(|stmt| stmt_references_call(stmt, name))
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            expr_references_call(condition, name)
+                || body.iter().any(|stmt| stmt_references_call(stmt, name))
+        }
+    }
+}
+
+fn expr_references_call(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Literal { .. } | Expr::Variable { .. } => false,
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_references_call(lhs, name) || expr_references_call(rhs, name)
+        }
+        Expr::Call { callee, args, .. } => {
+            callee == name || args.iter().any(|arg| expr_references_call(arg, name))
+        }
+        Expr::Index { target, index, .. } => {
+            expr_references_call(target, name) || expr_references_call(index, name)
+        }
+        Expr::Array { elements, .. } => elements
+            .iter()
+            .any(|element| expr_references_call(element, name)),
+        Expr::Map { entries, .. } => entries.iter().any(|(key, value)| {
+            expr_references_call(key, name) || expr_references_call(value, name)
+        }),
+        Expr::Grouping { expr, .. } => expr_references_call(expr, name),
+    }
+}
+
+fn statements_definitely_return(statements: &[Stmt]) -> bool {
+    statements.last().is_some_and(stmt_definitely_returns)
+}
+
+fn stmt_definitely_returns(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return { .. } => true,
+        Stmt::Block { statements, .. } => statements_definitely_return(statements),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            !else_branch.is_empty()
+                && statements_definitely_return(then_branch)
+                && statements_definitely_return(else_branch)
+        }
+        Stmt::Let { .. }
+        | Stmt::Import { .. }
+        | Stmt::Function { .. }
+        | Stmt::Assign { .. }
+        | Stmt::IndexAssign { .. }
+        | Stmt::While { .. }
+        | Stmt::Expr { .. } => false,
+    }
+}
