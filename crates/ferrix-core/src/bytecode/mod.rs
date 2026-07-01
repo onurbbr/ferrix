@@ -7,6 +7,7 @@ pub mod chunk;
 pub mod disassembler;
 pub mod format;
 pub mod instruction;
+pub mod optimizer;
 pub mod program;
 pub mod serialization;
 pub mod verifier;
@@ -19,6 +20,7 @@ pub use format::{
 pub use instruction::{
     CaptureId, ConstId, FunctionId, Instruction, JumpTarget, Register, StringId,
 };
+pub use optimizer::optimize_chunk;
 pub use program::{Function, FunctionKind, Program, ProgramBuildError};
 pub use serialization::{BytecodeDecodeError, BytecodeEncodeError, decode_program, encode_program};
 pub use verifier::{
