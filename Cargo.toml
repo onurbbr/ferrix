@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/ferrix-assembler",
+    "crates/ferrix-cli",
+    "crates/ferrix-compiler",
+    "crates/ferrix-core",
+    "crates/ferrix-benchmarks",
+    "crates/ferrix-stdlib",
+    "crates/ferrix-vm",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+ferrix-core = { path = "crates/ferrix-core" }
+ferrix-vm = { path = "crates/ferrix-vm" }
+ferrix-assembler = { path = "crates/ferrix-assembler" }
+ferrix-compiler = { path = "crates/ferrix-compiler" }
+ferrix-stdlib = { path = "crates/ferrix-stdlib" }
