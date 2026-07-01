@@ -37,6 +37,26 @@ fn respects_expression_precedence() {
 }
 
 #[test]
+fn optimizes_constant_arithmetic_before_verification() {
+    let program = compile_source("return 40 + 2;").unwrap();
+    let function = &program.as_program().functions[program.as_program().entry.0 as usize];
+    let FunctionKind::Bytecode(chunk) = &function.kind else {
+        panic!("compiler should emit bytecode");
+    };
+
+    assert!(
+        chunk
+            .instructions
+            .iter()
+            .all(|instruction| !matches!(instruction, Instruction::Add { .. }))
+    );
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
 fn compiles_comparisons() {
     let program = compile_source("return (1 + 1) == 2;").unwrap();
 
