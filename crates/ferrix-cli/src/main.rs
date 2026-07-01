@@ -19,7 +19,9 @@ use ferrix_core::{
     bytecode::{FunctionId, VerifiedProgram, encode_program, format_instruction},
     diagnostics::{SourceLocation, SourceManager},
 };
-use ferrix_runtime::{RunBytecodeRequest, RunSourceRequest, RuntimeService};
+use ferrix_runtime::{
+    DebugRequest, RunBytecodeRequest, RunSourceRequest, RuntimeGateway, RuntimeMode,
+};
 use ferrix_vm::{CallFrame, DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
 
 const USAGE: &str = "\
@@ -36,6 +38,7 @@ Usage:
 ";
 
 const MANIFEST_FILES: &[&str] = &["Ferrix.toml", "ferrix.toml"];
+const RUNTIME_MODE_ENV: &str = "FERRIX_RUNTIME_MODE";
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -80,9 +83,7 @@ fn run_cli(
             compile_bytecode(path, output, &mut read_file, stderr)
         }
         [command, path] if command == "run-bytecode" => run_bytecode(path, stdout, stderr),
-        [command, path] if command == "debug" => {
-            debug_file(path, &mut read_file, stdin, stdout, stderr)
-        }
+        [command, path] if command == "debug" => debug_file(path, stdin, stdout, stderr),
         [command, ..] if command == "run" => {
             writeln!(stderr, "error: expected a file or package path\n")
                 .expect("stderr write failed");
@@ -161,7 +162,10 @@ fn compile_bytecode(
 }
 
 fn run_bytecode(path: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
-    let runtime = RuntimeService::new();
+    let runtime = match runtime_gateway(stderr) {
+        Ok(runtime) => runtime,
+        Err(code) => return code,
+    };
     match runtime.run_bytecode(RunBytecodeRequest::new(path)) {
         Ok(result) => write_run_result(stdout, result),
         Err(error) => {
@@ -174,7 +178,10 @@ fn run_bytecode(path: &str, stdout: &mut impl io::Write, stderr: &mut impl io::W
 fn run_file(path: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
     // Normal source execution is delegated to ferrix-runtime so the CLI remains
     // a thin command surface instead of wiring compiler, stdlib, and VM itself.
-    let runtime = RuntimeService::new();
+    let runtime = match runtime_gateway(stderr) {
+        Ok(runtime) => runtime,
+        Err(code) => return code,
+    };
     match runtime.run_source(RunSourceRequest::new(path)) {
         Ok(result) => write_run_result(stdout, result),
         Err(error) => {
@@ -194,17 +201,25 @@ fn write_run_result(stdout: &mut impl io::Write, result: ferrix_runtime::RunResu
 
 fn debug_file(
     path: &str,
-    read_file: &mut impl FnMut(&str) -> io::Result<String>,
     stdin: &mut impl io::BufRead,
     stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> i32 {
-    // The CLI debugger is intentionally built on the same VM debugger trait
-    // external tools can implement.
-    let (sources, program) = match compile_file(path, read_file, stderr) {
-        Ok(compiled) => compiled,
+    // Debugger source preparation goes through ferrix-runtime so package and
+    // import resolution stay aligned with normal execution.
+    let runtime = match runtime_gateway(stderr) {
+        Ok(runtime) => runtime,
         Err(code) => return code,
     };
+    let compiled = match runtime.prepare_debug(DebugRequest::new(path)) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            return error.exit_code;
+        }
+    };
+    let sources = compiled.sources;
+    let program = compiled.program;
 
     let mut vm = Vm::new();
     ferrix_stdlib::install(&mut vm, program.as_program());
@@ -234,6 +249,20 @@ fn debug_file(
             70
         }
     }
+}
+
+fn runtime_gateway(stderr: &mut impl io::Write) -> Result<RuntimeGateway, i32> {
+    let mode = match env::var(RUNTIME_MODE_ENV) {
+        Ok(value) if !value.trim().is_empty() => match value.parse::<RuntimeMode>() {
+            Ok(mode) => mode,
+            Err(error) => {
+                writeln!(stderr, "error: {error}").expect("stderr write failed");
+                return Err(64);
+            }
+        },
+        _ => RuntimeMode::Embedded,
+    };
+    Ok(RuntimeGateway::new(mode))
 }
 
 fn compile_file(
