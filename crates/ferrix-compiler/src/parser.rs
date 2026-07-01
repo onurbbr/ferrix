@@ -445,12 +445,22 @@ impl Parser {
                         member_token.span,
                     ));
                 };
-                if let Expr::Variable { name, span } = &expr
-                    && self.check(&TokenKind::LeftParen)
-                {
-                    expr = Expr::Variable {
-                        name: format!("{name}.{member}"),
-                        span: join(*span, member_token.span),
+                if self.match_kind(&TokenKind::LeftParen) {
+                    let mut args = Vec::new();
+                    if !self.check(&TokenKind::RightParen) {
+                        loop {
+                            args.push(self.expression()?);
+                            if !self.match_kind(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    let right = self.consume(&TokenKind::RightParen, "`)`")?.span;
+                    expr = Expr::MethodCall {
+                        target: Box::new(expr),
+                        method: member,
+                        args,
+                        span: join(target_span, right),
                     };
                 } else {
                     expr = Expr::Field {
@@ -777,6 +787,7 @@ fn target_description(expr: &Expr) -> &'static str {
         Expr::Variable { .. } => "variable",
         Expr::Binary { .. } => "binary expression",
         Expr::Call { .. } => "function call",
+        Expr::MethodCall { .. } => "method call",
         Expr::Function { .. } => "function literal",
         Expr::Index { .. } => "index expression",
         Expr::Field { .. } => "field expression",
