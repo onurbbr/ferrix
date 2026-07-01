@@ -7,6 +7,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use ferrix_core::bytecode::{bytecode_features, inspect_container};
+
 #[test]
 fn help_prints_usage() {
     let output = run(["--help"]);
@@ -838,6 +840,48 @@ module_roots = [\"src\"]
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "42\n");
     assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn compile_can_explain_optimizations_and_write_feature_metadata() {
+    let dir = temp_dir();
+    let source = write_file(
+        &dir,
+        "main.fx",
+        "\
+print(\"hello\");
+return len([1, 2, 3]);
+",
+    );
+    let bytecode = dir.join("main.fxb");
+
+    let compile = run([
+        "compile",
+        source.to_str().unwrap(),
+        bytecode.to_str().unwrap(),
+        "--explain-optimizations",
+    ]);
+
+    assert_eq!(compile.status.code(), Some(0));
+    let stdout = stdout(&compile);
+    assert!(stdout.contains("features: "));
+    assert!(stdout.contains("arrays"));
+    assert!(stdout.contains("native-calls"));
+    assert!(stdout.contains("capabilities: io.output,native.call"));
+    assert!(stdout.contains("optimizer: chunks="));
+    assert!(stderr(&compile).is_empty());
+
+    let metadata = inspect_container(&fs::read(bytecode).unwrap()).unwrap();
+    let features = bytecode_features(metadata.feature_flags)
+        .into_iter()
+        .map(|feature| feature.as_str().to_string())
+        .collect::<Vec<_>>();
+    assert!(features.contains(&"arrays".to_string()));
+    assert!(features.contains(&"native-calls".to_string()));
+    assert_eq!(
+        metadata.required_capabilities,
+        vec!["io.output".to_string(), "native.call".to_string()]
+    );
 }
 
 #[test]
