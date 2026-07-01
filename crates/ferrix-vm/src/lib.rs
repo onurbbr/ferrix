@@ -16,5 +16,5 @@ pub use error::{VmError, VmErrorKind, VmStackFrame};
 pub use heap::{GcStats, Heap, RootSet};
 pub use limits::RuntimeLimits;
 pub use native::{NativeContext, NullOutput, OutputWriter};
-pub use runtime::{CallFrame, Vm};
+pub use runtime::{CallFrame, Vm, VmGcStats};
 pub use trace::TraceWriter;
