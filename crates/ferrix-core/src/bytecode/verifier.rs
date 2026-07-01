@@ -116,6 +116,11 @@ pub enum VerificationErrorKind {
         entry_count: u8,
         register_count: u8,
     },
+    RecordFieldsOutOfRange {
+        fields_start: Register,
+        field_count: usize,
+        register_count: u8,
+    },
     WrongCallArity {
         function: FunctionId,
         expected: u8,
@@ -267,17 +272,17 @@ impl StructuralVerifier {
                 ));
             }
 
-            if let Some(string) = instruction.string_operand()
-                && usize::from(string.0) >= chunk.strings.len()
-            {
-                return Err(VerificationError::new(
-                    None,
-                    Some(ip),
-                    VerificationErrorKind::InvalidString {
-                        string,
-                        string_count: chunk.strings.len(),
-                    },
-                ));
+            for string in instruction.string_operands() {
+                if usize::from(string.0) >= chunk.strings.len() {
+                    return Err(VerificationError::new(
+                        None,
+                        Some(ip),
+                        VerificationErrorKind::InvalidString {
+                            string,
+                            string_count: chunk.strings.len(),
+                        },
+                    ));
+                }
             }
 
             if let Some(target) = instruction.jump_operand()
@@ -394,6 +399,28 @@ impl StructuralVerifier {
                         VerificationErrorKind::MapEntriesOutOfRange {
                             entries_start: *entries_start,
                             entry_count: *entry_count,
+                            register_count: chunk.register_count,
+                        },
+                    ));
+                }
+            }
+
+            if let Instruction::RecordNew {
+                fields_start,
+                fields,
+                ..
+            } = instruction
+                && !fields.is_empty()
+            {
+                let start = usize::from(fields_start.0);
+                let end = start + fields.len();
+                if end > usize::from(chunk.register_count) {
+                    return Err(VerificationError::new(
+                        None,
+                        Some(ip),
+                        VerificationErrorKind::RecordFieldsOutOfRange {
+                            fields_start: *fields_start,
+                            field_count: fields.len(),
                             register_count: chunk.register_count,
                         },
                     ));
@@ -758,6 +785,14 @@ impl fmt::Display for VerificationError {
             } => write!(
                 f,
                 "map entries starting at {entries_start} with count {entry_count} exceed {register_count} registers"
+            ),
+            VerificationErrorKind::RecordFieldsOutOfRange {
+                fields_start,
+                field_count,
+                register_count,
+            } => write!(
+                f,
+                "record fields starting at {fields_start} with count {field_count} exceed {register_count} registers"
             ),
             VerificationErrorKind::WrongCallArity {
                 function,
