@@ -28,6 +28,67 @@ return x + y;
 }
 
 #[test]
+fn compiles_annotated_let_binding() {
+    let program = compile_source("let answer: int = 42;\nreturn answer;\n").unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compiles_annotated_function_declaration() {
+    let program = compile_source(
+        "\
+fn add(a: int, b: int): int {
+    return a + b;
+}
+
+return add(10, 32);
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compiles_annotated_function_literal() {
+    let program = compile_source(
+        "\
+let inc: function = fn(value: int): int {
+    return value + 1;
+};
+
+return inc(41);
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn annotated_any_keeps_dynamic_assignments_allowed() {
+    let program = compile_source(
+        "\
+let value: any = 1;
+value = false;
+return value;
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Bool(false));
+}
+
+#[test]
 fn respects_expression_precedence() {
     let program = compile_source("return 1 + 2 * 3;").unwrap();
 
