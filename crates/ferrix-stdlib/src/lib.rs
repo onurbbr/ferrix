@@ -94,14 +94,15 @@ fn len(ctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
     };
 
     let Value::Obj(reference) = value else {
-        return Err(type_error("string, array, or map", *value));
+        return Err(type_error("string, array, map, or record", *value));
     };
 
     let length = match ctx.heap_object(*reference)? {
         Obj::String(value) => value.chars().count(),
         Obj::Array(values) => values.len(),
         Obj::Map(entries) => entries.len(),
-        _ => return Err(type_error("string, array, or map", *value)),
+        Obj::Record(fields) => fields.len(),
+        _ => return Err(type_error("string, array, map, or record", *value)),
     };
 
     Ok(Value::Int(length.try_into().unwrap_or(i64::MAX)))
@@ -121,6 +122,7 @@ fn type_of(ctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError
             Obj::String(_) => "string",
             Obj::Array(_) => "array",
             Obj::Map(_) => "map",
+            Obj::Record(_) => "record",
             Obj::Upvalue(_) => "upvalue",
             Obj::Function(_) => "function",
             Obj::Closure { .. } => "function",
@@ -165,6 +167,19 @@ fn display_value(ctx: &NativeContext<'_>, value: Value, depth: usize) -> Result<
                     })
                     .collect::<Result<Vec<_>, VmError>>()?;
                 Ok(format!("{{{}}}", entries.join(", ")))
+            }
+            Obj::Record(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|(field, value)| {
+                        Ok(format!(
+                            "{}: {}",
+                            field,
+                            display_value(ctx, *value, depth + 1)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, VmError>>()?;
+                Ok(format!("{{{}}}", fields.join(", ")))
             }
             _ => Ok(value.to_string()),
         },
