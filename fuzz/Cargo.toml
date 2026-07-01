@@ -1,0 +1,27 @@
+[package]
+name = "ferrix-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ferrix-compiler = { path = "../crates/ferrix-compiler" }
+ferrix-core = { path = "../crates/ferrix-core" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "compile_source"
+path = "fuzz_targets/compile_source.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_bytecode"
+path = "fuzz_targets/decode_bytecode.rs"
+test = false
+doc = false
+bench = false
