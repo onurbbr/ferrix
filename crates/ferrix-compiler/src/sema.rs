@@ -1,8 +1,8 @@
 //! Semantic analysis for Ferrix ASTs.
 //!
-//! This pass validates names and arity before bytecode generation: variables
-//! must be declared before use, functions must be unique, parameters cannot be
-//! duplicated, and call sites must match the known function signatures.
+//! This pass validates names and arity before bytecode generation. Variables
+//! are resolved through lexical scopes so block-local bindings can shadow outer
+//! names without leaking after the block exits.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,6 +12,47 @@ use crate::{
 };
 
 const BUILTIN_FUNCTIONS: &[(&str, usize)] = &[("print", 1), ("len", 1), ("type_of", 1)];
+
+#[derive(Clone, Debug)]
+struct ScopeStack {
+    scopes: Vec<HashSet<String>>,
+}
+
+impl ScopeStack {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashSet::new()],
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes
+            .pop()
+            .expect("semantic analyzer always keeps one active scope");
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|scope| scope.contains(name))
+    }
+
+    fn contains_current(&self, name: &str) -> bool {
+        self.scopes
+            .last()
+            .expect("semantic analyzer always has a current scope")
+            .contains(name)
+    }
+
+    fn declare(&mut self, name: String) {
+        self.scopes
+            .last_mut()
+            .expect("semantic analyzer always has a current scope")
+            .insert(name);
+    }
+}
 
 /// Runs semantic checks for a program without module aliases.
 pub fn analyze(program: &ProgramAst) -> Result<(), CompileError> {
@@ -23,72 +64,12 @@ pub fn analyze_with_function_aliases(
     program: &ProgramAst,
     aliases: &[(String, String)],
 ) -> Result<(), CompileError> {
-    let mut locals = HashSet::new();
     let functions = collect_functions(program, aliases)?;
+    let mut scopes = ScopeStack::new();
 
     for stmt in &program.statements {
-        match stmt {
-            Stmt::Import { .. } => {}
-            Stmt::Function { .. } => {}
-            Stmt::Let {
-                name,
-                initializer,
-                span,
-            } => {
-                if locals.contains(name) {
-                    return Err(CompileError::new(
-                        CompileErrorKind::DuplicateVariable { name: name.clone() },
-                        Some(*span),
-                    ));
-                }
-                let mut initializer_locals = locals.clone();
-                if matches!(initializer, Expr::Function { .. }) {
-                    initializer_locals.insert(name.clone());
-                }
-                check_expr(initializer, &initializer_locals, &functions)?;
-                locals.insert(name.clone());
-            }
-            Stmt::Assign { name, value, span } => {
-                if !locals.contains(name) {
-                    return Err(CompileError::new(
-                        CompileErrorKind::UndefinedVariable { name: name.clone() },
-                        Some(*span),
-                    ));
-                }
-                check_expr(value, &locals, &functions)?;
-            }
-            Stmt::IndexAssign {
-                target,
-                index,
-                value,
-                ..
-            } => {
-                check_expr(target, &locals, &functions)?;
-                check_expr(index, &locals, &functions)?;
-                check_expr(value, &locals, &functions)?;
-            }
-            Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
-                check_expr(value, &locals, &functions)?;
-            }
-            Stmt::If {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                check_expr(condition, &locals, &functions)?;
-                check_statements(then_branch, &mut locals, &functions)?;
-                check_statements(else_branch, &mut locals, &functions)?;
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                check_expr(condition, &locals, &functions)?;
-                check_statements(body, &mut locals, &functions)?;
-            }
-            Stmt::Block { statements, .. } => {
-                check_statements(statements, &mut locals, &functions)?;
-            }
+        if !matches!(stmt, Stmt::Function { .. }) {
+            check_stmt(stmt, &mut scopes, &functions)?;
         }
     }
 
@@ -97,26 +78,9 @@ pub fn analyze_with_function_aliases(
             params, body, span, ..
         } = stmt
         {
-            let mut function_locals = HashSet::new();
-            if params.len() > u8::MAX as usize {
-                return Err(CompileError::new(
-                    CompileErrorKind::TooManyParameters {
-                        max: u8::MAX as usize,
-                    },
-                    Some(*span),
-                ));
-            }
-            for param in params {
-                if !function_locals.insert(param.clone()) {
-                    return Err(CompileError::new(
-                        CompileErrorKind::DuplicateParameter {
-                            name: param.clone(),
-                        },
-                        Some(*span),
-                    ));
-                }
-            }
-            check_statements(body, &mut function_locals, &functions)?;
+            let mut function_scopes = ScopeStack::new();
+            declare_parameters(params, *span, &mut function_scopes)?;
+            check_scoped_statements(body, &mut function_scopes, &functions)?;
         }
     }
 
@@ -154,85 +118,133 @@ fn collect_functions(
     Ok(functions)
 }
 
-fn check_statements(
+fn check_scoped_statements(
     stmts: &[Stmt],
-    locals: &mut HashSet<String>,
+    scopes: &mut ScopeStack,
     functions: &HashMap<String, usize>,
 ) -> Result<(), CompileError> {
-    let outer = HashSet::new();
-    check_statements_with_outer(stmts, locals, functions, &outer)
+    scopes.push_scope();
+    let result = check_statements(stmts, scopes, functions);
+    scopes.pop_scope();
+    result
 }
 
-fn check_statements_with_outer(
+fn check_statements(
     stmts: &[Stmt],
-    locals: &mut HashSet<String>,
+    scopes: &mut ScopeStack,
     functions: &HashMap<String, usize>,
-    outer: &HashSet<String>,
 ) -> Result<(), CompileError> {
     for stmt in stmts {
-        match stmt {
-            Stmt::Import { .. } => {}
-            Stmt::Function { .. } => {}
-            Stmt::Let {
-                name,
-                initializer,
-                span,
-            } => {
-                if locals.contains(name) {
-                    return Err(CompileError::new(
-                        CompileErrorKind::DuplicateVariable { name: name.clone() },
-                        Some(*span),
-                    ));
-                }
-                let mut initializer_locals = locals.clone();
-                if matches!(initializer, Expr::Function { .. }) {
-                    initializer_locals.insert(name.clone());
-                }
-                check_expr_with_outer(initializer, &initializer_locals, functions, outer)?;
-                locals.insert(name.clone());
+        check_stmt(stmt, scopes, functions)?;
+    }
+
+    Ok(())
+}
+
+fn check_stmt(
+    stmt: &Stmt,
+    scopes: &mut ScopeStack,
+    functions: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    match stmt {
+        Stmt::Import { .. } | Stmt::Function { .. } => Ok(()),
+        Stmt::Let {
+            name,
+            initializer,
+            span,
+        } => check_let(name, initializer, *span, scopes, functions),
+        Stmt::Assign { name, value, span } => {
+            if !scopes.contains(name) {
+                return Err(CompileError::new(
+                    CompileErrorKind::UndefinedVariable { name: name.clone() },
+                    Some(*span),
+                ));
             }
-            Stmt::Assign { name, value, span } => {
-                if !locals.contains(name) && !outer.contains(name) {
-                    return Err(CompileError::new(
-                        CompileErrorKind::UndefinedVariable { name: name.clone() },
-                        Some(*span),
-                    ));
-                }
-                check_expr_with_outer(value, locals, functions, outer)?;
-            }
-            Stmt::IndexAssign {
-                target,
-                index,
-                value,
-                ..
-            } => {
-                check_expr_with_outer(target, locals, functions, outer)?;
-                check_expr_with_outer(index, locals, functions, outer)?;
-                check_expr_with_outer(value, locals, functions, outer)?;
-            }
-            Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
-                check_expr_with_outer(value, locals, functions, outer)?;
-            }
-            Stmt::If {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                check_expr_with_outer(condition, locals, functions, outer)?;
-                check_statements_with_outer(then_branch, locals, functions, outer)?;
-                check_statements_with_outer(else_branch, locals, functions, outer)?;
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                check_expr_with_outer(condition, locals, functions, outer)?;
-                check_statements_with_outer(body, locals, functions, outer)?;
-            }
-            Stmt::Block { statements, .. } => {
-                check_statements_with_outer(statements, locals, functions, outer)?;
-            }
+            check_expr(value, scopes, functions)
         }
+        Stmt::IndexAssign {
+            target,
+            index,
+            value,
+            ..
+        } => {
+            check_expr(target, scopes, functions)?;
+            check_expr(index, scopes, functions)?;
+            check_expr(value, scopes, functions)
+        }
+        Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
+            check_expr(value, scopes, functions)
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            check_expr(condition, scopes, functions)?;
+            check_scoped_statements(then_branch, scopes, functions)?;
+            check_scoped_statements(else_branch, scopes, functions)
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            check_expr(condition, scopes, functions)?;
+            check_scoped_statements(body, scopes, functions)
+        }
+        Stmt::Block { statements, .. } => check_scoped_statements(statements, scopes, functions),
+    }
+}
+
+fn check_let(
+    name: &str,
+    initializer: &Expr,
+    span: ferrix_core::diagnostics::SourceSpan,
+    scopes: &mut ScopeStack,
+    functions: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    if scopes.contains_current(name) {
+        return Err(CompileError::new(
+            CompileErrorKind::DuplicateVariable {
+                name: name.to_string(),
+            },
+            Some(span),
+        ));
+    }
+
+    if matches!(initializer, Expr::Function { .. }) {
+        scopes.declare(name.to_string());
+        check_expr(initializer, scopes, functions)
+    } else {
+        check_expr(initializer, scopes, functions)?;
+        scopes.declare(name.to_string());
+        Ok(())
+    }
+}
+
+fn declare_parameters(
+    params: &[String],
+    span: ferrix_core::diagnostics::SourceSpan,
+    scopes: &mut ScopeStack,
+) -> Result<(), CompileError> {
+    if params.len() > u8::MAX as usize {
+        return Err(CompileError::new(
+            CompileErrorKind::TooManyParameters {
+                max: u8::MAX as usize,
+            },
+            Some(span),
+        ));
+    }
+
+    for param in params {
+        if scopes.contains_current(param) {
+            return Err(CompileError::new(
+                CompileErrorKind::DuplicateParameter {
+                    name: param.clone(),
+                },
+                Some(span),
+            ));
+        }
+        scopes.declare(param.clone());
     }
 
     Ok(())
@@ -240,23 +252,13 @@ fn check_statements_with_outer(
 
 fn check_expr(
     expr: &Expr,
-    locals: &HashSet<String>,
+    scopes: &mut ScopeStack,
     functions: &HashMap<String, usize>,
-) -> Result<(), CompileError> {
-    let outer = HashSet::new();
-    check_expr_with_outer(expr, locals, functions, &outer)
-}
-
-fn check_expr_with_outer(
-    expr: &Expr,
-    locals: &HashSet<String>,
-    functions: &HashMap<String, usize>,
-    outer: &HashSet<String>,
 ) -> Result<(), CompileError> {
     match expr {
         Expr::Literal { .. } => Ok(()),
         Expr::Variable { name, span } => {
-            if locals.contains(name) || outer.contains(name) {
+            if scopes.contains(name) {
                 Ok(())
             } else {
                 Err(CompileError::new(
@@ -266,8 +268,8 @@ fn check_expr_with_outer(
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            check_expr_with_outer(lhs, locals, functions, outer)?;
-            check_expr_with_outer(rhs, locals, functions, outer)
+            check_expr(lhs, scopes, functions)?;
+            check_expr(rhs, scopes, functions)
         }
         Expr::Array { elements, .. } => {
             if elements.len() > u8::MAX as usize {
@@ -280,7 +282,7 @@ fn check_expr_with_outer(
             }
 
             for element in elements {
-                check_expr_with_outer(element, locals, functions, outer)?;
+                check_expr(element, scopes, functions)?;
             }
             Ok(())
         }
@@ -295,14 +297,14 @@ fn check_expr_with_outer(
             }
 
             for (key, value) in entries {
-                check_expr_with_outer(key, locals, functions, outer)?;
-                check_expr_with_outer(value, locals, functions, outer)?;
+                check_expr(key, scopes, functions)?;
+                check_expr(value, scopes, functions)?;
             }
             Ok(())
         }
         Expr::Index { target, index, .. } => {
-            check_expr_with_outer(target, locals, functions, outer)?;
-            check_expr_with_outer(index, locals, functions, outer)
+            check_expr(target, scopes, functions)?;
+            check_expr(index, scopes, functions)
         }
         Expr::Call { callee, args, span } => {
             if args.len() > u8::MAX as usize {
@@ -313,6 +315,14 @@ fn check_expr_with_outer(
                     Some(*span),
                 ));
             }
+
+            if scopes.contains(callee) {
+                for arg in args {
+                    check_expr(arg, scopes, functions)?;
+                }
+                return Ok(());
+            }
+
             if let Some(expected) = functions.get(callee).copied() {
                 if expected != args.len() {
                     return Err(CompileError::new(
@@ -324,7 +334,7 @@ fn check_expr_with_outer(
                         Some(*span),
                     ));
                 }
-            } else if !locals.contains(callee) && !outer.contains(callee) {
+            } else {
                 return Err(CompileError::new(
                     CompileErrorKind::UndefinedFunction {
                         name: callee.clone(),
@@ -332,35 +342,18 @@ fn check_expr_with_outer(
                     Some(*span),
                 ));
             }
+
             for arg in args {
-                check_expr_with_outer(arg, locals, functions, outer)?;
+                check_expr(arg, scopes, functions)?;
             }
             Ok(())
         }
         Expr::Function { params, body, span } => {
-            let mut function_locals = HashSet::new();
-            let mut closure_outer = outer.clone();
-            closure_outer.extend(locals.iter().cloned());
-            if params.len() > u8::MAX as usize {
-                return Err(CompileError::new(
-                    CompileErrorKind::TooManyParameters {
-                        max: u8::MAX as usize,
-                    },
-                    Some(*span),
-                ));
-            }
-            for param in params {
-                if !function_locals.insert(param.clone()) {
-                    return Err(CompileError::new(
-                        CompileErrorKind::DuplicateParameter {
-                            name: param.clone(),
-                        },
-                        Some(*span),
-                    ));
-                }
-            }
-            check_statements_with_outer(body, &mut function_locals, functions, &closure_outer)
+            let mut function_scopes = scopes.clone();
+            function_scopes.push_scope();
+            declare_parameters(params, *span, &mut function_scopes)?;
+            check_scoped_statements(body, &mut function_scopes, functions)
         }
-        Expr::Grouping { expr, .. } => check_expr_with_outer(expr, locals, functions, outer),
+        Expr::Grouping { expr, .. } => check_expr(expr, scopes, functions),
     }
 }
