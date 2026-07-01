@@ -9,8 +9,8 @@ use ferrix_core::{
     diagnostics::{FileId, SourceManager, SourceSpan},
 };
 use ferrix_vm::{
-    DebugAction, DebugEvent, DebugOutcome, Debugger, IncrementalGcPhase, RuntimeLimits, Vm,
-    VmError, VmErrorKind, VmStackFrame,
+    DebugAction, DebugEvent, DebugOutcome, Debugger, HostCapability, IncrementalGcPhase,
+    RuntimeLimits, Vm, VmError, VmErrorKind, VmStackFrame,
 };
 
 #[test]
@@ -1321,7 +1321,9 @@ fn runtime_errors_capture_stack_trace() {
     program.add_function(Function::bytecode(main)).unwrap();
     let program = VerifiedProgram::new(program).unwrap();
 
-    let err = Vm::new().run_program(&program).unwrap_err();
+    let mut vm = Vm::new();
+    vm.grant_capability(HostCapability::NativeCall);
+    let err = vm.run_program(&program).unwrap_err();
 
     assert_eq!(
         err.stack_trace,
@@ -1481,6 +1483,7 @@ fn native_function_calls_are_supported() {
     program.add_function(Function::bytecode(main)).unwrap();
     let program = VerifiedProgram::new(program).unwrap();
     let mut vm = Vm::new();
+    vm.grant_capability(HostCapability::NativeCall);
     vm.register_native_fn(FunctionId(0), |args| match args {
         [Value::Int(value)] => Ok(Value::Int(value * 2)),
         [found] => Err(VmError::new(
@@ -1496,6 +1499,45 @@ fn native_function_calls_are_supported() {
     let result = vm.run_program(&program).unwrap();
 
     assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn native_function_requires_capability() {
+    let mut main = Chunk::new("main", 2);
+    let value = main.add_constant(Value::Int(21)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: value,
+    });
+    main.push_instruction(Instruction::CallFunction {
+        dst: Register(1),
+        function: FunctionId(0),
+        args_start: Register(0),
+        arg_count: 1,
+    });
+    main.push_instruction(Instruction::Return { src: Register(1) });
+
+    let mut program = Program::new(FunctionId(1));
+    program.add_function(Function::native("double", 1)).unwrap();
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+    let mut vm = Vm::new();
+    vm.register_native_fn(FunctionId(0), |_args| Ok(Value::Int(42)));
+
+    let err = vm.run_program(&program).unwrap_err();
+
+    assert_eq!(err.instruction_ip, Some(1));
+    assert_eq!(
+        err.kind,
+        VmErrorKind::CapabilityDenied {
+            capability: HostCapability::NativeCall,
+            operation: "call native function",
+        }
+    );
+    assert_eq!(
+        vm.audit_events(),
+        &["capability_denied capability=native.call operation=call native function".to_string()]
+    );
 }
 
 #[test]
@@ -1519,7 +1561,9 @@ fn missing_native_implementation_is_typed_error() {
     program.add_function(Function::bytecode(main)).unwrap();
     let program = VerifiedProgram::new(program).unwrap();
 
-    let err = Vm::new().run_program(&program).unwrap_err();
+    let mut vm = Vm::new();
+    vm.grant_capability(HostCapability::NativeCall);
+    let err = vm.run_program(&program).unwrap_err();
 
     assert_eq!(err.instruction_ip, Some(1));
     assert_eq!(
