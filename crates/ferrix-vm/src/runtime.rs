@@ -16,8 +16,8 @@ use ferrix_core::{
 };
 
 use crate::{
-    DebugAction, DebugEvent, DebugOutcome, Debugger, GcStats, Heap, NativeContext, NullOutput,
-    OutputWriter, RootSet, RuntimeLimits, TraceWriter,
+    DebugAction, DebugEvent, DebugOutcome, Debugger, GcStats, Heap, IncrementalGcPhase,
+    NativeContext, NullOutput, OutputWriter, RootSet, RuntimeLimits, TraceWriter,
 };
 use crate::{VmError, VmErrorKind, VmStackFrame};
 
@@ -78,6 +78,8 @@ pub struct VmGcStats {
     pub allocation_pressure: usize,
     /// Number of GC passes run manually or automatically.
     pub collections: u64,
+    /// Number of bounded incremental GC steps run at VM safepoints.
+    pub incremental_steps: u64,
     /// Total reachable objects marked across all collections.
     pub total_marked: usize,
     /// Total unreachable objects swept across all collections.
@@ -158,13 +160,21 @@ impl Vm {
         self.gc_stats
     }
 
+    /// Returns the current incremental GC phase.
+    pub fn incremental_gc_phase(&self) -> IncrementalGcPhase {
+        self.heap.incremental_phase()
+    }
+
     /// Allocates an object, triggering GC first when pressure or heap limits ask.
     pub fn allocate_object(&mut self, object: Obj) -> Result<ObjRef, VmError> {
         let extra_roots = object_references(&object);
-        if self.should_collect_before_allocation()
-            || self.heap.len() >= self.limits.max_heap_objects
-        {
-            self.collect_garbage_with_extra_roots(&extra_roots);
+        if self.should_collect_before_allocation() {
+            self.start_incremental_garbage_with_extra_roots(&extra_roots);
+            self.step_incremental_garbage();
+        }
+        if self.heap.len() >= self.limits.max_heap_objects {
+            self.start_incremental_garbage_with_extra_roots(&extra_roots);
+            self.finish_incremental_garbage();
         }
 
         let reference = self.heap.allocate(object, self.limits)?;
@@ -199,6 +209,44 @@ impl Vm {
         let stats = self.collect_garbage();
         self.program_roots = previous_program_roots;
         stats
+    }
+
+    /// Starts an incremental GC pass from the VM's current root snapshot.
+    pub fn start_incremental_garbage(&mut self) -> bool {
+        self.start_incremental_garbage_with_extra_roots(&[])
+    }
+
+    /// Advances active incremental GC by the configured safepoint budget.
+    pub fn step_incremental_garbage(&mut self) -> Option<GcStats> {
+        if self.heap.is_incremental_collection_active() {
+            self.gc_stats.incremental_steps = self.gc_stats.incremental_steps.saturating_add(1);
+        }
+        let stats = self
+            .heap
+            .step_incremental_collection(self.limits.gc_incremental_step_budget);
+        if stats.is_some() {
+            self.field_cache.clear();
+        }
+        if let Some(stats) = stats {
+            self.record_collection(stats);
+            Some(stats)
+        } else {
+            None
+        }
+    }
+
+    /// Completes active incremental GC immediately, returning stats if active.
+    pub fn finish_incremental_garbage(&mut self) -> Option<GcStats> {
+        let stats = self.heap.finish_incremental_collection();
+        if stats.is_some() {
+            self.field_cache.clear();
+        }
+        if let Some(stats) = stats {
+            self.record_collection(stats);
+            Some(stats)
+        } else {
+            None
+        }
     }
 
     /// Computes object roots from VM registers and active call frames.
@@ -349,6 +397,7 @@ impl Vm {
                     },
                 )
             })?;
+            self.step_incremental_garbage();
 
             if let Some(trace) = trace.as_deref_mut() {
                 trace_instruction(trace, ip, instruction, &self.registers);
@@ -626,6 +675,7 @@ impl Vm {
                 )
             })?;
             self.registers = self.frames[frame_index].registers.clone();
+            self.step_incremental_garbage();
 
             if let Some(debugger) = debugger.as_deref_mut() {
                 let action = debugger.before_instruction(DebugEvent {
@@ -1182,6 +1232,7 @@ impl Vm {
 
     fn store_upvalue_value(&mut self, ip: usize, cell: Value, value: Value) -> Result<(), VmError> {
         let reference = self.upvalue_ref(ip, cell)?;
+        self.heap.write_barrier_value(value);
         let Obj::Upvalue(stored) = self.heap.get_mut(reference)? else {
             return Err(VmError::new(
                 Some(ip),
@@ -1331,6 +1382,7 @@ impl Vm {
     ) -> Result<(), VmError> {
         let target = self.read_indexable_ref(ip, target_register)?;
         let value = self.read_register(ip, value_register)?;
+        self.heap.write_barrier_value(value);
 
         match self.heap.get(target)? {
             Obj::Array(values) => {
@@ -1345,6 +1397,7 @@ impl Vm {
             Obj::Map(entries) => {
                 let key = self.read_register(ip, index_register)?;
                 let entry_index = self.map_entry_index(entries, key)?;
+                self.heap.write_barrier_value(key);
                 let Obj::Map(entries) = self.heap.get_mut(target)? else {
                     unreachable!("object kind checked before mutable access");
                 };
@@ -1402,6 +1455,7 @@ impl Vm {
         let raw_index = self.read_int(ip, index_register)?;
         let value = self.read_register(ip, value_register)?;
         let found = self.read_register(ip, array_register)?;
+        self.heap.write_barrier_value(value);
 
         let Obj::Array(values) = self.heap.get_mut(array)? else {
             return Err(VmError::new(
@@ -1636,6 +1690,7 @@ impl Vm {
         let field = self.read_field_name(ip, field, chunk)?;
         let value = self.read_register(ip, value_register)?;
         let found = self.read_register(ip, target_register)?;
+        self.heap.write_barrier_value(value);
         let key = FieldCacheKey {
             object: target,
             field: field.clone(),
@@ -1811,6 +1866,11 @@ impl Vm {
         self.field_cache.clear();
         self.record_collection(stats);
         stats
+    }
+
+    fn start_incremental_garbage_with_extra_roots(&mut self, extra_roots: &[ObjRef]) -> bool {
+        let roots = self.allocation_roots(extra_roots);
+        self.heap.start_incremental_collection(&roots)
     }
 
     fn record_allocation(&mut self) {
