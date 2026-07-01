@@ -28,6 +28,43 @@ return x + y;
 }
 
 #[test]
+fn compiles_integer_operations_to_specialized_opcodes() {
+    let program = compile_source(
+        "\
+fn add(a, b) {
+    return a + b;
+}
+
+fn before(a, b) {
+    return a < b;
+}
+
+return add(40, 2);
+",
+    )
+    .unwrap();
+
+    let mut saw_add_int = false;
+    let mut saw_less_int = false;
+    for function in &program.as_program().functions {
+        let FunctionKind::Bytecode(chunk) = &function.kind else {
+            continue;
+        };
+        saw_add_int |= chunk
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::AddInt { .. }));
+        saw_less_int |= chunk
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::LessInt { .. }));
+    }
+
+    assert!(saw_add_int);
+    assert!(saw_less_int);
+}
+
+#[test]
 fn compiles_annotated_let_binding() {
     let program = compile_source("let answer: int = 42;\nreturn answer;\n").unwrap();
 
