@@ -590,6 +590,59 @@ fn verifies_map_and_index_instructions() {
 }
 
 #[test]
+fn verifies_record_and_field_instructions() {
+    let mut chunk = Chunk::new("record", 4);
+    let field = chunk.add_string("answer").unwrap();
+    let value = chunk.add_constant(Value::Int(42)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(1),
+        constant: value,
+    });
+    chunk.push_instruction(Instruction::RecordNew {
+        dst: Register(0),
+        fields_start: Register(1),
+        fields: vec![field],
+    });
+    chunk.push_instruction(Instruction::FieldGet {
+        dst: Register(2),
+        target: Register(0),
+        field,
+    });
+    chunk.push_instruction(Instruction::FieldSet {
+        target: Register(0),
+        field,
+        value: Register(2),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+
+    StructuralVerifier::verify(chunk).unwrap();
+}
+
+#[test]
+fn rejects_record_fields_that_exceed_register_file() {
+    let mut chunk = Chunk::new("record", 2);
+    let field = chunk.add_string("answer").unwrap();
+    let second = chunk.add_string("extra").unwrap();
+    chunk.push_instruction(Instruction::RecordNew {
+        dst: Register(0),
+        fields_start: Register(1),
+        fields: vec![field, second],
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(0) });
+
+    let err = StructuralVerifier::verify(chunk).unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        VerificationErrorKind::RecordFieldsOutOfRange {
+            fields_start: Register(1),
+            field_count: 2,
+            register_count: 2,
+        }
+    );
+}
+
+#[test]
 fn rejects_map_entries_that_exceed_register_file() {
     let mut chunk = Chunk::new("map", 2);
     chunk.push_instruction(Instruction::MapNew {
