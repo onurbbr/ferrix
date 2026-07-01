@@ -41,19 +41,27 @@ fn bytecode_program_roundtrips_through_binary_format() {
 
 #[test]
 fn bytecode_program_roundtrips_closure_instructions() {
-    let mut closure = Chunk::new("closure#0", 3)
+    let mut closure = Chunk::new("closure#0", 4)
         .with_arity(1)
         .with_capture_count(1);
-    closure.push_instruction(Instruction::LoadCapture {
+    closure.push_instruction(Instruction::LoadCaptureCell {
         dst: Register(1),
         capture: CaptureId(0),
     });
-    closure.push_instruction(Instruction::Add {
+    closure.push_instruction(Instruction::LoadCapture {
         dst: Register(2),
-        lhs: Register(1),
+        capture: CaptureId(0),
+    });
+    closure.push_instruction(Instruction::StoreCapture {
+        capture: CaptureId(0),
+        src: Register(2),
+    });
+    closure.push_instruction(Instruction::Add {
+        dst: Register(3),
+        lhs: Register(2),
         rhs: Register(0),
     });
-    closure.push_instruction(Instruction::Return { src: Register(2) });
+    closure.push_instruction(Instruction::Return { src: Register(3) });
 
     let mut main = Chunk::new("main", 4);
     let forty = main.add_constant(Value::Int(40)).unwrap();
@@ -61,6 +69,18 @@ fn bytecode_program_roundtrips_closure_instructions() {
     main.push_instruction(Instruction::LoadConst {
         dst: Register(0),
         constant: forty,
+    });
+    main.push_instruction(Instruction::MakeUpvalue {
+        dst: Register(0),
+        src: Register(0),
+    });
+    main.push_instruction(Instruction::LoadUpvalue {
+        dst: Register(3),
+        upvalue: Register(0),
+    });
+    main.push_instruction(Instruction::StoreUpvalue {
+        upvalue: Register(0),
+        src: Register(3),
     });
     main.push_instruction(Instruction::MakeClosure {
         dst: Register(1),
