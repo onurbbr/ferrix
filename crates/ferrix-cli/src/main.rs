@@ -1118,6 +1118,19 @@ fn display_heap_value_inner(heap: &Heap, value: Value, depth: usize) -> String {
                     .collect::<Vec<_>>();
                 format!("{{{}}}", entries.join(", "))
             }
+            Ok(Obj::Record(fields)) => {
+                let fields = fields
+                    .iter()
+                    .map(|(field, value)| {
+                        format!(
+                            "{}: {}",
+                            field,
+                            display_heap_value_inner(heap, *value, depth + 1)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                format!("{{{}}}", fields.join(", "))
+            }
             _ => value.to_string(),
         },
         _ => value.to_string(),
