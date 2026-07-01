@@ -419,11 +419,41 @@ impl Vm {
                 Instruction::Add { dst, lhs, rhs } => {
                     self.write_binary_int(ip, *dst, *lhs, *rhs, "addition", i64::checked_add)?;
                 }
+                Instruction::AddInt { dst, lhs, rhs } => {
+                    self.write_binary_int_specialized(
+                        ip,
+                        *dst,
+                        *lhs,
+                        *rhs,
+                        "addition",
+                        i64::checked_add,
+                    )?;
+                }
                 Instruction::Sub { dst, lhs, rhs } => {
                     self.write_binary_int(ip, *dst, *lhs, *rhs, "subtraction", i64::checked_sub)?;
                 }
+                Instruction::SubInt { dst, lhs, rhs } => {
+                    self.write_binary_int_specialized(
+                        ip,
+                        *dst,
+                        *lhs,
+                        *rhs,
+                        "subtraction",
+                        i64::checked_sub,
+                    )?;
+                }
                 Instruction::Mul { dst, lhs, rhs } => {
                     self.write_binary_int(
+                        ip,
+                        *dst,
+                        *lhs,
+                        *rhs,
+                        "multiplication",
+                        i64::checked_mul,
+                    )?;
+                }
+                Instruction::MulInt { dst, lhs, rhs } => {
+                    self.write_binary_int_specialized(
                         ip,
                         *dst,
                         *lhs,
@@ -448,6 +478,9 @@ impl Vm {
                         )
                     })?;
                     self.write_register(ip, *dst, Value::Int(value))?;
+                }
+                Instruction::DivInt { dst, lhs, rhs } => {
+                    self.write_int_division_specialized(ip, *dst, *lhs, *rhs)?;
                 }
                 Instruction::Jump { target } => {
                     self.jump_to(chunk, ip, *target)?;
@@ -475,14 +508,34 @@ impl Vm {
                 Instruction::Less { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, *dst, *lhs, *rhs, |lhs, rhs| lhs < rhs)?;
                 }
+                Instruction::LessInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, *dst, *lhs, *rhs, |lhs, rhs| {
+                        lhs < rhs
+                    })?;
+                }
                 Instruction::LessEqual { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, *dst, *lhs, *rhs, |lhs, rhs| lhs <= rhs)?;
+                }
+                Instruction::LessEqualInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, *dst, *lhs, *rhs, |lhs, rhs| {
+                        lhs <= rhs
+                    })?;
                 }
                 Instruction::Greater { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, *dst, *lhs, *rhs, |lhs, rhs| lhs > rhs)?;
                 }
+                Instruction::GreaterInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, *dst, *lhs, *rhs, |lhs, rhs| {
+                        lhs > rhs
+                    })?;
+                }
                 Instruction::GreaterEqual { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, *dst, *lhs, *rhs, |lhs, rhs| lhs >= rhs)?;
+                }
+                Instruction::GreaterEqualInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, *dst, *lhs, *rhs, |lhs, rhs| {
+                        lhs >= rhs
+                    })?;
                 }
                 Instruction::Not { dst, src } => {
                     let value = !self.read_bool(ip, *src)?;
@@ -714,11 +767,41 @@ impl Vm {
                 Instruction::Add { dst, lhs, rhs } => {
                     self.write_binary_int(ip, dst, lhs, rhs, "addition", i64::checked_add)?;
                 }
+                Instruction::AddInt { dst, lhs, rhs } => {
+                    self.write_binary_int_specialized(
+                        ip,
+                        dst,
+                        lhs,
+                        rhs,
+                        "addition",
+                        i64::checked_add,
+                    )?;
+                }
                 Instruction::Sub { dst, lhs, rhs } => {
                     self.write_binary_int(ip, dst, lhs, rhs, "subtraction", i64::checked_sub)?;
                 }
+                Instruction::SubInt { dst, lhs, rhs } => {
+                    self.write_binary_int_specialized(
+                        ip,
+                        dst,
+                        lhs,
+                        rhs,
+                        "subtraction",
+                        i64::checked_sub,
+                    )?;
+                }
                 Instruction::Mul { dst, lhs, rhs } => {
                     self.write_binary_int(ip, dst, lhs, rhs, "multiplication", i64::checked_mul)?;
+                }
+                Instruction::MulInt { dst, lhs, rhs } => {
+                    self.write_binary_int_specialized(
+                        ip,
+                        dst,
+                        lhs,
+                        rhs,
+                        "multiplication",
+                        i64::checked_mul,
+                    )?;
                 }
                 Instruction::Div { dst, lhs, rhs } => {
                     let rhs_value = self.read_int(ip, rhs)?;
@@ -735,6 +818,9 @@ impl Vm {
                         )
                     })?;
                     self.write_register(ip, dst, Value::Int(value))?;
+                }
+                Instruction::DivInt { dst, lhs, rhs } => {
+                    self.write_int_division_specialized(ip, dst, lhs, rhs)?;
                 }
                 Instruction::Jump { target } => {
                     self.jump_to(chunk, ip, target)?;
@@ -762,14 +848,30 @@ impl Vm {
                 Instruction::Less { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, dst, lhs, rhs, |lhs, rhs| lhs < rhs)?;
                 }
+                Instruction::LessInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, dst, lhs, rhs, |lhs, rhs| lhs < rhs)?;
+                }
                 Instruction::LessEqual { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, dst, lhs, rhs, |lhs, rhs| lhs <= rhs)?;
+                }
+                Instruction::LessEqualInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, dst, lhs, rhs, |lhs, rhs| {
+                        lhs <= rhs
+                    })?;
                 }
                 Instruction::Greater { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, dst, lhs, rhs, |lhs, rhs| lhs > rhs)?;
                 }
+                Instruction::GreaterInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, dst, lhs, rhs, |lhs, rhs| lhs > rhs)?;
+                }
                 Instruction::GreaterEqual { dst, lhs, rhs } => {
                     self.write_int_comparison(ip, dst, lhs, rhs, |lhs, rhs| lhs >= rhs)?;
+                }
+                Instruction::GreaterEqualInt { dst, lhs, rhs } => {
+                    self.write_int_comparison_specialized(ip, dst, lhs, rhs, |lhs, rhs| {
+                        lhs >= rhs
+                    })?;
                 }
                 Instruction::Not { dst, src } => {
                     let value = !self.read_bool(ip, src)?;
@@ -1523,6 +1625,26 @@ impl Vm {
         }
     }
 
+    fn read_int_specialized(&self, ip: usize, register: Register) -> Result<i64, VmError> {
+        match self.registers.get(usize::from(register.0)).copied() {
+            Some(Value::Int(value)) => Ok(value),
+            Some(found) => Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "int",
+                    found,
+                },
+            )),
+            None => Err(VmError::new(
+                Some(ip),
+                VmErrorKind::InvalidRegister {
+                    register,
+                    register_count: self.register_count(),
+                },
+            )),
+        }
+    }
+
     fn read_bool(&self, ip: usize, register: Register) -> Result<bool, VmError> {
         match self.read_register(ip, register)? {
             Value::Bool(value) => Ok(value),
@@ -1805,6 +1927,47 @@ impl Vm {
         self.write_register(ip, dst, Value::Int(value))
     }
 
+    fn write_binary_int_specialized(
+        &mut self,
+        ip: usize,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        operation: &'static str,
+        op: fn(i64, i64) -> Option<i64>,
+    ) -> Result<(), VmError> {
+        let lhs = self.read_int_specialized(ip, lhs)?;
+        let rhs = self.read_int_specialized(ip, rhs)?;
+        let value = op(lhs, rhs)
+            .ok_or_else(|| VmError::new(Some(ip), VmErrorKind::ArithmeticOverflow { operation }))?;
+
+        self.write_register(ip, dst, Value::Int(value))
+    }
+
+    fn write_int_division_specialized(
+        &mut self,
+        ip: usize,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    ) -> Result<(), VmError> {
+        let rhs_value = self.read_int_specialized(ip, rhs)?;
+        if rhs_value == 0 {
+            return Err(VmError::new(Some(ip), VmErrorKind::DivisionByZero));
+        }
+
+        let lhs_value = self.read_int_specialized(ip, lhs)?;
+        let value = lhs_value.checked_div(rhs_value).ok_or_else(|| {
+            VmError::new(
+                Some(ip),
+                VmErrorKind::ArithmeticOverflow {
+                    operation: "division",
+                },
+            )
+        })?;
+        self.write_register(ip, dst, Value::Int(value))
+    }
+
     fn write_int_comparison(
         &mut self,
         ip: usize,
@@ -1815,6 +1978,19 @@ impl Vm {
     ) -> Result<(), VmError> {
         let lhs = self.read_int(ip, lhs)?;
         let rhs = self.read_int(ip, rhs)?;
+        self.write_register(ip, dst, Value::Bool(op(lhs, rhs)))
+    }
+
+    fn write_int_comparison_specialized(
+        &mut self,
+        ip: usize,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        op: fn(i64, i64) -> bool,
+    ) -> Result<(), VmError> {
+        let lhs = self.read_int_specialized(ip, lhs)?;
+        let rhs = self.read_int_specialized(ip, rhs)?;
         self.write_register(ip, dst, Value::Bool(op(lhs, rhs)))
     }
 
