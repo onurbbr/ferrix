@@ -15,6 +15,8 @@ pub use debug::{DebugAction, DebugEvent, DebugOutcome, Debugger};
 pub use error::{VmError, VmErrorKind, VmStackFrame};
 pub use heap::{GcStats, Heap, IncrementalGcPhase, RootSet};
 pub use limits::RuntimeLimits;
-pub use native::{NativeContext, NullOutput, OutputWriter};
+pub use native::{
+    HostCapability, HostCapabilityParseError, NativeContext, NullOutput, OutputWriter,
+};
 pub use runtime::{CallFrame, Vm, VmGcStats};
 pub use trace::TraceWriter;
