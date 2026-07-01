@@ -184,19 +184,27 @@ fn verifies_program_with_direct_call() {
 
 #[test]
 fn verifies_program_with_closure_call() {
-    let mut add_capture = Chunk::new("closure#0", 3)
+    let mut add_capture = Chunk::new("closure#0", 4)
         .with_arity(1)
         .with_capture_count(1);
-    add_capture.push_instruction(Instruction::LoadCapture {
+    add_capture.push_instruction(Instruction::LoadCaptureCell {
         dst: Register(1),
         capture: CaptureId(0),
     });
-    add_capture.push_instruction(Instruction::Add {
+    add_capture.push_instruction(Instruction::LoadCapture {
         dst: Register(2),
-        lhs: Register(1),
+        capture: CaptureId(0),
+    });
+    add_capture.push_instruction(Instruction::StoreCapture {
+        capture: CaptureId(0),
+        src: Register(2),
+    });
+    add_capture.push_instruction(Instruction::Add {
+        dst: Register(3),
+        lhs: Register(2),
         rhs: Register(0),
     });
-    add_capture.push_instruction(Instruction::Return { src: Register(2) });
+    add_capture.push_instruction(Instruction::Return { src: Register(3) });
 
     let mut main = Chunk::new("main", 4);
     let forty = main.add_constant(Value::Int(40)).unwrap();
@@ -204,6 +212,18 @@ fn verifies_program_with_closure_call() {
     main.push_instruction(Instruction::LoadConst {
         dst: Register(0),
         constant: forty,
+    });
+    main.push_instruction(Instruction::MakeUpvalue {
+        dst: Register(0),
+        src: Register(0),
+    });
+    main.push_instruction(Instruction::LoadUpvalue {
+        dst: Register(3),
+        upvalue: Register(0),
+    });
+    main.push_instruction(Instruction::StoreUpvalue {
+        upvalue: Register(0),
+        src: Register(3),
     });
     main.push_instruction(Instruction::MakeClosure {
         dst: Register(1),
