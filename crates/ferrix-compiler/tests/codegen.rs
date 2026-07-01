@@ -179,6 +179,65 @@ return add(10, 32);
 }
 
 #[test]
+fn compiles_function_literal_without_captures() {
+    let program = compile_source(
+        "\
+let id = fn(value) {
+    return value;
+};
+
+return id(42);
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compiles_closure_that_captures_outer_local() {
+    let program = compile_source(
+        "\
+let x = 40;
+let add = fn(y) {
+    return x + y;
+};
+
+return add(2);
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compiles_escaping_nested_closure() {
+    let program = compile_source(
+        "\
+let x = 40;
+let make_add = fn() {
+    return fn(y) {
+        return x + y;
+    };
+};
+
+let add = make_add();
+return add(2);
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
 fn compiles_recursive_function_call() {
     let program = compile_source(
         "\
