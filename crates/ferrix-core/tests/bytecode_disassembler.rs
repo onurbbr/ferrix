@@ -34,6 +34,7 @@ fn disassembles_chunk_deterministically() {
 format: FERRIXBC v1
 registers: 3
 arity: 0
+captures: 0
 constants:
   #0 Int(10)
   #1 Int(32)
