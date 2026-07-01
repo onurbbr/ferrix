@@ -3,8 +3,8 @@
 use ferrix_core::{
     Obj, ObjRef, Value,
     bytecode::{
-        Chunk, ConstId, Function, FunctionId, Instruction, JumpTarget, Program, Register,
-        VerifiedChunk, VerifiedProgram,
+        CaptureId, Chunk, ConstId, Function, FunctionId, Instruction, JumpTarget, Program,
+        Register, VerifiedChunk, VerifiedProgram,
     },
     diagnostics::{FileId, SourceManager, SourceSpan},
 };
@@ -906,6 +906,59 @@ fn runs_direct_function_call() {
 
     let mut program = Program::new(FunctionId(1));
     program.add_function(Function::bytecode(add)).unwrap();
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn runs_closure_call_with_captured_value() {
+    let mut add_capture = Chunk::new("closure#0", 3)
+        .with_arity(1)
+        .with_capture_count(1);
+    add_capture.push_instruction(Instruction::LoadCapture {
+        dst: Register(1),
+        capture: CaptureId(0),
+    });
+    add_capture.push_instruction(Instruction::Add {
+        dst: Register(2),
+        lhs: Register(1),
+        rhs: Register(0),
+    });
+    add_capture.push_instruction(Instruction::Return { src: Register(2) });
+
+    let mut main = Chunk::new("main", 4);
+    let forty = main.add_constant(Value::Int(40)).unwrap();
+    let two = main.add_constant(Value::Int(2)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: forty,
+    });
+    main.push_instruction(Instruction::MakeClosure {
+        dst: Register(1),
+        function: FunctionId(0),
+        captures_start: Register(0),
+        capture_count: 1,
+    });
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(2),
+        constant: two,
+    });
+    main.push_instruction(Instruction::CallValue {
+        dst: Register(3),
+        callee: Register(1),
+        args_start: Register(2),
+        arg_count: 1,
+    });
+    main.push_instruction(Instruction::Return { src: Register(3) });
+
+    let mut program = Program::new(FunctionId(1));
+    program
+        .add_function(Function::bytecode(add_capture))
+        .unwrap();
     program.add_function(Function::bytecode(main)).unwrap();
     let program = VerifiedProgram::new(program).unwrap();
 
