@@ -7,6 +7,7 @@
 
 pub mod daemon;
 pub mod event;
+pub mod extension;
 pub mod mode;
 pub mod output;
 pub mod policy;
@@ -23,6 +24,10 @@ pub use daemon::{
 pub use event::{
     RuntimeEvent, RuntimeEventBus, RuntimeEventBusStats, RuntimeEventKind, RuntimeEventMetadata,
     RuntimeEventSeverity,
+};
+pub use extension::{
+    CustomExtension, CustomExtensionCallResult, CustomExtensionHandler, CustomExtensionMetadata,
+    ExtensionCostClass, RuntimeExtensionRegistry,
 };
 pub use ferrix_vm::{HostCapability, HostCapabilityParseError};
 pub use mode::{
