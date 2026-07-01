@@ -152,6 +152,72 @@ return math.add(40, 2);
 }
 
 #[test]
+fn run_file_supports_explicit_module_exports() {
+    let dir = temp_dir();
+    write_file(
+        &dir,
+        "math.fx",
+        "\
+fn hidden() {
+    return 40;
+}
+
+export fn answer() {
+    return hidden();
+}
+
+export let offset = 2;
+",
+    );
+    let file = write_file(
+        &dir,
+        "main.fx",
+        "\
+import math;
+return math.answer() + math.offset;
+",
+    );
+
+    let output = run(["run", file.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "42\n");
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn run_file_reports_private_module_exports() {
+    let dir = temp_dir();
+    write_file(
+        &dir,
+        "math.fx",
+        "\
+fn hidden() {
+    return 42;
+}
+
+export fn visible() {
+    return hidden();
+}
+",
+    );
+    let file = write_file(
+        &dir,
+        "main.fx",
+        "\
+import math;
+return math.hidden();
+",
+    );
+
+    let output = run(["run", file.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("undefined export `hidden` in module `math`"));
+}
+
+#[test]
 fn run_file_supports_transitive_static_imports() {
     let dir = temp_dir();
     write_file(
@@ -199,7 +265,11 @@ fn run_file_reports_missing_static_imports() {
 
     assert_eq!(output.status.code(), Some(66));
     assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains(&format!("could not read `{}`", missing.display())));
+    assert!(stderr(&output).contains(&format!(
+        "could not resolve import `missing` from `{}` as `{}`",
+        file.display(),
+        missing.display()
+    )));
 }
 
 #[test]
