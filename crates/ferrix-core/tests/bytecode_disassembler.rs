@@ -98,6 +98,24 @@ fn disassembles_string_pool_and_load_string() {
 }
 
 #[test]
+fn disassembles_custom_extension_instruction() {
+    let mut chunk = Chunk::new("extension", 2);
+    let extension = chunk.add_string("math.double").unwrap();
+    chunk.push_instruction(Instruction::CallExtension {
+        dst: Register(1),
+        extension,
+        args_start: Register(0),
+        arg_count: 1,
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(1) });
+
+    let output = Disassembler::disassemble_chunk(&chunk);
+
+    assert!(output.contains("strings:\n  str#0 \"math.double\"\n"));
+    assert!(output.contains("0000 CallExtension r1, str#0, r0, 1\n"));
+}
+
+#[test]
 fn disassembles_array_instructions() {
     let mut chunk = Chunk::new("arrays", 4);
     chunk.push_instruction(Instruction::ArrayNew {
