@@ -120,6 +120,15 @@ pub enum RuntimeErrorKind {
     Execution(String),
     /// The selected runtime mode needs a daemon that is not available yet.
     RuntimeUnavailable { mode: RuntimeMode },
+    /// CLI and daemon protocol versions are incompatible.
+    ProtocolMismatch {
+        cli_supported: String,
+        daemon_protocol: String,
+    },
+    /// Middleware timeout budget was exceeded.
+    RequestTimeout { timeout_ms: u64 },
+    /// Middleware rate limit rejected the request.
+    RateLimited { limit_per_second: u32 },
     /// A start request targeted a service that is already running.
     ServiceAlreadyRunning,
     /// A stop request targeted a service that is not running.
@@ -204,6 +213,18 @@ impl RuntimeError {
             RuntimeErrorKind::RuntimeUnavailable {
                 mode: RuntimeMode::Embedded,
             } => "Ferrix embedded runtime is not available.\n".to_string(),
+            RuntimeErrorKind::ProtocolMismatch {
+                cli_supported,
+                daemon_protocol,
+            } => format!(
+                "Ferrix runtime protocol mismatch.\nCLI supports protocol {cli_supported}, daemon speaks protocol {daemon_protocol}.\n"
+            ),
+            RuntimeErrorKind::RequestTimeout { timeout_ms } => {
+                format!("error: runtime request exceeded timeout of {timeout_ms}ms\n")
+            }
+            RuntimeErrorKind::RateLimited { limit_per_second } => {
+                format!("error: runtime request rate limit exceeded ({limit_per_second}/s)\n")
+            }
             RuntimeErrorKind::ServiceAlreadyRunning => "Service is already running\n".to_string(),
             RuntimeErrorKind::ServiceNotRunning => "Service is not running\n".to_string(),
             RuntimeErrorKind::DaemonState { message } => {
