@@ -9,7 +9,8 @@ use std::{
 use ferrix_core::{
     Value,
     bytecode::{
-        BytecodeContainerMetadata, FEATURE_CUSTOM_EXTENSIONS, encode_container, encode_program,
+        BytecodeContainerMetadata, Chunk, Function, FunctionId, Instruction, Program, Register,
+        VerifiedProgram, encode_container, encode_program,
     },
 };
 use ferrix_runtime::{
@@ -524,7 +525,7 @@ fn runtime_rejects_unsupported_bytecode_container_features() {
     let runtime = RuntimeService::new();
     let compiled = runtime.compile_source_path(&source).unwrap();
     let mut metadata = BytecodeContainerMetadata::for_program(compiled.program.as_program());
-    metadata.feature_flags |= FEATURE_CUSTOM_EXTENSIONS;
+    metadata.feature_flags |= 1 << 31;
     fs::write(
         &bytecode,
         encode_container(compiled.program.as_program(), Some(metadata)).unwrap(),
@@ -539,7 +540,68 @@ fn runtime_rejects_unsupported_bytecode_container_features() {
     assert!(
         error
             .render()
-            .contains("unsupported bytecode feature `custom-extensions`")
+            .contains("unsupported bytecode feature `unknown:0x80000000`")
+    );
+}
+
+#[test]
+fn runtime_runs_bytecode_custom_extension_through_vm_dispatch() {
+    let dir = temp_dir();
+    let bytecode = dir.join("main.fxb");
+    let mut main = Chunk::new("main", 2);
+    let extension = main.add_string("math.double").unwrap();
+    let value = main.add_constant(Value::Int(21)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: value,
+    });
+    main.push_instruction(Instruction::CallExtension {
+        dst: Register(1),
+        extension,
+        args_start: Register(0),
+        arg_count: 1,
+    });
+    main.push_instruction(Instruction::Return { src: Register(1) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+    fs::write(
+        &bytecode,
+        encode_container(program.as_program(), None).unwrap(),
+    )
+    .unwrap();
+
+    let mut registry = RuntimeExtensionRegistry::new();
+    registry.register(CustomExtension::new(
+        CustomExtensionMetadata {
+            id: "math.double".to_string(),
+            name: "Double".to_string(),
+            arity: 1,
+            output_register: Some(1),
+            required_capabilities: Vec::new(),
+            cost: ExtensionCostClass::Cheap,
+            docs: "Doubles an integer.".to_string(),
+        },
+        |args: &[Value]| {
+            let Value::Int(value) = args[0] else {
+                return Ok(Value::Nil);
+            };
+            Ok(Value::Int(value * 2))
+        },
+    ));
+    let runtime = RuntimeService::with_extensions(registry);
+    let mut request = RunBytecodeRequest::new(&bytecode);
+    request.profile = RuntimeProfile::Trusted;
+    request.collect_audit = true;
+
+    let result = runtime.run_bytecode(request).unwrap();
+
+    assert_eq!(result.value_display.as_deref(), Some("42"));
+    assert!(
+        result
+            .audit_events
+            .iter()
+            .any(|event| event == "custom_extension_called id=math.double arity=1")
     );
 }
 
