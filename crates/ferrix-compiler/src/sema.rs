@@ -256,8 +256,21 @@ fn check_stmt(
             check_expr(value, scopes, functions)?;
             Ok(())
         }
-        Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
+        Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
             check_expr(value, scopes, functions).map(|_| ())
+        }
+        Stmt::TryCatch {
+            try_branch,
+            catch_name,
+            catch_branch,
+            ..
+        } => {
+            check_scoped_statements(try_branch, scopes, functions)?;
+            scopes.push_scope();
+            scopes.declare(catch_name.clone(), SourceType::Unknown);
+            let result = check_statements(catch_branch, scopes, functions);
+            scopes.pop_scope();
+            result
         }
         Stmt::If {
             condition,
