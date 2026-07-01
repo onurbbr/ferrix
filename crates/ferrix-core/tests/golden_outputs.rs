@@ -37,6 +37,7 @@ fn disassembler_output_is_golden_tested_outside_unit_modules() {
 format: FERRIXBC v1
 registers: 3
 arity: 0
+captures: 0
 constants:
   #0 Int(2)
   #1 Int(3)
