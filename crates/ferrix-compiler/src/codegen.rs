@@ -611,22 +611,22 @@ impl Codegen {
                 let lhs_register = self.compile_expr(lhs)?;
                 let rhs_register = self.compile_expr(rhs)?;
                 let instruction = match op {
-                    BinaryOp::Add => Instruction::Add {
+                    BinaryOp::Add => Instruction::AddInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
                     },
-                    BinaryOp::Sub => Instruction::Sub {
+                    BinaryOp::Sub => Instruction::SubInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
                     },
-                    BinaryOp::Mul => Instruction::Mul {
+                    BinaryOp::Mul => Instruction::MulInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
                     },
-                    BinaryOp::Div => Instruction::Div {
+                    BinaryOp::Div => Instruction::DivInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
@@ -641,22 +641,22 @@ impl Codegen {
                         lhs: lhs_register,
                         rhs: rhs_register,
                     },
-                    BinaryOp::Less => Instruction::Less {
+                    BinaryOp::Less => Instruction::LessInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
                     },
-                    BinaryOp::LessEqual => Instruction::LessEqual {
+                    BinaryOp::LessEqual => Instruction::LessEqualInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
                     },
-                    BinaryOp::Greater => Instruction::Greater {
+                    BinaryOp::Greater => Instruction::GreaterInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
                     },
-                    BinaryOp::GreaterEqual => Instruction::GreaterEqual {
+                    BinaryOp::GreaterEqual => Instruction::GreaterEqualInt {
                         dst,
                         lhs: lhs_register,
                         rhs: rhs_register,
