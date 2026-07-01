@@ -40,6 +40,10 @@ pub enum CompileErrorKind {
     UndefinedFunction {
         name: String,
     },
+    UndefinedModuleExport {
+        module: String,
+        name: String,
+    },
     DuplicateVariable {
         name: String,
     },
@@ -114,6 +118,9 @@ impl fmt::Display for CompileError {
             }
             CompileErrorKind::UndefinedFunction { name } => {
                 write!(f, "undefined function `{name}`")
+            }
+            CompileErrorKind::UndefinedModuleExport { module, name } => {
+                write!(f, "undefined export `{name}` in module `{module}`")
             }
             CompileErrorKind::DuplicateVariable { name } => {
                 write!(f, "duplicate variable `{name}`")
