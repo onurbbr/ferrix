@@ -535,6 +535,18 @@ impl Encoder {
                 self.reg(*args_start);
                 self.u8(*arg_count);
             }
+            Instruction::CallExtension {
+                dst,
+                extension,
+                args_start,
+                arg_count,
+            } => {
+                self.u8(47);
+                self.reg(*dst);
+                self.u16(extension.0);
+                self.reg(*args_start);
+                self.u8(*arg_count);
+            }
             Instruction::ArrayNew {
                 dst,
                 elements_start,
@@ -917,6 +929,12 @@ impl Decoder<'_> {
             27 => Instruction::CallValue {
                 dst: self.reg()?,
                 callee: self.reg()?,
+                args_start: self.reg()?,
+                arg_count: self.u8()?,
+            },
+            47 => Instruction::CallExtension {
+                dst: self.reg()?,
+                extension: crate::bytecode::StringId(self.u16()?),
                 args_start: self.reg()?,
                 arg_count: self.u8()?,
             },
