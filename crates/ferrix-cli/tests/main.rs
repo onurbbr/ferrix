@@ -280,6 +280,31 @@ fn runtime_inspection_commands_report_metrics_events_config_and_json_status() {
 }
 
 #[test]
+fn runtime_status_json_output_is_golden_tested() {
+    let dir = temp_dir();
+    let runtime_home = dir.join("runtime");
+
+    let status = run([
+        "--format",
+        "json",
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "status",
+    ]);
+
+    assert_eq!(status.status.code(), Some(0));
+    assert_eq!(
+        stdout(&status),
+        format!(
+            "{{\"runtime\":\"stopped\",\"version\":\"{}\",\"protocol\":\"1.0\",\"uptime_ms\":null,\"processes\":0,\"active\":0,\"completed\":0,\"failed\":0,\"event_queue\":0,\"events_dropped\":0}}\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert!(stderr(&status).is_empty());
+}
+
+#[test]
 fn run_and_check_watch_once_execute_one_iteration() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "return 42;\n");
