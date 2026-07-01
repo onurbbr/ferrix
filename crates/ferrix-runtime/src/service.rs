@@ -13,14 +13,14 @@ use ferrix_compiler::{
 };
 use ferrix_core::{
     Obj, Value,
-    bytecode::{VerifiedProgram, decode_program},
+    bytecode::{FunctionKind, Program, VerifiedProgram, decode_program},
     diagnostics::SourceManager,
 };
 use ferrix_vm::{Heap, Vm};
 
 use crate::{
     DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind,
-    RuntimeStats, output::install_output,
+    RuntimePolicy, RuntimeStats, output::install_output,
 };
 
 const MANIFEST_FILES: &[&str] = &["Ferrix.toml", "ferrix.toml"];
@@ -47,9 +47,10 @@ impl RuntimeService {
     /// Compiles and runs a source file, package directory, or package manifest.
     pub fn run_source(&self, request: RunSourceRequest) -> Result<RunResult, RuntimeError> {
         let compiled = self.compile_source_path(&request.path)?;
-        let mut vm = Vm::with_limits(request.profile.limits());
+        let policy = RuntimePolicy::new(request.profile, request.capabilities.iter().copied());
+        let mut vm = vm_for_policy(&policy);
         let capture = install_output(&mut vm, request.output);
-        ferrix_stdlib::install(&mut vm, compiled.program.as_program());
+        install_stdlib_for_policy(&mut vm, compiled.program.as_program(), &policy)?;
 
         match vm.run_program(&compiled.program) {
             Ok(value) => Ok(run_result(&vm, value, capture, request.collect_stats)),
@@ -78,9 +79,10 @@ impl RuntimeService {
             RuntimeError::new(65, RuntimeErrorKind::DecodeBytecode(error.to_string()))
         })?;
 
-        let mut vm = Vm::with_limits(request.profile.limits());
+        let policy = RuntimePolicy::new(request.profile, request.capabilities.iter().copied());
+        let mut vm = vm_for_policy(&policy);
         let capture = install_output(&mut vm, request.output);
-        ferrix_stdlib::install(&mut vm, program.as_program());
+        install_stdlib_for_policy(&mut vm, program.as_program(), &policy)?;
 
         match vm.run_program(&program) {
             Ok(value) => Ok(run_result(&vm, value, capture, request.collect_stats)),
@@ -103,6 +105,56 @@ impl RuntimeService {
     }
 }
 
+fn vm_for_policy(policy: &RuntimePolicy) -> Vm {
+    let mut vm = Vm::with_limits(policy.profile().limits());
+    vm.set_capabilities(policy.granted_capabilities());
+    vm
+}
+
+fn install_stdlib_for_policy(
+    vm: &mut Vm,
+    program: &Program,
+    policy: &RuntimePolicy,
+) -> Result<(), RuntimeError> {
+    ferrix_stdlib::validate_registry()
+        .map_err(|message| RuntimeError::new(70, RuntimeErrorKind::PolicyDenied { message }))?;
+
+    for function in &program.functions {
+        let FunctionKind::Native { name } = &function.kind else {
+            continue;
+        };
+        let Some(binding) = ferrix_stdlib::find_binding(name, function.arity) else {
+            continue;
+        };
+        policy
+            .require_native_available(binding)
+            .map_err(policy_error)?;
+        for capability in binding.required_capabilities {
+            policy
+                .require_capability(*capability, "install native binding")
+                .map_err(policy_error)?;
+        }
+    }
+
+    ferrix_stdlib::install_with_filter(vm, program, |binding| {
+        policy.native_available(binding)
+            && binding
+                .required_capabilities
+                .iter()
+                .all(|capability| policy.allows_capability(*capability))
+    });
+    Ok(())
+}
+
+fn policy_error(error: crate::PolicyFailure) -> RuntimeError {
+    RuntimeError::new(
+        70,
+        RuntimeErrorKind::PolicyDenied {
+            message: error.to_string(),
+        },
+    )
+}
+
 fn run_result(
     vm: &Vm,
     value: Value,
@@ -123,7 +175,7 @@ fn run_result(
         value_display,
         output,
         stats,
-        audit_events: Vec::new(),
+        audit_events: vm.audit_events().to_vec(),
     }
 }
 
