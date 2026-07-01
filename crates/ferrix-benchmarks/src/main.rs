@@ -12,7 +12,7 @@ use std::{
 };
 
 use ferrix_compiler::compile_source;
-use ferrix_vm::Vm;
+use ferrix_vm::{HostCapability, Vm};
 
 const CASES: &[BenchCase] = &[
     BenchCase {
@@ -283,6 +283,7 @@ fn run_case(case: &BenchCase) -> BenchResult {
 
     let run_elapsed = timed(case.iterations, || {
         let mut vm = Vm::new();
+        vm.set_capabilities([HostCapability::NativeCall, HostCapability::IoOutput]);
         ferrix_stdlib::install(&mut vm, program.as_program());
         vm.run_program(&program)
             .expect("benchmark source should execute");
