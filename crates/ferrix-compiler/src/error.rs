@@ -58,6 +58,10 @@ pub enum CompileErrorKind {
         expected: usize,
         actual: usize,
     },
+    TypeMismatch {
+        expected: String,
+        found: String,
+    },
     TooManyParameters {
         max: usize,
     },
@@ -139,6 +143,9 @@ impl fmt::Display for CompileError {
                 f,
                 "wrong argument count for `{name}`; expected {expected}, got {actual}"
             ),
+            CompileErrorKind::TypeMismatch { expected, found } => {
+                write!(f, "type mismatch; expected {expected}, got {found}")
+            }
             CompileErrorKind::TooManyParameters { max } => {
                 write!(f, "too many function parameters; maximum is {max}")
             }
