@@ -36,10 +36,10 @@ Ferrix
 
 Usage:
   ferrix [--runtime-mode <mode>] [--runtime-home <dir>] <command>
-  ferrix run <file|package>
+  ferrix run <file|package> [--stats] [--audit]
   ferrix check <file|package>
   ferrix compile <file|package> <output>
-  ferrix run-bytecode <file>
+  ferrix run-bytecode <file> [--stats] [--audit]
   ferrix debug <file|package>
   ferrix runtime start|stop|status|restart
   ferrix ps
@@ -94,12 +94,22 @@ fn run_cli(
             writeln!(stdout, "ferrix {}", env!("CARGO_PKG_VERSION")).expect("stdout write failed");
             0
         }
-        [command, path] if command == "run" => run_file(path, &config, stdout, stderr),
+        [command, path, options @ ..] if command == "run" => {
+            let Some(options) = parse_run_display_options(options, stderr) else {
+                return 64;
+            };
+            run_file(path, &config, options, stdout, stderr)
+        }
         [command, path] if command == "check" => check_file(path, &config, &mut read_file, stderr),
         [command, path, output] if command == "compile" => {
             compile_bytecode(path, output, &config, &mut read_file, stderr)
         }
-        [command, path] if command == "run-bytecode" => run_bytecode(path, &config, stdout, stderr),
+        [command, path, options @ ..] if command == "run-bytecode" => {
+            let Some(options) = parse_run_display_options(options, stderr) else {
+                return 64;
+            };
+            run_bytecode(path, &config, options, stdout, stderr)
+        }
         [command, path] if command == "debug" => debug_file(path, &config, stdin, stdout, stderr),
         [command, action] if command == "runtime" && action == "serve" => runtime_serve(stderr),
         [command, action, ..] if command == "runtime" && action == "serve" => {
@@ -188,6 +198,12 @@ struct CliConfig {
     runtime_home: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunDisplayOptions {
+    stats: bool,
+    audit: bool,
+}
+
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
@@ -244,6 +260,24 @@ fn parse_runtime_options(
     }
 
     Ok((config, rest))
+}
+
+fn parse_run_display_options(
+    args: &[String],
+    stderr: &mut impl io::Write,
+) -> Option<RunDisplayOptions> {
+    let mut options = RunDisplayOptions::default();
+    for arg in args {
+        match arg.as_str() {
+            "--stats" => options.stats = true,
+            "--audit" => options.audit = true,
+            _ => {
+                writeln!(stderr, "error: unknown run option `{arg}`").expect("stderr write failed");
+                return None;
+            }
+        }
+    }
+    Some(options)
 }
 
 fn runtime_command(
@@ -532,6 +566,9 @@ fn write_status(stdout: &mut impl io::Write, status: &ferrix_runtime::RuntimeSta
     writeln!(stdout, "active: {}", status.active_process_count).expect("stdout write failed");
     writeln!(stdout, "completed: {}", status.completed_process_count).expect("stdout write failed");
     writeln!(stdout, "failed: {}", status.failed_process_count).expect("stdout write failed");
+    writeln!(stdout, "event_queue: {}", status.event_queue_len).expect("stdout write failed");
+    writeln!(stdout, "events_dropped: {}", status.dropped_event_count)
+        .expect("stdout write failed");
 }
 
 fn list_processes(
@@ -644,6 +681,7 @@ fn write_process_info(stdout: &mut impl io::Write, process: &RuntimeProcessRecor
     if let Some(error) = &process.last_error {
         writeln!(stdout, "error: {}", error.trim_end()).expect("stdout write failed");
     }
+    write_runtime_stats(stdout, &process.stats);
 }
 
 fn kill_process(
@@ -784,6 +822,7 @@ fn compile_bytecode(
 fn run_bytecode(
     path: &str,
     config: &CliConfig,
+    options: RunDisplayOptions,
     stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> i32 {
@@ -791,8 +830,11 @@ fn run_bytecode(
         Ok(runtime) => runtime,
         Err(code) => return code,
     };
-    match runtime.run_bytecode(RunBytecodeRequest::new(path)) {
-        Ok(result) => write_run_result(stdout, result),
+    let mut request = RunBytecodeRequest::new(path);
+    request.collect_stats = options.stats;
+    request.collect_audit = options.audit;
+    match runtime.run_bytecode(request) {
+        Ok(result) => write_run_result(stdout, result, options),
         Err(error) => {
             let rendered = error.render();
             write!(stderr, "{rendered}").expect("stderr write failed");
@@ -804,6 +846,7 @@ fn run_bytecode(
 fn run_file(
     path: &str,
     config: &CliConfig,
+    options: RunDisplayOptions,
     stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> i32 {
@@ -813,8 +856,11 @@ fn run_file(
         Ok(runtime) => runtime,
         Err(code) => return code,
     };
-    match runtime.run_source(RunSourceRequest::new(path)) {
-        Ok(result) => write_run_result(stdout, result),
+    let mut request = RunSourceRequest::new(path);
+    request.collect_stats = options.stats;
+    request.collect_audit = options.audit;
+    match runtime.run_source(request) {
+        Ok(result) => write_run_result(stdout, result, options),
         Err(error) => {
             let rendered = error.render();
             write!(stderr, "{rendered}").expect("stderr write failed");
@@ -823,12 +869,61 @@ fn run_file(
     }
 }
 
-fn write_run_result(stdout: &mut impl io::Write, result: ferrix_runtime::RunResult) -> i32 {
+fn write_run_result(
+    stdout: &mut impl io::Write,
+    result: ferrix_runtime::RunResult,
+    options: RunDisplayOptions,
+) -> i32 {
     write!(stdout, "{}", result.output).expect("stdout write failed");
     if let Some(value) = result.value_display {
         writeln!(stdout, "{value}").expect("stdout write failed");
     }
+    if options.stats {
+        write_runtime_stats(stdout, &result.stats);
+    }
+    if options.audit {
+        write_audit_events(stdout, &result.audit_events);
+    }
     result.exit_code
+}
+
+fn write_runtime_stats(stdout: &mut impl io::Write, stats: &ferrix_runtime::RuntimeStats) {
+    writeln!(stdout, "stats:").expect("stdout write failed");
+    writeln!(
+        stdout,
+        "  executed_instructions: {}",
+        stats.executed_instructions
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "  native_calls: {}", stats.native_calls).expect("stdout write failed");
+    writeln!(stdout, "  allocations: {}", stats.allocations).expect("stdout write failed");
+    writeln!(stdout, "  heap_objects: {}", stats.heap_objects).expect("stdout write failed");
+    writeln!(stdout, "  gc_collections: {}", stats.gc_collections).expect("stdout write failed");
+    writeln!(
+        stdout,
+        "  incremental_gc_steps: {}",
+        stats.incremental_gc_steps
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "  max_call_depth: {}", stats.max_call_depth).expect("stdout write failed");
+    writeln!(stdout, "  max_register_count: {}", stats.max_register_count)
+        .expect("stdout write failed");
+    writeln!(stdout, "  thrown_errors: {}", stats.thrown_errors).expect("stdout write failed");
+    writeln!(stdout, "  handled_exceptions: {}", stats.handled_exceptions)
+        .expect("stdout write failed");
+    writeln!(stdout, "  execution_time_ms: {}", stats.execution_time_ms)
+        .expect("stdout write failed");
+}
+
+fn write_audit_events(stdout: &mut impl io::Write, audit_events: &[String]) {
+    writeln!(stdout, "audit:").expect("stdout write failed");
+    if audit_events.is_empty() {
+        writeln!(stdout, "  <empty>").expect("stdout write failed");
+    } else {
+        for event in audit_events {
+            writeln!(stdout, "  {event}").expect("stdout write failed");
+        }
+    }
 }
 
 fn debug_file(
