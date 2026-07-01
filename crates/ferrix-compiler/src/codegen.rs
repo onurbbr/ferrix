@@ -363,6 +363,28 @@ impl Codegen {
                 );
                 Ok(())
             }
+            Stmt::FieldAssign {
+                target,
+                field,
+                value,
+                span,
+            } => {
+                let target = self.compile_expr(target)?;
+                let value = self.compile_expr(value)?;
+                let field = self
+                    .chunk
+                    .add_string(field.clone())
+                    .map_err(map_chunk_error)?;
+                self.chunk.push_instruction_with_span(
+                    Instruction::FieldSet {
+                        target,
+                        field,
+                        value,
+                    },
+                    Some(*span),
+                );
+                Ok(())
+            }
             Stmt::Return { value, span } => {
                 let src = self.compile_expr(value)?;
                 self.chunk
@@ -637,6 +659,7 @@ impl Codegen {
             }
             Expr::Array { elements, span } => self.compile_array_into(elements, dst, *span),
             Expr::Map { entries, span } => self.compile_map_into(entries, dst, *span),
+            Expr::Record { fields, span } => self.compile_record_into(fields, dst, *span),
             Expr::Index {
                 target,
                 index,
@@ -646,6 +669,28 @@ impl Codegen {
                 let index = self.compile_expr(index)?;
                 self.chunk.push_instruction_with_span(
                     Instruction::IndexGet { dst, target, index },
+                    Some(*span),
+                );
+                Ok(())
+            }
+            Expr::Field {
+                target,
+                field,
+                span,
+            } => {
+                if let Some(name) = namespaced_field_name(target, field)
+                    && (self.lookup_local(&name).is_some() || self.captures.contains_key(&name))
+                {
+                    return self.compile_expr_into(&Expr::Variable { name, span: *span }, dst);
+                }
+
+                let target = self.compile_expr(target)?;
+                let field = self
+                    .chunk
+                    .add_string(field.clone())
+                    .map_err(map_chunk_error)?;
+                self.chunk.push_instruction_with_span(
+                    Instruction::FieldGet { dst, target, field },
                     Some(*span),
                 );
                 Ok(())
@@ -735,6 +780,55 @@ impl Codegen {
                 dst,
                 entries_start,
                 entry_count: entries.len() as u8,
+            },
+            Some(span),
+        );
+        Ok(())
+    }
+
+    fn compile_record_into(
+        &mut self,
+        fields: &[(String, Expr)],
+        dst: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        if fields.len() > u8::MAX as usize {
+            return Err(CompileError::new(
+                CompileErrorKind::TooManyRecordFields {
+                    max: u8::MAX as usize,
+                },
+                Some(span),
+            ));
+        }
+
+        let field_names = fields
+            .iter()
+            .map(|(field, _)| {
+                self.chunk
+                    .add_string(field.clone())
+                    .map_err(map_chunk_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let fields_start = if fields.is_empty() {
+            Register(0)
+        } else {
+            let start = self.alloc_register()?;
+            let mut field_registers = vec![start];
+            for _ in fields.iter().skip(1) {
+                field_registers.push(self.alloc_register()?);
+            }
+
+            for ((_, value), register) in fields.iter().zip(field_registers) {
+                self.compile_expr_into(value, register)?;
+            }
+            start
+        };
+
+        self.chunk.push_instruction_with_span(
+            Instruction::RecordNew {
+                dst,
+                fields_start,
+                fields: field_names,
             },
             Some(span),
         );
@@ -1255,6 +1349,17 @@ fn rewrite_module_stmt(function_targets: &HashMap<String, String>, stmt: Stmt) -
             value: rewrite_module_expr(function_targets, value),
             span,
         },
+        Stmt::FieldAssign {
+            target,
+            field,
+            value,
+            span,
+        } => Stmt::FieldAssign {
+            target: rewrite_module_expr(function_targets, target),
+            field,
+            value: rewrite_module_expr(function_targets, value),
+            span,
+        },
         Stmt::Return { value, span } => Stmt::Return {
             value: rewrite_module_expr(function_targets, value),
             span,
@@ -1336,6 +1441,15 @@ fn rewrite_module_expr(function_targets: &HashMap<String, String>, expr: Expr) -
             index: Box::new(rewrite_module_expr(function_targets, *index)),
             span,
         },
+        Expr::Field {
+            target,
+            field,
+            span,
+        } => Expr::Field {
+            target: Box::new(rewrite_module_expr(function_targets, *target)),
+            field,
+            span,
+        },
         Expr::Array { elements, span } => Expr::Array {
             elements: elements
                 .into_iter()
@@ -1352,6 +1466,13 @@ fn rewrite_module_expr(function_targets: &HashMap<String, String>, expr: Expr) -
                         rewrite_module_expr(function_targets, value),
                     )
                 })
+                .collect(),
+            span,
+        },
+        Expr::Record { fields, span } => Expr::Record {
+            fields: fields
+                .into_iter()
+                .map(|(field, value)| (field, rewrite_module_expr(function_targets, value)))
                 .collect(),
             span,
         },
@@ -1417,6 +1538,19 @@ fn rewrite_module_value_expr(
             )),
             span,
         },
+        Expr::Field {
+            target,
+            field,
+            span,
+        } => Expr::Field {
+            target: Box::new(rewrite_module_value_expr(
+                function_targets,
+                value_targets,
+                *target,
+            )),
+            field,
+            span,
+        },
         Expr::Array { elements, span } => Expr::Array {
             elements: elements
                 .into_iter()
@@ -1430,6 +1564,18 @@ fn rewrite_module_value_expr(
                 .map(|(key, value)| {
                     (
                         rewrite_module_value_expr(function_targets, value_targets, key),
+                        rewrite_module_value_expr(function_targets, value_targets, value),
+                    )
+                })
+                .collect(),
+            span,
+        },
+        Expr::Record { fields, span } => Expr::Record {
+            fields: fields
+                .into_iter()
+                .map(|(field, value)| {
+                    (
+                        field,
                         rewrite_module_value_expr(function_targets, value_targets, value),
                     )
                 })
@@ -1457,6 +1603,13 @@ fn map_chunk_error(error: ChunkBuildError) -> CompileError {
             CompileError::new(CompileErrorKind::TooManyStrings { max }, None)
         }
     }
+}
+
+fn namespaced_field_name(target: &Expr, field: &str) -> Option<String> {
+    let Expr::Variable { name, .. } = target else {
+        return None;
+    };
+    Some(format!("{name}.{field}"))
 }
 
 fn map_program_error(error: ProgramBuildError) -> CompileError {
@@ -1561,6 +1714,9 @@ fn stmt_references_call(stmt: &Stmt, name: &str) -> bool {
                 || expr_references_call(index, name)
                 || expr_references_call(value, name)
         }
+        Stmt::FieldAssign { target, value, .. } => {
+            expr_references_call(target, name) || expr_references_call(value, name)
+        }
         Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
             expr_references_call(value, name)
         }
@@ -1611,12 +1767,16 @@ fn expr_references_call(expr: &Expr, name: &str) -> bool {
         Expr::Index { target, index, .. } => {
             expr_references_call(target, name) || expr_references_call(index, name)
         }
+        Expr::Field { target, .. } => expr_references_call(target, name),
         Expr::Array { elements, .. } => elements
             .iter()
             .any(|element| expr_references_call(element, name)),
         Expr::Map { entries, .. } => entries.iter().any(|(key, value)| {
             expr_references_call(key, name) || expr_references_call(value, name)
         }),
+        Expr::Record { fields, .. } => fields
+            .iter()
+            .any(|(_, value)| expr_references_call(value, name)),
         Expr::Function { body, .. } => body.iter().any(|stmt| stmt_references_call(stmt, name)),
         Expr::Grouping { expr, .. } => expr_references_call(expr, name),
     }
@@ -1732,6 +1892,10 @@ fn collect_stmt_captured_locals(
                 collect_expr_captured_locals(index, scopes, functions, captured);
                 collect_expr_captured_locals(value, scopes, functions, captured);
             }
+            Stmt::FieldAssign { target, value, .. } => {
+                collect_expr_captured_locals(target, scopes, functions, captured);
+                collect_expr_captured_locals(value, scopes, functions, captured);
+            }
             Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
                 collect_expr_captured_locals(value, scopes, functions, captured);
             }
@@ -1791,6 +1955,9 @@ fn collect_expr_captured_locals(
             collect_expr_captured_locals(target, scopes, functions, captured);
             collect_expr_captured_locals(index, scopes, functions, captured);
         }
+        Expr::Field { target, .. } => {
+            collect_expr_captured_locals(target, scopes, functions, captured);
+        }
         Expr::Array { elements, .. } => {
             for element in elements {
                 collect_expr_captured_locals(element, scopes, functions, captured);
@@ -1799,6 +1966,11 @@ fn collect_expr_captured_locals(
         Expr::Map { entries, .. } => {
             for (key, value) in entries {
                 collect_expr_captured_locals(key, scopes, functions, captured);
+                collect_expr_captured_locals(value, scopes, functions, captured);
+            }
+        }
+        Expr::Record { fields, .. } => {
+            for (_, value) in fields {
                 collect_expr_captured_locals(value, scopes, functions, captured);
             }
         }
@@ -1853,6 +2025,10 @@ fn collect_stmt_free_variables(
             } => {
                 collect_expr_free_variables(target, scopes, functions, seen, free);
                 collect_expr_free_variables(index, scopes, functions, seen, free);
+                collect_expr_free_variables(value, scopes, functions, seen, free);
+            }
+            Stmt::FieldAssign { target, value, .. } => {
+                collect_expr_free_variables(target, scopes, functions, seen, free);
                 collect_expr_free_variables(value, scopes, functions, seen, free);
             }
             Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
@@ -1939,6 +2115,9 @@ fn collect_expr_free_variables(
             collect_expr_free_variables(target, scopes, functions, seen, free);
             collect_expr_free_variables(index, scopes, functions, seen, free);
         }
+        Expr::Field { target, .. } => {
+            collect_expr_free_variables(target, scopes, functions, seen, free);
+        }
         Expr::Array { elements, .. } => {
             for element in elements {
                 collect_expr_free_variables(element, scopes, functions, seen, free);
@@ -1947,6 +2126,11 @@ fn collect_expr_free_variables(
         Expr::Map { entries, .. } => {
             for (key, value) in entries {
                 collect_expr_free_variables(key, scopes, functions, seen, free);
+                collect_expr_free_variables(value, scopes, functions, seen, free);
+            }
+        }
+        Expr::Record { fields, .. } => {
+            for (_, value) in fields {
                 collect_expr_free_variables(value, scopes, functions, seen, free);
             }
         }
@@ -1990,6 +2174,7 @@ fn stmt_definitely_returns(stmt: &Stmt) -> bool {
         | Stmt::Function { .. }
         | Stmt::Assign { .. }
         | Stmt::IndexAssign { .. }
+        | Stmt::FieldAssign { .. }
         | Stmt::While { .. }
         | Stmt::Expr { .. } => false,
     }
