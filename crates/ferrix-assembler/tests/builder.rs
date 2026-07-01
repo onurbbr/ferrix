@@ -119,6 +119,24 @@ fn builder_supports_string_pool_and_load_string() {
 }
 
 #[test]
+fn builder_supports_custom_extension_call_instruction() {
+    let chunk = Assembler::new("extension")
+        .registers(2)
+        .string("math.double")
+        .int(21)
+        .load_const(0, 0)
+        .call_extension(1, 0, 0, 1)
+        .ret(1)
+        .finish()
+        .unwrap();
+
+    assert!(matches!(
+        chunk.as_chunk().instructions[1],
+        Instruction::CallExtension { arg_count: 1, .. }
+    ));
+}
+
+#[test]
 fn builder_supports_record_and_field_opcodes() {
     let chunk = Assembler::new("records")
         .registers(4)
