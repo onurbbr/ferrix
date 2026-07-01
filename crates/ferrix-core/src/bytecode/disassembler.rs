@@ -418,6 +418,21 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 arg_count
             )
         }
+        Instruction::CallExtension {
+            dst,
+            extension,
+            args_start,
+            arg_count,
+        } => {
+            format!(
+                "{:<13} {}, {}, {}, {}",
+                "CallExtension",
+                register(*dst),
+                string_id(*extension),
+                register(*args_start),
+                arg_count
+            )
+        }
         Instruction::ArrayNew {
             dst,
             elements_start,
