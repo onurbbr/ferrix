@@ -8,9 +8,9 @@ use std::{
 };
 
 use ferrix_compiler::{
-    CompileError, ImportedModuleAst,
+    CompileError, CompileReport, ImportedModuleAst,
     ast::{ProgramAst, Stmt},
-    compile_program_ast_with_named_modules, parse_source_with_file_id,
+    compile_program_ast_with_named_modules_report, parse_source_with_file_id,
 };
 use ferrix_core::{
     Obj, Value,
@@ -41,6 +41,8 @@ pub struct CompiledProgram {
     pub sources: SourceManager,
     /// Verified program ready for VM execution.
     pub program: VerifiedProgram,
+    /// Compiler analysis and optimization metadata.
+    pub report: CompileReport,
 }
 
 impl RuntimeService {
@@ -362,15 +364,19 @@ fn compile_source_path(path: &Path) -> Result<CompiledProgram, RuntimeError> {
     let graph = load_module_graph(&input.entry_path, input.package.as_ref(), &mut sources)
         .map_err(|error| runtime_load_error(error, Some(&sources)))?;
 
-    let program =
-        compile_program_ast_with_named_modules(graph.entry, graph.modules).map_err(|error| {
+    let compiled = compile_program_ast_with_named_modules_report(graph.entry, graph.modules)
+        .map_err(|error| {
             RuntimeError::new(
                 65,
                 RuntimeErrorKind::Diagnostic(sources.render_diagnostic(&error.to_diagnostic())),
             )
         })?;
 
-    Ok(CompiledProgram { sources, program })
+    Ok(CompiledProgram {
+        sources,
+        program: compiled.program,
+        report: compiled.report,
+    })
 }
 
 struct CompileInput {
