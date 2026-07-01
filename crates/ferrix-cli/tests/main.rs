@@ -307,6 +307,72 @@ fn debug_file_supports_instruction_breakpoints() {
 }
 
 #[test]
+fn debug_file_supports_source_line_breakpoints() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "let x = 1;\nlet y = 41;\nreturn x + y;\n");
+
+    let output = run_with_input(
+        ["debug", file.to_str().unwrap()],
+        "break line 2\ncontinue\ncontinue\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    assert!(stdout(&output).contains("set breakpoint at line 2"));
+    assert!(stdout(&output).contains(&format!(" --> {}:2:", file.display())));
+    assert!(stdout(&output).contains("  | let y = 41;"));
+    assert!(stdout(&output).contains("debug: finished with 42"));
+}
+
+#[test]
+fn debug_file_supports_watches_and_disassembly() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "let x = 40 + 2;\nreturn x;\n");
+
+    let output = run_with_input(
+        ["debug", file.to_str().unwrap()],
+        "watch r1\ndisasm 1\nstep\ncontinue\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    assert!(stdout(&output).contains("watch #0: r1 = nil"));
+    assert!(stdout(&output).contains("disassembly for frame #0 main"));
+    assert!(stdout(&output).contains("=> 0000"));
+    assert!(stdout(&output).contains("watch #0: r1 = 40"));
+    assert!(stdout(&output).contains("debug: finished with 42"));
+}
+
+#[test]
+fn debug_file_supports_frame_selection() {
+    let dir = temp_dir();
+    let file = write_file(
+        &dir,
+        "main.fx",
+        "\
+fn add(a, b) {
+    return a + b;
+}
+return add(40, 2);
+",
+    );
+
+    let output = run_with_input(
+        ["debug", file.to_str().unwrap()],
+        "break add:0\ncontinue\nstack\nframe 1\nregisters\ncontinue\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    assert!(stdout(&output).contains("set breakpoint at fn#0:0"));
+    assert!(stdout(&output).contains("#0 * at add (fn#0, ip=0)"));
+    assert!(stdout(&output).contains("#1 at main (fn#1, ip="));
+    assert!(stdout(&output).contains("selected frame #1 at main (fn#1, ip="));
+    assert!(stdout(&output).contains("registers for frame #1 main (fn#1, ip="));
+    assert!(stdout(&output).contains("debug: finished with 42"));
+}
+
+#[test]
 fn run_file_prints_array_results_and_supports_len() {
     let dir = temp_dir();
     let file = write_file(
