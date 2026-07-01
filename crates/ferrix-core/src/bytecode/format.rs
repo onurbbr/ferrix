@@ -50,6 +50,7 @@ pub const SUPPORTED_BYTECODE_FEATURE_FLAGS: u32 = FEATURE_CLOSURES
     | FEATURE_MODULES
     | FEATURE_NATIVE_CALLS
     | FEATURE_EXCEPTIONS
+    | FEATURE_CUSTOM_EXTENSIONS
     | FEATURE_DEBUG_SYMBOLS
     | FEATURE_OPTIMIZED_INT_OPS;
 
@@ -191,6 +192,7 @@ fn instruction_feature_flags(instruction: &Instruction) -> u32 {
         | Instruction::MakeUpvalue { .. }
         | Instruction::LoadUpvalue { .. }
         | Instruction::StoreUpvalue { .. } => FEATURE_CLOSURES,
+        Instruction::CallExtension { .. } => FEATURE_CUSTOM_EXTENSIONS,
         Instruction::ArrayNew { .. }
         | Instruction::ArrayGet { .. }
         | Instruction::ArraySet { .. } => FEATURE_ARRAYS,
