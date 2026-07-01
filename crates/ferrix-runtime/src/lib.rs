@@ -22,8 +22,9 @@ pub mod service;
 
 pub use config::{RuntimeConfig, RuntimeLogLevel};
 pub use daemon::{
-    RuntimeCheckpoint, RuntimeDaemon, RuntimeHealth, RuntimeStateStore, RuntimeStatusReport,
-    default_config_path, default_ferrix_home, default_runtime_home, ensure_default_layout,
+    RuntimeCheckpoint, RuntimeDaemon, RuntimeHealth, RuntimeMetricsReport, RuntimeStateStore,
+    RuntimeStatusReport, default_config_path, default_ferrix_home, default_runtime_home,
+    ensure_default_layout,
 };
 pub use event::{
     RuntimeEvent, RuntimeEventBus, RuntimeEventBusStats, RuntimeEventKind, RuntimeEventMetadata,
