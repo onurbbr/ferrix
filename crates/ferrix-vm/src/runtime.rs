@@ -37,6 +37,7 @@ pub struct Vm {
     program_roots: Vec<ObjRef>,
     heap: Heap,
     gc_stats: VmGcStats,
+    execution_stats: VmExecutionStats,
     output: Box<dyn OutputWriter>,
     capabilities: HashSet<HostCapability>,
     audit_events: Vec<String>,
@@ -96,6 +97,21 @@ pub struct VmGcStats {
     pub last_collection: GcStats,
 }
 
+/// Cumulative execution counters for one VM instance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmExecutionStats {
+    /// Host native calls executed successfully or attempted by this VM.
+    pub native_calls: u64,
+    /// Maximum number of active call frames observed during execution.
+    pub max_call_depth: usize,
+    /// Maximum register file size observed during execution.
+    pub max_register_count: usize,
+    /// Number of throw instructions executed.
+    pub thrown_errors: u64,
+    /// Number of throw instructions caught by an exception handler.
+    pub handled_exceptions: u64,
+}
+
 impl Vm {
     /// Creates a VM with default runtime limits.
     pub fn new() -> Self {
@@ -115,6 +131,7 @@ impl Vm {
             program_roots: Vec::new(),
             heap: Heap::new(),
             gc_stats: VmGcStats::default(),
+            execution_stats: VmExecutionStats::default(),
             output: Box::new(NullOutput),
             capabilities: HashSet::new(),
             audit_events: Vec::new(),
@@ -166,6 +183,11 @@ impl Vm {
     /// Returns cumulative allocation and GC counters.
     pub fn gc_stats(&self) -> VmGcStats {
         self.gc_stats
+    }
+
+    /// Returns cumulative non-GC execution counters.
+    pub fn execution_stats(&self) -> VmExecutionStats {
+        self.execution_stats
     }
 
     /// Returns the current incremental GC phase.
@@ -715,6 +737,7 @@ impl Vm {
         self.instruction_ip = 0;
         self.executed_instruction_count = 0;
         self.registers = vec![Value::Nil; usize::from(chunk.register_count)];
+        self.record_register_count(self.registers.len());
         self.frames.clear();
         self.exception_handlers.clear();
         self.field_cache.clear();
@@ -778,6 +801,7 @@ impl Vm {
                 )
             })?;
             self.registers = self.frames[frame_index].registers.clone();
+            self.record_register_count(self.registers.len());
             self.step_incremental_garbage();
 
             if let Some(debugger) = debugger.as_deref_mut() {
@@ -1119,6 +1143,8 @@ impl Vm {
                         }
                         err
                     })?;
+                self.execution_stats.native_calls =
+                    self.execution_stats.native_calls.saturating_add(1);
                 let native = self
                     .native_functions
                     .get(&function_id)
@@ -1285,9 +1311,12 @@ impl Vm {
     }
 
     fn throw_value(&mut self, ip: usize, value: Value) -> Result<bool, VmError> {
+        self.execution_stats.thrown_errors = self.execution_stats.thrown_errors.saturating_add(1);
         let Some(handler) = self.exception_handlers.pop() else {
             return Err(VmError::new(Some(ip), VmErrorKind::UncaughtThrow { value }));
         };
+        self.execution_stats.handled_exceptions =
+            self.execution_stats.handled_exceptions.saturating_add(1);
 
         if handler.frame_depth == 0 {
             write_register_in(Some(ip), &mut self.registers, handler.error_register, value)?;
@@ -1457,6 +1486,10 @@ impl Vm {
             captures: captures.to_vec(),
             return_dst,
         });
+        self.record_call_depth();
+        if let Some(frame) = self.frames.last() {
+            self.record_register_count(frame.registers.len());
+        }
         Ok(())
     }
 
@@ -2118,6 +2151,16 @@ impl Vm {
         self.gc_stats.live_after_last_collection = stats.live;
         self.gc_stats.last_collection = stats;
         self.gc_stats.allocation_pressure = 0;
+    }
+
+    fn record_call_depth(&mut self) {
+        self.execution_stats.max_call_depth =
+            self.execution_stats.max_call_depth.max(self.frames.len());
+    }
+
+    fn record_register_count(&mut self, register_count: usize) {
+        self.execution_stats.max_register_count =
+            self.execution_stats.max_register_count.max(register_count);
     }
 
     fn attach_stack_trace(&self, error: VmError, program: &Program) -> VmError {
