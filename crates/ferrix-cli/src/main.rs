@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use ferrix_compiler::{
@@ -21,13 +21,16 @@ use ferrix_compiler::{
 };
 use ferrix_core::{
     Obj, Value,
-    bytecode::{BytecodeContainerMetadata, FunctionId, encode_container, format_instruction},
+    bytecode::{
+        BytecodeContainerMetadata, FunctionId, encode_container, format_instruction,
+        inspect_container,
+    },
     diagnostics::{SourceLocation, SourceManager},
 };
 use ferrix_runtime::{
     DebugRequest, RecordProcessRequest, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon,
-    RuntimeGateway, RuntimeMode, RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord,
-    RuntimeProfile,
+    RuntimeEvent, RuntimeGateway, RuntimeMetricsReport, RuntimeMode, RuntimeProcessId,
+    RuntimeProcessKind, RuntimeProcessRecord, RuntimeProfile,
 };
 use ferrix_vm::{CallFrame, DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
 
@@ -35,16 +38,18 @@ const USAGE: &str = "\
 Ferrix
 
 Usage:
-  ferrix [--runtime-mode <mode>] [--runtime-home <dir>] <command>
-  ferrix run <file|package> [--stats] [--audit]
-  ferrix check <file|package>
+  ferrix [--runtime-mode <mode>] [--runtime-home <dir>] [--format human|json] <command>
+  ferrix run <file|package> [--stats] [--audit] [--watch]
+  ferrix check <file|package> [--watch]
   ferrix compile <file|package> <output> [--explain-optimizations]
   ferrix run-bytecode <file> [--stats] [--audit]
   ferrix debug <file|package>
-  ferrix runtime start|stop|status|restart
+  ferrix runtime start|stop|status|restart|metrics|events|config
   ferrix ps
   ferrix info <pid>
   ferrix logs
+  ferrix inspect <bytecode>
+  ferrix explain <source|package>
   ferrix kill <pid>
   ferrix --help
   ferrix --version
@@ -100,7 +105,12 @@ fn run_cli(
             };
             run_file(path, &config, options, stdout, stderr)
         }
-        [command, path] if command == "check" => check_file(path, &config, &mut read_file, stderr),
+        [command, path, options @ ..] if command == "check" => {
+            let Some(options) = parse_check_display_options(options, stderr) else {
+                return 64;
+            };
+            check_file(path, &config, options, &mut read_file, stdout, stderr)
+        }
         [command, path, output, options @ ..] if command == "compile" => {
             let Some(options) = parse_compile_display_options(options, stderr) else {
                 return 64;
@@ -135,6 +145,10 @@ fn run_cli(
         [command] if command == "logs" => list_logs(&config, stdout, stderr),
         [command, pid] if command == "info" => show_process_info(pid, &config, stdout, stderr),
         [command, pid] if command == "kill" => kill_process(pid, &config, stdout, stderr),
+        [command, path] if command == "inspect" => inspect_bytecode(path, &config, stdout, stderr),
+        [command, path] if command == "explain" => {
+            explain_source(path, &config, &mut read_file, stdout, stderr)
+        }
         [command, ..] if command == "run" => {
             writeln!(stderr, "error: expected a file or package path\n")
                 .expect("stderr write failed");
@@ -168,7 +182,7 @@ fn run_cli(
         [command, ..] if command == "runtime" => {
             writeln!(
                 stderr,
-                "error: expected runtime action start, stop, status, or restart\n"
+                "error: expected runtime action start, stop, status, restart, metrics, events, or config\n"
             )
             .expect("stderr write failed");
             write!(stderr, "{USAGE}").expect("stderr write failed");
@@ -195,6 +209,18 @@ fn run_cli(
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
         }
+        [command, ..] if command == "inspect" => {
+            writeln!(stderr, "error: expected a bytecode file path\n")
+                .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
+        }
+        [command, ..] if command == "explain" => {
+            writeln!(stderr, "error: expected a source file or package path\n")
+                .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
+        }
         _ => {
             writeln!(stderr, "error: unknown command\n").expect("stderr write failed");
             write!(stderr, "{USAGE}").expect("stderr write failed");
@@ -208,12 +234,32 @@ struct CliConfig {
     runtime_mode: RuntimeMode,
     runtime_home: PathBuf,
     runtime_config: ferrix_runtime::RuntimeConfig,
+    output_format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OutputFormat {
+    #[default]
+    Human,
+    Json,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RunDisplayOptions {
     stats: bool,
     audit: bool,
+    watch: WatchOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CheckDisplayOptions {
+    watch: WatchOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WatchOptions {
+    enabled: bool,
+    once: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -228,6 +274,7 @@ impl Default for CliConfig {
             runtime_mode: runtime_config.mode,
             runtime_home: runtime_config.resolved_home(&ferrix_runtime::default_ferrix_home()),
             runtime_config,
+            output_format: OutputFormat::Human,
         }
     }
 }
@@ -253,6 +300,7 @@ fn parse_runtime_options(
         runtime_mode: runtime_config.mode,
         runtime_home: runtime_config.resolved_home(&ferrix_runtime::default_ferrix_home()),
         runtime_config,
+        output_format: OutputFormat::Human,
     };
     let mut rest = Vec::new();
     let mut index = 0;
@@ -285,6 +333,23 @@ fn parse_runtime_options(
                 config.runtime_config.home = config.runtime_home.clone();
                 index += 2;
             }
+            "--format" => {
+                let Some(value) = args.get(index + 1) else {
+                    writeln!(stderr, "error: expected value after --format")
+                        .expect("stderr write failed");
+                    return Err(64);
+                };
+                config.output_format = match value.as_str() {
+                    "human" => OutputFormat::Human,
+                    "json" => OutputFormat::Json,
+                    _ => {
+                        writeln!(stderr, "error: invalid output format `{value}`")
+                            .expect("stderr write failed");
+                        return Err(64);
+                    }
+                };
+                index += 2;
+            }
             _ => {
                 rest.extend_from_slice(&args[index..]);
                 break;
@@ -304,8 +369,35 @@ fn parse_run_display_options(
         match arg.as_str() {
             "--stats" => options.stats = true,
             "--audit" => options.audit = true,
+            "--watch" => options.watch.enabled = true,
+            "--watch-once" => {
+                options.watch.enabled = true;
+                options.watch.once = true;
+            }
             _ => {
                 writeln!(stderr, "error: unknown run option `{arg}`").expect("stderr write failed");
+                return None;
+            }
+        }
+    }
+    Some(options)
+}
+
+fn parse_check_display_options(
+    args: &[String],
+    stderr: &mut impl io::Write,
+) -> Option<CheckDisplayOptions> {
+    let mut options = CheckDisplayOptions::default();
+    for arg in args {
+        match arg.as_str() {
+            "--watch" => options.watch.enabled = true,
+            "--watch-once" => {
+                options.watch.enabled = true;
+                options.watch.once = true;
+            }
+            _ => {
+                writeln!(stderr, "error: unknown check option `{arg}`")
+                    .expect("stderr write failed");
                 return None;
             }
         }
@@ -348,7 +440,28 @@ fn runtime_command(
         },
         "status" => match runtime_daemon(config).checked_status() {
             Ok(status) => {
-                write_status(stdout, &status);
+                write_status(stdout, &status, config.output_format);
+                0
+            }
+            Err(error) => write_runtime_error(error, stderr),
+        },
+        "metrics" => match runtime_request_gateway(config).metrics() {
+            Ok(metrics) => {
+                write_metrics(stdout, &metrics, config.output_format);
+                0
+            }
+            Err(error) => write_runtime_error(error, stderr),
+        },
+        "events" => match runtime_request_gateway(config).events() {
+            Ok(events) => {
+                write_events(stdout, &events, config.output_format);
+                0
+            }
+            Err(error) => write_runtime_error(error, stderr),
+        },
+        "config" => match runtime_request_gateway(config).config() {
+            Ok(runtime_config) => {
+                write_runtime_config(stdout, &runtime_config, config.output_format);
                 0
             }
             Err(error) => write_runtime_error(error, stderr),
@@ -433,6 +546,7 @@ fn consume_runtime_launch_config() -> Option<CliConfig> {
         runtime_mode: RuntimeMode::Required,
         runtime_home,
         runtime_config,
+        output_format: OutputFormat::Human,
     })
 }
 
@@ -641,7 +755,32 @@ fn wait_for_runtime(
     ))
 }
 
-fn write_status(stdout: &mut impl io::Write, status: &ferrix_runtime::RuntimeStatusReport) {
+fn write_status(
+    stdout: &mut impl io::Write,
+    status: &ferrix_runtime::RuntimeStatusReport,
+    format: OutputFormat,
+) {
+    if format == OutputFormat::Json {
+        writeln!(
+            stdout,
+            "{{\"runtime\":\"{}\",\"version\":\"{}\",\"protocol\":\"{}\",\"uptime_ms\":{},\"processes\":{},\"active\":{},\"completed\":{},\"failed\":{},\"event_queue\":{},\"events_dropped\":{}}}",
+            json_escape(status.health.as_str()),
+            json_escape(&status.version),
+            status.protocol_version,
+            status
+                .uptime_ms
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+            status.process_count,
+            status.active_process_count,
+            status.completed_process_count,
+            status.failed_process_count,
+            status.event_queue_len,
+            status.dropped_event_count
+        )
+        .expect("stdout write failed");
+        return;
+    }
+
     writeln!(stdout, "runtime: {}", status.health.as_str()).expect("stdout write failed");
     writeln!(stdout, "version: {}", status.version).expect("stdout write failed");
     writeln!(stdout, "protocol: {}", status.protocol_version).expect("stdout write failed");
@@ -655,6 +794,215 @@ fn write_status(stdout: &mut impl io::Write, status: &ferrix_runtime::RuntimeSta
     writeln!(stdout, "event_queue: {}", status.event_queue_len).expect("stdout write failed");
     writeln!(stdout, "events_dropped: {}", status.dropped_event_count)
         .expect("stdout write failed");
+}
+
+fn write_metrics(
+    stdout: &mut impl io::Write,
+    metrics: &RuntimeMetricsReport,
+    format: OutputFormat,
+) {
+    if format == OutputFormat::Json {
+        writeln!(
+            stdout,
+            "{{\"processes\":{},\"active\":{},\"completed\":{},\"failed\":{},\"events\":{},\"events_dropped\":{},\"checkpoints\":{},\"middleware_requests\":{},\"executed_instructions\":{},\"allocations\":{},\"gc_collections\":{},\"native_calls\":{},\"execution_time_ms\":{}}}",
+            metrics.process_count,
+            metrics.active_process_count,
+            metrics.completed_process_count,
+            metrics.failed_process_count,
+            metrics.event_queue_len,
+            metrics.dropped_event_count,
+            metrics.checkpoint_count,
+            metrics.middleware_request_count,
+            metrics.executed_instructions,
+            metrics.allocations,
+            metrics.gc_collections,
+            metrics.native_calls,
+            metrics.execution_time_ms
+        )
+        .expect("stdout write failed");
+        return;
+    }
+
+    writeln!(stdout, "processes: {}", metrics.process_count).expect("stdout write failed");
+    writeln!(stdout, "active: {}", metrics.active_process_count).expect("stdout write failed");
+    writeln!(stdout, "completed: {}", metrics.completed_process_count)
+        .expect("stdout write failed");
+    writeln!(stdout, "failed: {}", metrics.failed_process_count).expect("stdout write failed");
+    writeln!(stdout, "events: {}", metrics.event_queue_len).expect("stdout write failed");
+    writeln!(stdout, "events_dropped: {}", metrics.dropped_event_count)
+        .expect("stdout write failed");
+    writeln!(stdout, "checkpoints: {}", metrics.checkpoint_count).expect("stdout write failed");
+    writeln!(
+        stdout,
+        "middleware_requests: {}",
+        metrics.middleware_request_count
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "executed_instructions: {}",
+        metrics.executed_instructions
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "allocations: {}", metrics.allocations).expect("stdout write failed");
+    writeln!(stdout, "gc_collections: {}", metrics.gc_collections).expect("stdout write failed");
+    writeln!(stdout, "native_calls: {}", metrics.native_calls).expect("stdout write failed");
+    writeln!(stdout, "execution_time_ms: {}", metrics.execution_time_ms)
+        .expect("stdout write failed");
+}
+
+fn write_events(stdout: &mut impl io::Write, events: &[RuntimeEvent], format: OutputFormat) {
+    if format == OutputFormat::Json {
+        write!(stdout, "{{\"events\":[").expect("stdout write failed");
+        for (index, event) in events.iter().enumerate() {
+            if index > 0 {
+                write!(stdout, ",").expect("stdout write failed");
+            }
+            write!(
+                stdout,
+                "{{\"id\":{},\"timestamp_ms\":{},\"kind\":\"{}\",\"severity\":\"{}\",\"process\":{},\"session\":{},\"message\":\"{}\"}}",
+                event.id,
+                event.timestamp_ms,
+                json_escape(runtime_event_kind_name(&event.kind)),
+                event.metadata.severity.as_str(),
+                event
+                    .process_id
+                    .map_or_else(|| "null".to_string(), |process| process.0.to_string()),
+                event
+                    .session_id
+                    .map_or_else(|| "null".to_string(), |session| session.0.to_string()),
+                json_escape(event.metadata.message.as_deref().unwrap_or_default())
+            )
+            .expect("stdout write failed");
+        }
+        writeln!(stdout, "]}}").expect("stdout write failed");
+        return;
+    }
+
+    writeln!(stdout, "id\tseverity\tkind\tprocess\tsession\tmessage").expect("stdout write failed");
+    for event in events {
+        writeln!(
+            stdout,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            event.id,
+            event.metadata.severity.as_str(),
+            runtime_event_kind_name(&event.kind),
+            event
+                .process_id
+                .map_or_else(|| "-".to_string(), |process| process.0.to_string()),
+            event
+                .session_id
+                .map_or_else(|| "-".to_string(), |session| session.0.to_string()),
+            event.metadata.message.as_deref().unwrap_or_default()
+        )
+        .expect("stdout write failed");
+    }
+}
+
+fn write_runtime_config(
+    stdout: &mut impl io::Write,
+    config: &ferrix_runtime::RuntimeConfig,
+    format: OutputFormat,
+) {
+    if format == OutputFormat::Json {
+        writeln!(
+            stdout,
+            "{{\"mode\":\"{}\",\"home\":\"{}\",\"auto_start\":{},\"default_profile\":\"{}\",\"log_level\":\"{}\",\"audit_enabled\":{},\"stats_enabled\":{},\"request_timeout_ms\":{},\"max_concurrent_processes\":{},\"rate_limit_per_second\":{}}}",
+            config.mode.as_str(),
+            json_escape(&config.home.display().to_string()),
+            config.auto_start,
+            config.default_profile.as_str(),
+            config.log_level.as_str(),
+            config.audit_enabled,
+            config.stats_enabled,
+            config.request_timeout_ms,
+            config.max_concurrent_runtime_processes,
+            config.rate_limit_per_second
+        )
+        .expect("stdout write failed");
+        return;
+    }
+
+    writeln!(stdout, "mode: {}", config.mode.as_str()).expect("stdout write failed");
+    writeln!(stdout, "home: {}", config.home.display()).expect("stdout write failed");
+    writeln!(stdout, "auto_start: {}", config.auto_start).expect("stdout write failed");
+    writeln!(
+        stdout,
+        "default_profile: {}",
+        config.default_profile.as_str()
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "log_level: {}", config.log_level.as_str()).expect("stdout write failed");
+    writeln!(stdout, "audit_enabled: {}", config.audit_enabled).expect("stdout write failed");
+    writeln!(stdout, "stats_enabled: {}", config.stats_enabled).expect("stdout write failed");
+    writeln!(stdout, "request_timeout_ms: {}", config.request_timeout_ms)
+        .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "max_concurrent_processes: {}",
+        config.max_concurrent_runtime_processes
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "rate_limit_per_second: {}",
+        config.rate_limit_per_second
+    )
+    .expect("stdout write failed");
+}
+
+fn runtime_event_kind_name(kind: &ferrix_runtime::RuntimeEventKind) -> &'static str {
+    match kind {
+        ferrix_runtime::RuntimeEventKind::RuntimeStarted => "runtime_started",
+        ferrix_runtime::RuntimeEventKind::RuntimeStopped => "runtime_stopped",
+        ferrix_runtime::RuntimeEventKind::ProcessStarted => "process_started",
+        ferrix_runtime::RuntimeEventKind::ProcessCompleted => "process_completed",
+        ferrix_runtime::RuntimeEventKind::ProcessFailed => "process_failed",
+        ferrix_runtime::RuntimeEventKind::ProcessKilled => "process_killed",
+        ferrix_runtime::RuntimeEventKind::DebuggerAttached => "debugger_attached",
+        ferrix_runtime::RuntimeEventKind::ProfileSelected(_) => "profile_selected",
+        ferrix_runtime::RuntimeEventKind::CheckpointRecorded => "checkpoint_recorded",
+        ferrix_runtime::RuntimeEventKind::AuditEvent(_) => "audit_event",
+        ferrix_runtime::RuntimeEventKind::ProgramStarted => "program_started",
+        ferrix_runtime::RuntimeEventKind::ProgramCompleted => "program_completed",
+        ferrix_runtime::RuntimeEventKind::ProgramFailed => "program_failed",
+        ferrix_runtime::RuntimeEventKind::NativeFunctionCalled(_) => "native_function_called",
+        ferrix_runtime::RuntimeEventKind::CapabilityDenied(_) => "capability_denied",
+        ferrix_runtime::RuntimeEventKind::ExceptionThrown => "exception_thrown",
+        ferrix_runtime::RuntimeEventKind::ExceptionHandled => "exception_handled",
+        ferrix_runtime::RuntimeEventKind::ModuleLoaded(_) => "module_loaded",
+        ferrix_runtime::RuntimeEventKind::GcStarted => "gc_started",
+        ferrix_runtime::RuntimeEventKind::GcCompleted => "gc_completed",
+        ferrix_runtime::RuntimeEventKind::DebuggerBreakpointHit => "debugger_breakpoint_hit",
+        ferrix_runtime::RuntimeEventKind::CustomExtensionCalled(_) => "custom_extension_called",
+        ferrix_runtime::RuntimeEventKind::InstructionBudgetExceeded => {
+            "instruction_budget_exceeded"
+        }
+    }
+}
+
+fn json_string_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn list_processes(
@@ -833,6 +1181,20 @@ fn record_cli_history(
 fn check_file(
     path: &str,
     config: &CliConfig,
+    options: CheckDisplayOptions,
+    read_file: &mut impl FnMut(&str) -> io::Result<String>,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    if options.watch.enabled {
+        return watch_check_file(path, config, options, read_file, stdout, stderr);
+    }
+    check_file_once(path, config, read_file, stderr)
+}
+
+fn check_file_once(
+    path: &str,
+    config: &CliConfig,
     read_file: &mut impl FnMut(&str) -> io::Result<String>,
     stderr: &mut impl io::Write,
 ) -> i32 {
@@ -977,6 +1339,165 @@ fn write_compile_report(stdout: &mut impl io::Write, report: &ferrix_compiler::C
     }
 }
 
+fn inspect_bytecode(
+    path: &str,
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            writeln!(stderr, "error: could not read `{path}`: {error}")
+                .expect("stderr write failed");
+            return 66;
+        }
+    };
+    let metadata = match inspect_container(&bytes) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            writeln!(stderr, "error: could not inspect bytecode: {error}")
+                .expect("stderr write failed");
+            return 65;
+        }
+    };
+    write_inspect_metadata(stdout, &metadata, config.output_format);
+    0
+}
+
+fn explain_source(
+    path: &str,
+    config: &CliConfig,
+    read_file: &mut impl FnMut(&str) -> io::Result<String>,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    let (_, compiled) = match compile_file(path, read_file, stderr) {
+        Ok(compiled) => compiled,
+        Err(code) => return code,
+    };
+    if config.output_format == OutputFormat::Json {
+        write_compile_report_json(stdout, &compiled.report);
+    } else {
+        write_compile_report(stdout, &compiled.report);
+    }
+    record_cli_history(
+        config,
+        RuntimeProcessKind::Check,
+        path,
+        0,
+        "explain\n",
+        None,
+    );
+    0
+}
+
+fn write_inspect_metadata(
+    stdout: &mut impl io::Write,
+    metadata: &BytecodeContainerMetadata,
+    format: OutputFormat,
+) {
+    if format == OutputFormat::Json {
+        writeln!(
+            stdout,
+            "{{\"bytecode_format_version\":{},\"min_ferrix_version\":\"{}\",\"feature_flags\":{},\"required_capabilities\":[{}],\"entry\":{},\"module_name\":{},\"debug_section_present\":{},\"checksum\":{},\"optimization_level\":{},\"import_table_present\":{},\"export_table_present\":{},\"interface_metadata_present\":{}}}",
+            metadata.bytecode_format_version,
+            json_escape(&metadata.min_ferrix_version),
+            metadata.feature_flags,
+            json_string_array(&metadata.required_capabilities),
+            metadata.entry.0,
+            metadata
+                .module_name
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |name| format!("\"{}\"", json_escape(name))),
+            metadata.debug_section_present,
+            metadata.checksum,
+            metadata.optimization_level,
+            metadata.import_table_present,
+            metadata.export_table_present,
+            metadata.interface_metadata_present
+        )
+        .expect("stdout write failed");
+        return;
+    }
+
+    writeln!(
+        stdout,
+        "bytecode_format_version: {}",
+        metadata.bytecode_format_version
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "min_ferrix_version: {}",
+        metadata.min_ferrix_version
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "feature_flags: {}", metadata.feature_flags).expect("stdout write failed");
+    writeln!(
+        stdout,
+        "required_capabilities: {}",
+        comma_or_none(&metadata.required_capabilities)
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "entry: {}", metadata.entry.0).expect("stdout write failed");
+    writeln!(
+        stdout,
+        "module_name: {}",
+        metadata.module_name.as_deref().unwrap_or("<none>")
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "debug_section_present: {}",
+        metadata.debug_section_present
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "checksum: {}", metadata.checksum).expect("stdout write failed");
+    writeln!(
+        stdout,
+        "optimization_level: {}",
+        metadata.optimization_level
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "import_table_present: {}",
+        metadata.import_table_present
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "export_table_present: {}",
+        metadata.export_table_present
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "interface_metadata_present: {}",
+        metadata.interface_metadata_present
+    )
+    .expect("stdout write failed");
+}
+
+fn write_compile_report_json(stdout: &mut impl io::Write, report: &ferrix_compiler::CompileReport) {
+    writeln!(
+        stdout,
+        "{{\"features\":[{}],\"capabilities\":[{}],\"modules\":[{}],\"natives\":[{}],\"bytecode\":{{\"functions\":{},\"instructions\":{}}},\"optimizer\":{{\"chunks\":{},\"passes\":{},\"transformations\":{},\"changed\":{}}}}}",
+        json_string_array(&report.analysis.required_features),
+        json_string_array(&report.analysis.required_capabilities),
+        json_string_array(&report.analysis.module_dependencies),
+        json_string_array(&report.analysis.native_dependencies),
+        report.analysis.bytecode_function_count,
+        report.analysis.bytecode_instruction_count,
+        report.optimization.chunks.len(),
+        report.optimization.total_passes(),
+        report.optimization.total_transformations(),
+        report.optimization.changed()
+    )
+    .expect("stdout write failed");
+}
+
 fn comma_or_none(values: &[String]) -> String {
     if values.is_empty() {
         "<none>".to_string()
@@ -1016,6 +1537,19 @@ fn run_file(
     stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> i32 {
+    if options.watch.enabled {
+        return watch_run_file(path, config, options, stdout, stderr);
+    }
+    run_file_once(path, config, options, stdout, stderr)
+}
+
+fn run_file_once(
+    path: &str,
+    config: &CliConfig,
+    options: RunDisplayOptions,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
     // Normal source execution is delegated to ferrix-runtime so the CLI remains
     // a thin command surface instead of wiring compiler, stdlib, and VM itself.
     let runtime = match runtime_gateway(config, stderr) {
@@ -1033,6 +1567,58 @@ fn run_file(
             error.exit_code
         }
     }
+}
+
+fn watch_run_file(
+    path: &str,
+    config: &CliConfig,
+    mut options: RunDisplayOptions,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    options.watch.enabled = false;
+    let mut last_stamp = None;
+    loop {
+        let stamp = watched_path_stamp(Path::new(path));
+        if last_stamp != Some(stamp) {
+            writeln!(stdout, "watch: running {path}").expect("stdout write failed");
+            let code = run_file_once(path, config, options, stdout, stderr);
+            if options.watch.once {
+                return code;
+            }
+            last_stamp = Some(stamp);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn watch_check_file(
+    path: &str,
+    config: &CliConfig,
+    options: CheckDisplayOptions,
+    read_file: &mut impl FnMut(&str) -> io::Result<String>,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    let mut last_stamp = None;
+    loop {
+        let stamp = watched_path_stamp(Path::new(path));
+        if last_stamp != Some(stamp) {
+            writeln!(stdout, "watch: checking {path}").expect("stdout write failed");
+            let code = check_file_once(path, config, read_file, stderr);
+            if options.watch.once {
+                return code;
+            }
+            last_stamp = Some(stamp);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn watched_path_stamp(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 fn write_run_result(
