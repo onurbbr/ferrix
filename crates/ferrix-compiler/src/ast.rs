@@ -88,6 +88,12 @@ pub enum Expr {
         args: Vec<Expr>,
         span: SourceSpan,
     },
+    /// Anonymous function expression that can capture outer locals.
+    Function {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+        span: SourceSpan,
+    },
     /// Array/map indexing expression.
     Index {
         target: Box<Expr>,
@@ -140,6 +146,7 @@ impl Expr {
             | Self::Variable { span, .. }
             | Self::Binary { span, .. }
             | Self::Call { span, .. }
+            | Self::Function { span, .. }
             | Self::Index { span, .. }
             | Self::Array { span, .. }
             | Self::Map { span, .. }
