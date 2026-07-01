@@ -19,8 +19,8 @@ use ferrix_core::{
 use ferrix_vm::{Heap, Vm};
 
 use crate::{
-    RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind, RuntimeStats,
-    output::install_output,
+    DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind,
+    RuntimeStats, output::install_output,
 };
 
 const MANIFEST_FILES: &[&str] = &["Ferrix.toml", "ferrix.toml"];
@@ -94,6 +94,12 @@ impl RuntimeService {
     /// Compiles source into a verified program without running it.
     pub fn compile_source_path(&self, path: &Path) -> Result<CompiledProgram, RuntimeError> {
         compile_source_path(path)
+    }
+
+    /// Compiles source and returns the verified program needed by a debugger.
+    pub fn prepare_debug(&self, request: DebugRequest) -> Result<CompiledProgram, RuntimeError> {
+        let DebugRequest { path, profile: _ } = request;
+        self.compile_source_path(&path)
     }
 }
 

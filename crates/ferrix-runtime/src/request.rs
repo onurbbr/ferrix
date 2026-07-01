@@ -92,3 +92,13 @@ pub struct DebugRequest {
     pub path: PathBuf,
     pub profile: RuntimeProfile,
 }
+
+impl DebugRequest {
+    /// Creates a debugger request with CLI-friendly defaults.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            profile: RuntimeProfile::Cli,
+        }
+    }
+}

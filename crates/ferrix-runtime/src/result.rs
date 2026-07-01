@@ -4,6 +4,8 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use ferrix_core::Value;
 
+use crate::RuntimeMode;
+
 /// Successful source or bytecode execution result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunResult {
@@ -92,6 +94,8 @@ pub enum RuntimeErrorKind {
     DecodeBytecode(String),
     /// Runtime bytecode execution failed without source diagnostics.
     Execution(String),
+    /// The selected runtime mode needs a daemon that is not available yet.
+    RuntimeUnavailable { mode: RuntimeMode },
 }
 
 impl RuntimeError {
@@ -148,6 +152,19 @@ impl RuntimeError {
                 format!("error: could not decode bytecode: {message}\n")
             }
             RuntimeErrorKind::Execution(message) => format!("error: {message}\n"),
+            RuntimeErrorKind::RuntimeUnavailable {
+                mode: RuntimeMode::Required,
+            } => {
+                "Ferrix runtime is not running.\nStart it with: ferrix runtime start\n".to_string()
+            }
+            RuntimeErrorKind::RuntimeUnavailable {
+                mode: RuntimeMode::Managed,
+            } => {
+                "Ferrix managed runtime mode is not available yet.\nUse FERRIX_RUNTIME_MODE=embedded for local execution.\n".to_string()
+            }
+            RuntimeErrorKind::RuntimeUnavailable {
+                mode: RuntimeMode::Embedded,
+            } => "Ferrix embedded runtime is not available.\n".to_string(),
         }
     }
 }

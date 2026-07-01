@@ -5,12 +5,14 @@
 //! runs the program, and returns structured request results for tools such as
 //! `ferrix-cli`.
 
+pub mod mode;
 pub mod output;
 pub mod profile;
 pub mod request;
 pub mod result;
 pub mod service;
 
+pub use mode::{RuntimeGateway, RuntimeMode, RuntimeModeParseError};
 pub use profile::RuntimeProfile;
 pub use request::{
     CompileRequest, DebugRequest, InspectBytecodeRequest, OutputMode, RunBytecodeRequest,
