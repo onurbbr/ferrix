@@ -40,6 +40,56 @@ fn bytecode_program_roundtrips_through_binary_format() {
 }
 
 #[test]
+fn bytecode_program_roundtrips_integer_specialized_instructions() {
+    let mut main = Chunk::new("main", 6);
+    let forty = main.add_constant(Value::Int(40)).unwrap();
+    let two = main.add_constant(Value::Int(2)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: forty,
+    });
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(1),
+        constant: two,
+    });
+    main.push_instruction(Instruction::AddInt {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    main.push_instruction(Instruction::SubInt {
+        dst: Register(3),
+        lhs: Register(2),
+        rhs: Register(1),
+    });
+    main.push_instruction(Instruction::MulInt {
+        dst: Register(4),
+        lhs: Register(3),
+        rhs: Register(1),
+    });
+    main.push_instruction(Instruction::DivInt {
+        dst: Register(5),
+        lhs: Register(4),
+        rhs: Register(1),
+    });
+    main.push_instruction(Instruction::LessEqualInt {
+        dst: Register(5),
+        lhs: Register(3),
+        rhs: Register(5),
+    });
+    main.push_instruction(Instruction::Return { src: Register(5) });
+
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let bytes = encode_program(program.as_program()).unwrap();
+    let decoded = decode_program(&bytes).unwrap();
+
+    assert_eq!(decoded.as_program(), program.as_program());
+}
+
+#[test]
 fn bytecode_program_roundtrips_closure_instructions() {
     let mut closure = Chunk::new("closure#0", 4)
         .with_arity(1)
