@@ -234,7 +234,10 @@ impl StructuralVerifier {
         let mut has_return = false;
 
         for (ip, instruction) in chunk.instructions.iter().enumerate() {
-            if matches!(instruction, Instruction::Return { .. }) {
+            if matches!(
+                instruction,
+                Instruction::Return { .. } | Instruction::Throw { .. }
+            ) {
                 has_return = true;
             }
 
