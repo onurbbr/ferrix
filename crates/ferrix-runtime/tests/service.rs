@@ -9,8 +9,9 @@ use std::{
 use ferrix_core::bytecode::encode_program;
 use ferrix_runtime::{
     HostCapability, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus,
-    RuntimeEventKind, RuntimeGateway, RuntimeMode, RuntimePolicy, RuntimeProcessKind,
-    RuntimeProcessStatus, RuntimeProfile, RuntimeService,
+    RuntimeEventKind, RuntimeEventMetadata, RuntimeEventSeverity, RuntimeGateway, RuntimeMode,
+    RuntimePolicy, RuntimeProcessKind, RuntimeProcessStatus, RuntimeProfile, RuntimeService,
+    RuntimeSessionId,
 };
 
 #[test]
@@ -162,6 +163,36 @@ fn event_bus_drops_oldest_events_when_capacity_is_reached() {
 }
 
 #[test]
+fn event_bus_filters_sessions_and_reports_queue_stats() {
+    let mut bus = RuntimeEventBus::with_capacity(4);
+
+    bus.publish_event(
+        RuntimeEventKind::ProgramFailed,
+        None,
+        Some(RuntimeSessionId(7)),
+        RuntimeEventMetadata::new(RuntimeEventSeverity::Error).with_message("boom"),
+    );
+    bus.publish(
+        RuntimeEventKind::ProgramCompleted,
+        None,
+        Some(RuntimeSessionId(8)),
+    );
+
+    let session_events = bus.events_for_session(RuntimeSessionId(7));
+    let stats = bus.stats();
+
+    assert_eq!(session_events.len(), 1);
+    assert_eq!(
+        session_events[0].metadata.severity,
+        RuntimeEventSeverity::Error
+    );
+    assert_eq!(session_events[0].metadata.message.as_deref(), Some("boom"));
+    assert_eq!(stats.len, 2);
+    assert_eq!(stats.capacity, 4);
+    assert_eq!(stats.dropped_events, 0);
+}
+
+#[test]
 fn runtime_mode_parses_configuration_names() {
     assert_eq!(
         "embedded".parse::<RuntimeMode>().unwrap(),
@@ -209,6 +240,39 @@ return 42;
 
     assert_eq!(result.output, "hello\n");
     assert_eq!(result.value_display.as_deref(), Some("42"));
+}
+
+#[test]
+fn runtime_collects_stats_and_audit_when_requested() {
+    let dir = temp_dir();
+    let file = write_file(
+        &dir,
+        "main.fx",
+        "print(\"hello\");\nreturn len([1, 2, 3]);\n",
+    );
+    let mut request = RunSourceRequest::new(&file);
+    request.collect_stats = true;
+    request.collect_audit = true;
+
+    let result = RuntimeService::new().run_source(request).unwrap();
+
+    assert_eq!(result.value_display.as_deref(), Some("3"));
+    assert!(result.stats.executed_instructions > 0);
+    assert_eq!(result.stats.native_calls, 2);
+    assert!(result.stats.allocations > 0);
+    assert!(result.stats.max_register_count > 0);
+    assert!(
+        result
+            .audit_events
+            .iter()
+            .any(|event| event.starts_with("program_started"))
+    );
+    assert!(
+        result
+            .audit_events
+            .iter()
+            .any(|event| event == "program_completed exit_code=0")
+    );
 }
 
 #[test]
