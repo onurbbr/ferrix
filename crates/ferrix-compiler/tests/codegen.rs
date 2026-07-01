@@ -891,6 +891,27 @@ fn generated_program_is_bytecode_function() {
 }
 
 #[test]
+fn reuses_registers_after_block_scope_exit() {
+    let program = compile_source(
+        "\
+let kept = 1;
+{
+    let scoped = 2;
+}
+let reused = 41;
+return kept + reused;
+",
+    )
+    .unwrap();
+    let function = &program.as_program().functions[program.as_program().entry.0 as usize];
+    let FunctionKind::Bytecode(chunk) = &function.kind else {
+        panic!("compiler should emit bytecode");
+    };
+
+    assert_eq!(chunk.register_count, 3);
+}
+
+#[test]
 fn undefined_variable_is_compile_error() {
     let err = compile_source("return missing;").unwrap_err();
 
