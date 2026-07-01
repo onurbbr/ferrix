@@ -138,6 +138,42 @@ fn bytecode_program_roundtrips_error_handling_instructions() {
 }
 
 #[test]
+fn bytecode_program_roundtrips_record_instructions() {
+    let mut main = Chunk::new("main", 4);
+    let name = main.add_string("name").unwrap();
+    let value = main.add_constant(Value::Int(42)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(1),
+        constant: value,
+    });
+    main.push_instruction(Instruction::RecordNew {
+        dst: Register(0),
+        fields_start: Register(1),
+        fields: vec![name],
+    });
+    main.push_instruction(Instruction::FieldGet {
+        dst: Register(2),
+        target: Register(0),
+        field: name,
+    });
+    main.push_instruction(Instruction::FieldSet {
+        target: Register(0),
+        field: name,
+        value: Register(2),
+    });
+    main.push_instruction(Instruction::Return { src: Register(2) });
+
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let bytes = encode_program(program.as_program()).unwrap();
+    let decoded = decode_program(&bytes).unwrap();
+
+    assert_eq!(decoded.as_program(), program.as_program());
+}
+
+#[test]
 fn bytecode_decode_rejects_invalid_magic() {
     let err = decode_program(b"not ferrix").unwrap_err();
 
