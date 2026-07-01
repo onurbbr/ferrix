@@ -5,6 +5,7 @@ members = [
     "crates/ferrix-compiler",
     "crates/ferrix-core",
     "crates/ferrix-benchmarks",
+    "crates/ferrix-runtime",
     "crates/ferrix-stdlib",
     "crates/ferrix-vm",
 ]
@@ -20,4 +21,5 @@ ferrix-core = { path = "crates/ferrix-core" }
 ferrix-vm = { path = "crates/ferrix-vm" }
 ferrix-assembler = { path = "crates/ferrix-assembler" }
 ferrix-compiler = { path = "crates/ferrix-compiler" }
+ferrix-runtime = { path = "crates/ferrix-runtime" }
 ferrix-stdlib = { path = "crates/ferrix-stdlib" }
