@@ -1,0 +1,11 @@
+# Ferrix benchmark baseline v1
+# Columns:
+# case,compile_ms,compile_threshold_pct,verify_ms,verify_threshold_pct,run_avg_us,run_threshold_pct
+case,compile_ms,compile_threshold_pct,verify_ms,verify_threshold_pct,run_avg_us,run_threshold_pct
+arithmetic,0.100,1000.0,0.010000,1000.0,2.000,500.0
+loop,0.150,1000.0,0.010000,1000.0,50.000,500.0
+dispatch,0.200,1000.0,0.010000,1000.0,200.000,500.0
+calls,0.200,1000.0,0.010000,1000.0,50.000,500.0
+allocation,0.200,1000.0,0.010000,1000.0,5.000,500.0
+records,0.200,1000.0,0.010000,1000.0,60.000,500.0
+closures,0.200,1000.0,0.010000,1000.0,2.000,500.0
