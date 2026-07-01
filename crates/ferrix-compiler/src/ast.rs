@@ -46,6 +46,13 @@ pub enum Stmt {
         value: Expr,
         span: SourceSpan,
     },
+    /// Assignment through a named record field expression.
+    FieldAssign {
+        target: Expr,
+        field: String,
+        value: Expr,
+        span: SourceSpan,
+    },
     /// `return expr;` from the current function or main chunk.
     Return { value: Expr, span: SourceSpan },
     /// `throw expr;` raises a recoverable source-level error.
@@ -111,6 +118,12 @@ pub enum Expr {
         index: Box<Expr>,
         span: SourceSpan,
     },
+    /// Named record field access expression.
+    Field {
+        target: Box<Expr>,
+        field: String,
+        span: SourceSpan,
+    },
     /// Array literal.
     Array {
         elements: Vec<Expr>,
@@ -119,6 +132,11 @@ pub enum Expr {
     /// Map literal represented as key/value expression pairs.
     Map {
         entries: Vec<(Expr, Expr)>,
+        span: SourceSpan,
+    },
+    /// Record literal represented as named field/value pairs.
+    Record {
+        fields: Vec<(String, Expr)>,
         span: SourceSpan,
     },
     /// Parenthesized expression used to preserve source span.
@@ -159,8 +177,10 @@ impl Expr {
             | Self::Call { span, .. }
             | Self::Function { span, .. }
             | Self::Index { span, .. }
+            | Self::Field { span, .. }
             | Self::Array { span, .. }
             | Self::Map { span, .. }
+            | Self::Record { span, .. }
             | Self::Grouping { span, .. } => *span,
         }
     }
