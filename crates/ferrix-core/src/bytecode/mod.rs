@@ -25,7 +25,10 @@ pub use format::{
 pub use instruction::{
     CaptureId, ConstId, FunctionId, Instruction, JumpTarget, Register, StringId,
 };
-pub use optimizer::optimize_chunk;
+pub use optimizer::{
+    OptimizationPassReport, OptimizationReport, OptimizedChunk, optimize_chunk,
+    optimize_chunk_with_report,
+};
 pub use program::{Function, FunctionKind, Program, ProgramBuildError};
 pub use serialization::{
     BytecodeContainer, BytecodeContainerMetadata, BytecodeDecodeError, BytecodeEncodeError,
