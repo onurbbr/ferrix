@@ -137,3 +137,74 @@ fn wrong_function_arity_is_compile_error() {
         }
     );
 }
+
+#[test]
+fn arithmetic_operand_type_mismatch_is_compile_error() {
+    let err = compile_source_with_file_id("return 1 + true;\n", FileId(0)).unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "int".to_string(),
+            found: "bool".to_string(),
+        }
+    );
+}
+
+#[test]
+fn branch_condition_type_mismatch_is_compile_error() {
+    let err =
+        compile_source_with_file_id("if (1) { return 2; }\nreturn 3;\n", FileId(0)).unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "bool".to_string(),
+            found: "int".to_string(),
+        }
+    );
+}
+
+#[test]
+fn assignment_type_mismatch_is_compile_error() {
+    let err =
+        compile_source_with_file_id("let value = 1;\nvalue = false;\nreturn value;\n", FileId(0))
+            .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "int".to_string(),
+            found: "bool".to_string(),
+        }
+    );
+}
+
+#[test]
+fn array_index_type_mismatch_is_compile_error() {
+    let err =
+        compile_source_with_file_id("let values = [1, 2];\nreturn values[false];\n", FileId(0))
+            .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "int".to_string(),
+            found: "bool".to_string(),
+        }
+    );
+}
+
+#[test]
+fn non_function_call_type_mismatch_is_compile_error() {
+    let err =
+        compile_source_with_file_id("let value = 1;\nreturn value();\n", FileId(0)).unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "function".to_string(),
+            found: "int".to_string(),
+        }
+    );
+}
