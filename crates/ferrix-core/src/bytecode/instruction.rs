@@ -112,6 +112,18 @@ pub enum Instruction {
         args_start: Register,
         arg_count: u8,
     },
+    MakeUpvalue {
+        dst: Register,
+        src: Register,
+    },
+    LoadUpvalue {
+        dst: Register,
+        upvalue: Register,
+    },
+    StoreUpvalue {
+        upvalue: Register,
+        src: Register,
+    },
     MakeClosure {
         dst: Register,
         function: FunctionId,
@@ -121,6 +133,14 @@ pub enum Instruction {
     LoadCapture {
         dst: Register,
         capture: CaptureId,
+    },
+    LoadCaptureCell {
+        dst: Register,
+        capture: CaptureId,
+    },
+    StoreCapture {
+        capture: CaptureId,
+        src: Register,
     },
     CallValue {
         dst: Register,
@@ -189,12 +209,17 @@ impl Instruction {
             Self::CallFunction {
                 dst, args_start, ..
             } => vec![*dst, *args_start],
+            Self::MakeUpvalue { dst, src }
+            | Self::LoadUpvalue { dst, upvalue: src }
+            | Self::StoreUpvalue { upvalue: dst, src } => vec![*dst, *src],
             Self::MakeClosure {
                 dst,
                 captures_start,
                 ..
             } => vec![*dst, *captures_start],
             Self::LoadCapture { dst, .. } => vec![*dst],
+            Self::LoadCaptureCell { dst, .. } => vec![*dst],
+            Self::StoreCapture { src, .. } => vec![*src],
             Self::CallValue {
                 dst,
                 callee,
@@ -264,6 +289,8 @@ impl Instruction {
     pub fn capture_operand(&self) -> Option<CaptureId> {
         match self {
             Self::LoadCapture { capture, .. } => Some(*capture),
+            Self::LoadCaptureCell { capture, .. } => Some(*capture),
+            Self::StoreCapture { capture, .. } => Some(*capture),
             _ => None,
         }
     }
