@@ -15,9 +15,10 @@ use std::{
 };
 
 use crate::{
-    DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind,
-    RuntimeEventBus, RuntimeEventKind, RuntimeMode, RuntimeProcessId, RuntimeProcessKind,
-    RuntimeProcessRecord, RuntimeProcessStatus, RuntimeProcessTable, RuntimeProfile,
+    DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeConfig, RuntimeError,
+    RuntimeErrorKind, RuntimeEventBus, RuntimeEventKind, RuntimeMiddlewareChain, RuntimeMode,
+    RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord, RuntimeProcessStatus,
+    RuntimeProcessTable, RuntimeProfile, RuntimeProtocolInfo, RuntimeProtocolVersion,
     RuntimeSessionId, RuntimeStats,
     event::{RuntimeEventMetadata, RuntimeEventSeverity, timestamp_ms},
     request::RecordProcessRequest,
@@ -83,6 +84,14 @@ pub struct RuntimeStatusReport {
     pub health: RuntimeHealth,
     /// Runtime crate version.
     pub version: String,
+    /// Runtime daemon protocol version.
+    pub protocol_version: RuntimeProtocolVersion,
+    /// Oldest daemon protocol supported.
+    pub protocol_min: RuntimeProtocolVersion,
+    /// Newest daemon protocol supported.
+    pub protocol_max: RuntimeProtocolVersion,
+    /// Stable daemon protocol feature names.
+    pub protocol_features: Vec<String>,
     /// Milliseconds since the daemon was started.
     pub uptime_ms: Option<u128>,
     /// Number of active process records.
@@ -165,8 +174,10 @@ impl RuntimeStateStore {
 #[derive(Clone, Debug)]
 pub struct RuntimeDaemon {
     home: PathBuf,
+    config: RuntimeConfig,
     events: RuntimeEventBus,
     memory_table: RuntimeProcessTable,
+    middleware: RuntimeMiddlewareChain,
     state: RuntimeStateStore,
 }
 
@@ -178,12 +189,21 @@ impl RuntimeDaemon {
 
     /// Creates a daemon facade rooted at a specific runtime home.
     pub fn with_home(home: impl Into<PathBuf>) -> Self {
+        Self::with_home_and_config(home, RuntimeConfig::default())
+    }
+
+    /// Creates a daemon facade rooted at a specific runtime home and config.
+    pub fn with_home_and_config(home: impl Into<PathBuf>, config: RuntimeConfig) -> Self {
         let mut state = RuntimeStateStore::default();
         state.set("version", env!("CARGO_PKG_VERSION"));
+        let middleware =
+            RuntimeMiddlewareChain::new(config.request_timeout_ms, config.rate_limit_per_second);
         Self {
             home: home.into(),
+            config,
             events: RuntimeEventBus::default(),
             memory_table: RuntimeProcessTable::new(),
+            middleware,
             state,
         }
     }
@@ -211,6 +231,10 @@ impl RuntimeDaemon {
             &[
                 ("health", RuntimeHealth::Serving.as_str().to_string()),
                 ("version", env!("CARGO_PKG_VERSION").to_string()),
+                (
+                    "protocol_version",
+                    RuntimeProtocolInfo::current().protocol_version.to_string(),
+                ),
                 ("started_at_ms", timestamp_ms().to_string()),
                 ("pid", std::process::id().to_string()),
                 ("socket", self.socket_path().display().to_string()),
@@ -234,6 +258,10 @@ impl RuntimeDaemon {
             &[
                 ("health", RuntimeHealth::Stopped.as_str().to_string()),
                 ("version", env!("CARGO_PKG_VERSION").to_string()),
+                (
+                    "protocol_version",
+                    RuntimeProtocolInfo::current().protocol_version.to_string(),
+                ),
                 ("started_at_ms", started_at),
                 ("pid", String::new()),
                 ("socket", self.socket_path().display().to_string()),
@@ -302,6 +330,7 @@ impl RuntimeDaemon {
         };
 
         let event_stats = self.events.stats();
+        let protocol = RuntimeProtocolInfo::current();
 
         Ok(RuntimeStatusReport {
             health,
@@ -309,6 +338,10 @@ impl RuntimeDaemon {
                 .get("version")
                 .cloned()
                 .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+            protocol_version: protocol.protocol_version,
+            protocol_min: protocol.supported_min,
+            protocol_max: protocol.supported_max,
+            protocol_features: protocol.features,
             uptime_ms,
             active_process_count,
             completed_process_count,
@@ -354,6 +387,31 @@ impl RuntimeDaemon {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Reads daemon protocol info through the socket protocol.
+    pub fn request_protocol_info(&self) -> Result<RuntimeProtocolInfo, RuntimeError> {
+        let response = self.request("HELLO")?;
+        decode_protocol_response(&response)
+    }
+
+    /// Fails when the daemon protocol cannot be spoken by this CLI/runtime crate.
+    pub fn check_protocol_compatibility(&self) -> Result<(), RuntimeError> {
+        let info = self.request_protocol_info()?;
+        if info.is_compatible_with_current() {
+            return Ok(());
+        }
+        Err(RuntimeError::new(
+            70,
+            RuntimeErrorKind::ProtocolMismatch {
+                cli_supported: format!(
+                    "{}-{}",
+                    crate::MIN_SUPPORTED_PROTOCOL_VERSION,
+                    crate::MAX_SUPPORTED_PROTOCOL_VERSION
+                ),
+                daemon_protocol: info.protocol_version.to_string(),
+            },
+        ))
     }
 
     /// Sends a stop request to the running daemon process.
@@ -443,6 +501,7 @@ impl RuntimeDaemon {
     /// Runs source through a serving daemon and records process metadata.
     pub fn run_source(&mut self, mut request: RunSourceRequest) -> Result<RunResult, RuntimeError> {
         self.require_serving()?;
+        self.require_process_slot()?;
         request.collect_stats = true;
         let record = self.start_process(
             RuntimeProcessKind::Run,
@@ -467,6 +526,7 @@ impl RuntimeDaemon {
         mut request: RunBytecodeRequest,
     ) -> Result<RunResult, RuntimeError> {
         self.require_serving()?;
+        self.require_process_slot()?;
         request.collect_stats = true;
         let record = self.start_process(
             RuntimeProcessKind::RunBytecode,
@@ -614,6 +674,16 @@ impl RuntimeDaemon {
         &self.state
     }
 
+    /// Returns middleware request logs retained by this daemon instance.
+    pub fn middleware_logs(&self) -> &[crate::RuntimeRequestLogEntry] {
+        self.middleware.logs()
+    }
+
+    /// Returns runtime configuration used by this daemon facade.
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
+
     /// Returns persisted checkpoints.
     pub fn checkpoints(&self) -> Result<Vec<RuntimeCheckpoint>, RuntimeError> {
         let path = self.checkpoint_path();
@@ -637,6 +707,19 @@ impl RuntimeDaemon {
         }
     }
 
+    fn require_process_slot(&self) -> Result<(), RuntimeError> {
+        let active = self.list_processes()?.len();
+        if active < self.config.max_concurrent_runtime_processes {
+            return Ok(());
+        }
+        Err(RuntimeError::new(
+            70,
+            RuntimeErrorKind::RateLimited {
+                limit_per_second: self.config.rate_limit_per_second,
+            },
+        ))
+    }
+
     fn handle_stream(&mut self, mut stream: UnixStream) -> Result<bool, RuntimeError> {
         let mut line = String::new();
         {
@@ -644,54 +727,96 @@ impl RuntimeDaemon {
             reader.read_line(&mut line).map_err(runtime_io_error)?;
         }
         let line = line.trim_end_matches(['\r', '\n']);
-        let mut parts = line.split('\t');
-        let command = parts.next().unwrap_or_default();
+        let fields = line.split('\t').map(str::to_string).collect::<Vec<_>>();
+        let command = fields.first().map(String::as_str).unwrap_or_default();
+        let response = match self
+            .middleware
+            .begin(command, crate::CURRENT_PROTOCOL_VERSION)
+        {
+            Ok(context) => {
+                let (should_stop, response) = self.handle_command(command, &fields[1..]);
+                let response = match self.middleware.finish(&context, "handled") {
+                    Ok(()) => response,
+                    Err(error) => encode_error_response(error),
+                };
+                writeln!(stream, "{response}").map_err(runtime_io_error)?;
+                return Ok(should_stop);
+            }
+            Err(error) => encode_error_response(error),
+        };
+        writeln!(stream, "{response}").map_err(runtime_io_error)?;
+        Ok(false)
+    }
+
+    fn handle_command(&mut self, command: &str, args: &[String]) -> (bool, String) {
         let mut should_stop = false;
         let response = match command {
+            "HELLO" => format!("OK\tHELLO\t{}", RuntimeProtocolInfo::current().encode()),
             "PING" => "OK\tPONG".to_string(),
             "STOP" => {
                 should_stop = true;
                 "OK\tSTOPPED".to_string()
             }
             "RUN_SOURCE" => {
-                let path = parts.next().map(unescape).unwrap_or_default();
-                let profile = parts
-                    .next()
-                    .map(unescape)
+                let path = args
+                    .first()
+                    .map(|value| unescape(value))
+                    .unwrap_or_default();
+                let profile = args
+                    .get(1)
+                    .map(|value| unescape(value))
                     .and_then(|value| value.parse::<RuntimeProfile>().ok())
                     .unwrap_or(RuntimeProfile::Cli);
                 let mut request = RunSourceRequest::new(path);
                 request.profile = profile;
-                request.collect_stats = parts.next().and_then(parse_bool).unwrap_or(false);
-                request.collect_audit = parts.next().and_then(parse_bool).unwrap_or(false);
+                request.collect_stats = args
+                    .get(2)
+                    .and_then(|value| parse_bool(value))
+                    .unwrap_or(false);
+                request.collect_audit = args
+                    .get(3)
+                    .and_then(|value| parse_bool(value))
+                    .unwrap_or(false);
                 encode_run_response(self.run_source(request))
             }
             "RUN_BYTECODE" => {
-                let path = parts.next().map(unescape).unwrap_or_default();
-                let profile = parts
-                    .next()
-                    .map(unescape)
+                let path = args
+                    .first()
+                    .map(|value| unescape(value))
+                    .unwrap_or_default();
+                let profile = args
+                    .get(1)
+                    .map(|value| unescape(value))
                     .and_then(|value| value.parse::<RuntimeProfile>().ok())
                     .unwrap_or(RuntimeProfile::Cli);
                 let mut request = RunBytecodeRequest::new(path);
                 request.profile = profile;
-                request.collect_stats = parts.next().and_then(parse_bool).unwrap_or(false);
-                request.collect_audit = parts.next().and_then(parse_bool).unwrap_or(false);
+                request.collect_stats = args
+                    .get(2)
+                    .and_then(|value| parse_bool(value))
+                    .unwrap_or(false);
+                request.collect_audit = args
+                    .get(3)
+                    .and_then(|value| parse_bool(value))
+                    .unwrap_or(false);
                 encode_run_response(self.run_bytecode(request))
             }
             "RECORD_PROCESS" => {
-                let kind = parts
-                    .next()
-                    .map(unescape)
+                let kind = args
+                    .first()
+                    .map(|value| unescape(value))
                     .and_then(|value| parse_process_kind(&value))
                     .unwrap_or(RuntimeProcessKind::Run);
-                let path = parts.next().map(unescape).unwrap_or_default();
-                let exit_code = parts
-                    .next()
+                let path = args.get(1).map(|value| unescape(value)).unwrap_or_default();
+                let exit_code = args
+                    .get(2)
                     .and_then(|value| value.parse::<i32>().ok())
                     .unwrap_or(70);
-                let output = parts.next().map(unescape).unwrap_or_default();
-                let last_error = parts.next().map(unescape).filter(|value| !value.is_empty());
+                let output = args.get(3).map(|value| unescape(value)).unwrap_or_default();
+                let last_error = args
+                    .get(4)
+                    .map(|value| unescape(value))
+                    .filter(|value| !value.is_empty());
                 encode_record_response(self.record_cli_process(
                     kind,
                     path,
@@ -703,8 +828,8 @@ impl RuntimeDaemon {
             "LIST_PROCESSES" => encode_records_response(self.list_processes()),
             "LIST_HISTORY" => encode_records_response(self.list_history()),
             "PROCESS_INFO" => {
-                let process_id = parts
-                    .next()
+                let process_id = args
+                    .first()
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(RuntimeProcessId);
                 match process_id {
@@ -715,8 +840,8 @@ impl RuntimeDaemon {
                 }
             }
             "PROCESS_LOG" => {
-                let process_id = parts
-                    .next()
+                let process_id = args
+                    .first()
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(RuntimeProcessId);
                 match process_id {
@@ -725,8 +850,8 @@ impl RuntimeDaemon {
                 }
             }
             "KILL_PROCESS" => {
-                let process_id = parts
-                    .next()
+                let process_id = args
+                    .first()
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(RuntimeProcessId);
                 match process_id {
@@ -736,8 +861,7 @@ impl RuntimeDaemon {
             }
             _ => format!("ERR\t64\t{}", escape("unknown daemon command")),
         };
-        writeln!(stream, "{response}").map_err(runtime_io_error)?;
-        Ok(should_stop)
+        (should_stop, response)
     }
 
     fn request(&self, request: &str) -> Result<String, RuntimeError> {
@@ -1030,19 +1154,7 @@ pub fn ensure_default_layout() -> Result<(), RuntimeError> {
 }
 
 fn default_config_source() -> String {
-    [
-        "# Ferrix local configuration.",
-        "# This file is created next to the ferrix binary for local runtime services.",
-        "",
-        "[runtime]",
-        "mode = \"embedded\"",
-        "home = \"services/runtime\"",
-        "",
-        "[services]",
-        "runtime = \"services/runtime\"",
-        "",
-    ]
-    .join("\n")
+    RuntimeConfig::default_config_source()
 }
 
 fn write_process_record(path: &Path, record: &RuntimeProcessRecord) -> Result<(), RuntimeError> {
@@ -1050,6 +1162,8 @@ fn write_process_record(path: &Path, record: &RuntimeProcessRecord) -> Result<()
         path,
         &[
             ("id", record.id.0.to_string()),
+            ("request_id", record.request_id.0.to_string()),
+            ("correlation_id", record.correlation_id.0.to_string()),
             (
                 "parent_id",
                 record
@@ -1157,6 +1271,16 @@ fn read_process_record(path: &Path) -> Result<Option<RuntimeProcessRecord>, Runt
 
     Ok(Some(RuntimeProcessRecord {
         id: RuntimeProcessId(id),
+        request_id: values
+            .get("request_id")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(crate::RuntimeRequestId)
+            .unwrap_or(crate::RuntimeRequestId(id)),
+        correlation_id: values
+            .get("correlation_id")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(crate::RuntimeCorrelationId)
+            .unwrap_or(crate::RuntimeCorrelationId(session_id)),
         parent_id: values
             .get("parent_id")
             .and_then(|value| value.parse::<u64>().ok())
@@ -1338,6 +1462,31 @@ fn encode_text_response(result: Result<String, RuntimeError>) -> String {
     }
 }
 
+fn encode_error_response(error: RuntimeError) -> String {
+    format!("ERR\t{}\t{}", error.exit_code, escape(&error.render()))
+}
+
+fn decode_protocol_response(response: &str) -> Result<RuntimeProtocolInfo, RuntimeError> {
+    let parts = response.splitn(3, '\t').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["OK", "HELLO", payload] => RuntimeProtocolInfo::decode(payload).ok_or_else(|| {
+            RuntimeError::new(
+                70,
+                RuntimeErrorKind::DaemonState {
+                    message: "invalid protocol response".to_string(),
+                },
+            )
+        }),
+        ["ERR", exit_code, message] => Err(RuntimeError::new(
+            exit_code.parse().unwrap_or(70),
+            RuntimeErrorKind::DaemonState {
+                message: unescape(message).trim_end().to_string(),
+            },
+        )),
+        _ => invalid_daemon_response(response),
+    }
+}
+
 fn decode_record_response(response: &str) -> Result<RuntimeProcessRecord, RuntimeError> {
     let parts = response.split('\t').collect::<Vec<_>>();
     match parts.as_slice() {
@@ -1429,6 +1578,8 @@ fn invalid_daemon_response<T>(response: &str) -> Result<T, RuntimeError> {
 fn format_process_record(record: &RuntimeProcessRecord) -> String {
     [
         record.id.0.to_string(),
+        record.request_id.0.to_string(),
+        record.correlation_id.0.to_string(),
         record
             .parent_id
             .map_or_else(String::new, |parent| parent.0.to_string()),
@@ -1465,27 +1616,40 @@ fn format_process_record(record: &RuntimeProcessRecord) -> String {
 
 fn parse_process_record_line(line: &str) -> Option<RuntimeProcessRecord> {
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 17 && fields.len() != 25 {
+    if fields.len() != 17 && fields.len() != 25 && fields.len() != 27 {
         return None;
     }
     let id = RuntimeProcessId(fields[0].parse().ok()?);
-    let parent_id = if fields[1].is_empty() {
-        None
+    let has_identity = fields.len() == 27;
+    let offset = usize::from(has_identity) * 2;
+    let request_id = if has_identity {
+        crate::RuntimeRequestId(fields[1].parse().ok()?)
     } else {
-        Some(RuntimeProcessId(fields[1].parse().ok()?))
+        crate::RuntimeRequestId(id.0)
     };
-    let status = RuntimeProcessStatus::parse(fields[3])?;
-    let kind = parse_process_kind(fields[4])?;
-    let profile = fields[5].parse::<RuntimeProfile>().ok()?;
-    let ended_at_ms = if fields[9].is_empty() {
-        None
+    let session_id = RuntimeSessionId(fields[2 + offset].parse().ok()?);
+    let correlation_id = if has_identity {
+        crate::RuntimeCorrelationId(fields[2].parse().ok()?)
     } else {
-        Some(fields[9].parse().ok()?)
+        crate::RuntimeCorrelationId(session_id.0)
     };
-    let exit_code = if fields[10].is_empty() {
+    let parent_id = if fields[1 + offset].is_empty() {
         None
     } else {
-        Some(fields[10].parse().ok()?)
+        Some(RuntimeProcessId(fields[1 + offset].parse().ok()?))
+    };
+    let status = RuntimeProcessStatus::parse(fields[3 + offset])?;
+    let kind = parse_process_kind(fields[4 + offset])?;
+    let profile = fields[5 + offset].parse::<RuntimeProfile>().ok()?;
+    let ended_at_ms = if fields[9 + offset].is_empty() {
+        None
+    } else {
+        Some(fields[9 + offset].parse().ok()?)
+    };
+    let exit_code = if fields[10 + offset].is_empty() {
+        None
+    } else {
+        Some(fields[10 + offset].parse().ok()?)
     };
     let last_error_index = fields.len() - 1;
     let last_error = if fields[last_error_index].is_empty() {
@@ -1493,67 +1657,75 @@ fn parse_process_record_line(line: &str) -> Option<RuntimeProcessRecord> {
     } else {
         Some(unescape(fields[last_error_index]))
     };
-    let new_stats = fields.len() == 25;
+    let new_stats = fields.len() == 25 || fields.len() == 27;
 
     Some(RuntimeProcessRecord {
         id,
+        request_id,
+        correlation_id,
         parent_id,
-        session_id: RuntimeSessionId(fields[2].parse().ok()?),
+        session_id,
         status,
         kind,
         profile,
-        path: PathBuf::from(unescape(fields[6])),
-        args: unescape(fields[7])
+        path: PathBuf::from(unescape(fields[6 + offset])),
+        args: unescape(fields[7 + offset])
             .split(',')
             .filter(|arg| !arg.is_empty())
             .map(str::to_string)
             .collect(),
-        started_at_ms: fields[8].parse().ok()?,
+        started_at_ms: fields[8 + offset].parse().ok()?,
         ended_at_ms,
         exit_code,
         stats: RuntimeStats {
-            executed_instructions: fields[11].parse().ok()?,
-            call_depth: fields[12].parse().ok()?,
+            executed_instructions: fields[11 + offset].parse().ok()?,
+            call_depth: fields[12 + offset].parse().ok()?,
             max_call_depth: if new_stats {
-                fields[13].parse().ok()?
+                fields[13 + offset].parse().ok()?
             } else {
                 0
             },
             max_register_count: if new_stats {
-                fields[14].parse().ok()?
+                fields[14 + offset].parse().ok()?
             } else {
                 0
             },
-            heap_objects: fields[if new_stats { 15 } else { 13 }].parse().ok()?,
+            heap_objects: fields[if new_stats { 15 + offset } else { 13 + offset }]
+                .parse()
+                .ok()?,
             allocations: if new_stats {
-                fields[16].parse().ok()?
+                fields[16 + offset].parse().ok()?
             } else {
                 0
             },
             allocation_pressure: if new_stats {
-                fields[17].parse().ok()?
+                fields[17 + offset].parse().ok()?
             } else {
                 0
             },
-            gc_collections: fields[if new_stats { 18 } else { 14 }].parse().ok()?,
-            incremental_gc_steps: fields[if new_stats { 19 } else { 15 }].parse().ok()?,
+            gc_collections: fields[if new_stats { 18 + offset } else { 14 + offset }]
+                .parse()
+                .ok()?,
+            incremental_gc_steps: fields[if new_stats { 19 + offset } else { 15 + offset }]
+                .parse()
+                .ok()?,
             native_calls: if new_stats {
-                fields[20].parse().ok()?
+                fields[20 + offset].parse().ok()?
             } else {
                 0
             },
             thrown_errors: if new_stats {
-                fields[21].parse().ok()?
+                fields[21 + offset].parse().ok()?
             } else {
                 0
             },
             handled_exceptions: if new_stats {
-                fields[22].parse().ok()?
+                fields[22 + offset].parse().ok()?
             } else {
                 0
             },
             execution_time_ms: if new_stats {
-                fields[23].parse().ok()?
+                fields[23 + offset].parse().ok()?
             } else {
                 0
             },
