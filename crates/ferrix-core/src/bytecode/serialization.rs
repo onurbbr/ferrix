@@ -104,6 +104,7 @@ impl Encoder {
         self.string("function.name", &function.name)?;
         self.u8(function.arity);
         self.u8(function.register_count);
+        self.u8(function.capture_count);
         match &function.kind {
             FunctionKind::Bytecode(chunk) => {
                 self.u8(0);
@@ -121,6 +122,7 @@ impl Encoder {
         self.string("chunk.name", &chunk.name)?;
         self.u8(chunk.arity);
         self.u8(chunk.register_count);
+        self.u8(chunk.capture_count);
 
         self.len("constants", chunk.constants.len())?;
         for value in &chunk.constants {
@@ -228,6 +230,35 @@ impl Encoder {
                 self.u8(17);
                 self.reg(*dst);
                 self.u16(function.0);
+                self.reg(*args_start);
+                self.u8(*arg_count);
+            }
+            Instruction::MakeClosure {
+                dst,
+                function,
+                captures_start,
+                capture_count,
+            } => {
+                self.u8(25);
+                self.reg(*dst);
+                self.u16(function.0);
+                self.reg(*captures_start);
+                self.u8(*capture_count);
+            }
+            Instruction::LoadCapture { dst, capture } => {
+                self.u8(26);
+                self.reg(*dst);
+                self.u8(capture.0);
+            }
+            Instruction::CallValue {
+                dst,
+                callee,
+                args_start,
+                arg_count,
+            } => {
+                self.u8(27);
+                self.reg(*dst);
+                self.reg(*callee);
                 self.reg(*args_start);
                 self.u8(*arg_count);
             }
@@ -374,6 +405,7 @@ impl Decoder<'_> {
         let name = self.string()?;
         let arity = self.u8()?;
         let register_count = self.u8()?;
+        let capture_count = self.u8()?;
         match self.u8()? {
             0 => {
                 let chunk = self.chunk()?;
@@ -389,6 +421,7 @@ impl Decoder<'_> {
             function.name = name;
             function.arity = arity;
             function.register_count = register_count;
+            function.capture_count = capture_count;
             function
         })
     }
@@ -397,7 +430,10 @@ impl Decoder<'_> {
         let name = self.string()?;
         let arity = self.u8()?;
         let register_count = self.u8()?;
-        let mut chunk = Chunk::new(name, register_count).with_arity(arity);
+        let capture_count = self.u8()?;
+        let mut chunk = Chunk::new(name, register_count)
+            .with_arity(arity)
+            .with_capture_count(capture_count);
 
         let constant_count = self.len("constants")?;
         for _ in 0..constant_count {
@@ -480,6 +516,22 @@ impl Decoder<'_> {
             17 => Instruction::CallFunction {
                 dst: self.reg()?,
                 function: FunctionId(self.u16()?),
+                args_start: self.reg()?,
+                arg_count: self.u8()?,
+            },
+            25 => Instruction::MakeClosure {
+                dst: self.reg()?,
+                function: FunctionId(self.u16()?),
+                captures_start: self.reg()?,
+                capture_count: self.u8()?,
+            },
+            26 => Instruction::LoadCapture {
+                dst: self.reg()?,
+                capture: crate::bytecode::CaptureId(self.u8()?),
+            },
+            27 => Instruction::CallValue {
+                dst: self.reg()?,
+                callee: self.reg()?,
                 args_start: self.reg()?,
                 arg_count: self.u8()?,
             },
