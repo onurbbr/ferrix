@@ -30,12 +30,28 @@ pub struct RuntimeStats {
     pub executed_instructions: usize,
     /// Number of active call frames left after execution.
     pub call_depth: usize,
+    /// Maximum call depth observed during execution.
+    pub max_call_depth: usize,
+    /// Maximum active register count observed during execution.
+    pub max_register_count: usize,
     /// Number of heap objects currently owned by the VM.
     pub heap_objects: usize,
+    /// Number of successful heap allocations recorded by the VM.
+    pub allocations: u64,
+    /// Allocation pressure remaining after the latest collection.
+    pub allocation_pressure: usize,
     /// Number of GC collections recorded by the VM.
     pub gc_collections: u64,
     /// Number of incremental GC steps recorded by the VM.
     pub incremental_gc_steps: u64,
+    /// Number of native host calls executed by the VM.
+    pub native_calls: u64,
+    /// Number of throw instructions executed by the VM.
+    pub thrown_errors: u64,
+    /// Number of thrown values caught by an exception handler.
+    pub handled_exceptions: u64,
+    /// Wall-clock execution duration measured by the runtime.
+    pub execution_time_ms: u128,
 }
 
 /// Placeholder compile-only result.
