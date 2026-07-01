@@ -37,12 +37,30 @@ impl Parser {
     }
 
     fn declaration(&mut self) -> Result<Stmt, CompileError> {
-        if self.match_kind(&TokenKind::Fn) {
-            self.function_declaration()
+        if self.match_kind(&TokenKind::Export) {
+            self.export_declaration()
+        } else if self.match_kind(&TokenKind::Fn) {
+            self.function_declaration(false)
         } else if self.match_kind(&TokenKind::Import) {
             self.import_declaration()
         } else {
             self.statement()
+        }
+    }
+
+    fn export_declaration(&mut self) -> Result<Stmt, CompileError> {
+        if self.match_kind(&TokenKind::Fn) {
+            self.function_declaration(true)
+        } else if self.match_kind(&TokenKind::Let) {
+            self.let_statement(true)
+        } else {
+            Err(self.error(
+                CompileErrorKind::UnexpectedToken {
+                    expected: "`fn` or `let`".to_string(),
+                    found: self.peek().kind.describe(),
+                },
+                self.peek().span,
+            ))
         }
     }
 
@@ -68,7 +86,7 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Stmt, CompileError> {
         if self.match_kind(&TokenKind::Let) {
-            self.let_statement()
+            self.let_statement(false)
         } else if self.match_kind(&TokenKind::If) {
             self.if_statement()
         } else if self.match_kind(&TokenKind::While) {
@@ -82,7 +100,7 @@ impl Parser {
         }
     }
 
-    fn function_declaration(&mut self) -> Result<Stmt, CompileError> {
+    fn function_declaration(&mut self, exported: bool) -> Result<Stmt, CompileError> {
         let start = self.previous().span;
         let name_token = self.advance().clone();
         let TokenKind::Identifier(name) = name_token.kind else {
@@ -125,11 +143,12 @@ impl Parser {
             name,
             params,
             body,
+            exported,
             span: join(start, end),
         })
     }
 
-    fn let_statement(&mut self) -> Result<Stmt, CompileError> {
+    fn let_statement(&mut self, exported: bool) -> Result<Stmt, CompileError> {
         let start = self.previous().span;
         let name = match self.advance().kind.clone() {
             TokenKind::Identifier(name) => name,
@@ -151,6 +170,7 @@ impl Parser {
         Ok(Stmt::Let {
             name,
             initializer,
+            exported,
             span: join(start, end),
         })
     }
