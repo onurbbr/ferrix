@@ -143,6 +143,30 @@ impl RuntimeError {
         Self { exit_code, kind }
     }
 
+    /// Returns a stable machine-readable error category.
+    pub fn category(&self) -> &'static str {
+        match &self.kind {
+            RuntimeErrorKind::Read { .. } => "read",
+            RuntimeErrorKind::Manifest { .. } => "manifest",
+            RuntimeErrorKind::ReadImport { .. } => "read_import",
+            RuntimeErrorKind::PackageImport { .. } => "package_import",
+            RuntimeErrorKind::Diagnostic(_) => "diagnostic",
+            RuntimeErrorKind::PolicyDenied { .. } => "policy_denied",
+            RuntimeErrorKind::ImportCycle { .. } => "import_cycle",
+            RuntimeErrorKind::DecodeBytecode(_) => "decode_bytecode",
+            RuntimeErrorKind::UnsupportedFeature { .. } => "unsupported_feature",
+            RuntimeErrorKind::MissingExtension { .. } => "missing_extension",
+            RuntimeErrorKind::Execution(_) => "execution",
+            RuntimeErrorKind::RuntimeUnavailable { .. } => "runtime_unavailable",
+            RuntimeErrorKind::ProtocolMismatch { .. } => "protocol_mismatch",
+            RuntimeErrorKind::RequestTimeout { .. } => "request_timeout",
+            RuntimeErrorKind::RateLimited { .. } => "rate_limited",
+            RuntimeErrorKind::ServiceAlreadyRunning => "service_already_running",
+            RuntimeErrorKind::ServiceNotRunning => "service_not_running",
+            RuntimeErrorKind::DaemonState { .. } => "daemon_state",
+        }
+    }
+
     /// Renders the error exactly once for CLI stderr.
     pub fn render(&self) -> String {
         match &self.kind {
