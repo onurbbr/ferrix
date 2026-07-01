@@ -309,6 +309,31 @@ fn daemon_records_request_identity_and_protocol_status() {
 }
 
 #[test]
+fn daemon_metrics_config_events_and_error_categories_are_inspectable() {
+    let dir = temp_dir();
+    let mut daemon = RuntimeDaemon::with_home(dir.join("runtime"));
+    daemon.start().unwrap();
+
+    let metrics = daemon.metrics().unwrap();
+    assert_eq!(metrics.process_count, 0);
+    assert_eq!(metrics.event_queue_len, 1);
+
+    let events = daemon.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, RuntimeEventKind::RuntimeStarted);
+
+    assert_eq!(daemon.config().mode, RuntimeMode::Embedded);
+
+    let error = ferrix_runtime::RuntimeError::new(
+        69,
+        ferrix_runtime::RuntimeErrorKind::RuntimeUnavailable {
+            mode: RuntimeMode::Required,
+        },
+    );
+    assert_eq!(error.category(), "runtime_unavailable");
+}
+
+#[test]
 fn runtime_policy_combines_profile_and_request_capabilities() {
     let policy = RuntimePolicy::new(RuntimeProfile::Server, [HostCapability::IoOutput]);
 
