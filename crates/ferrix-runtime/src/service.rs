@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     env, fs, io,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use ferrix_compiler::{
@@ -51,10 +52,29 @@ impl RuntimeService {
         let mut vm = vm_for_policy(&policy);
         let capture = install_output(&mut vm, request.output);
         install_stdlib_for_policy(&mut vm, compiled.program.as_program(), &policy)?;
+        let collect_audit = request.collect_audit || request.profile.audit_enabled();
+        let mut audit_events = audit_start_events(collect_audit, request.profile, &request.path);
 
+        let started = Instant::now();
         match vm.run_program(&compiled.program) {
-            Ok(value) => Ok(run_result(&vm, value, capture, request.collect_stats)),
+            Ok(value) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                if collect_audit {
+                    audit_events.push("program_completed exit_code=0".to_string());
+                }
+                Ok(run_result(
+                    &vm,
+                    value,
+                    capture,
+                    request.collect_stats,
+                    elapsed_ms,
+                    audit_events,
+                ))
+            }
             Err(error) => {
+                if collect_audit {
+                    audit_events.push(format!("program_failed error={:?}", error.kind));
+                }
                 let diagnostic = error.to_diagnostic_with_program(compiled.program.as_program());
                 Err(RuntimeError::new(
                     70,
@@ -83,13 +103,34 @@ impl RuntimeService {
         let mut vm = vm_for_policy(&policy);
         let capture = install_output(&mut vm, request.output);
         install_stdlib_for_policy(&mut vm, program.as_program(), &policy)?;
+        let collect_audit = request.collect_audit || request.profile.audit_enabled();
+        let mut audit_events = audit_start_events(collect_audit, request.profile, &request.path);
 
+        let started = Instant::now();
         match vm.run_program(&program) {
-            Ok(value) => Ok(run_result(&vm, value, capture, request.collect_stats)),
-            Err(error) => Err(RuntimeError::new(
-                70,
-                RuntimeErrorKind::Execution(error.to_string()),
-            )),
+            Ok(value) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                if collect_audit {
+                    audit_events.push("program_completed exit_code=0".to_string());
+                }
+                Ok(run_result(
+                    &vm,
+                    value,
+                    capture,
+                    request.collect_stats,
+                    elapsed_ms,
+                    audit_events,
+                ))
+            }
+            Err(error) => {
+                if collect_audit {
+                    audit_events.push(format!("program_failed error={:?}", error.kind));
+                }
+                Err(RuntimeError::new(
+                    70,
+                    RuntimeErrorKind::Execution(error.to_string()),
+                ))
+            }
         }
     }
 
@@ -160,14 +201,17 @@ fn run_result(
     value: Value,
     capture: Option<crate::output::CapturedOutput>,
     collect_stats: bool,
+    execution_time_ms: u128,
+    mut audit_events: Vec<String>,
 ) -> RunResult {
     let value_display = (value != Value::Nil).then(|| display_value(vm, value));
     let output = capture.map_or_else(String::new, |capture| capture.contents());
     let stats = if collect_stats {
-        runtime_stats(vm)
+        runtime_stats(vm, execution_time_ms)
     } else {
         RuntimeStats::default()
     };
+    audit_events.extend(vm.audit_events().iter().cloned());
 
     RunResult {
         exit_code: 0,
@@ -175,18 +219,38 @@ fn run_result(
         value_display,
         output,
         stats,
-        audit_events: vm.audit_events().to_vec(),
+        audit_events,
     }
 }
 
-fn runtime_stats(vm: &Vm) -> RuntimeStats {
+fn runtime_stats(vm: &Vm, execution_time_ms: u128) -> RuntimeStats {
     let gc = vm.gc_stats();
+    let execution = vm.execution_stats();
     RuntimeStats {
         executed_instructions: vm.executed_instruction_count(),
         call_depth: vm.call_depth(),
+        max_call_depth: execution.max_call_depth,
+        max_register_count: execution.max_register_count,
         heap_objects: vm.heap().len(),
+        allocations: gc.allocations,
+        allocation_pressure: gc.allocation_pressure,
         gc_collections: gc.collections,
         incremental_gc_steps: gc.incremental_steps,
+        native_calls: execution.native_calls,
+        thrown_errors: execution.thrown_errors,
+        handled_exceptions: execution.handled_exceptions,
+        execution_time_ms,
+    }
+}
+
+fn audit_start_events(enabled: bool, profile: crate::RuntimeProfile, path: &Path) -> Vec<String> {
+    if enabled {
+        vec![
+            format!("runtime_profile_selected profile={}", profile.as_str()),
+            format!("program_started path={}", path.display()),
+        ]
+    } else {
+        Vec::new()
     }
 }
 
