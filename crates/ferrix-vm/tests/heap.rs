@@ -1,7 +1,7 @@
 //! Tests for heap allocation, root collection, and mark/sweep GC behavior.
 
 use ferrix_core::{Obj, ObjRef, Value, bytecode::Chunk};
-use ferrix_vm::{Heap, RootSet, RuntimeLimits, VmErrorKind};
+use ferrix_vm::{Heap, IncrementalGcPhase, RootSet, RuntimeLimits, VmErrorKind};
 
 #[test]
 fn arena_allocates_stable_object_references() {
@@ -27,6 +27,7 @@ fn heap_object_limit_is_typed_error() {
         max_call_depth: 1,
         max_heap_objects: 1,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     };
     heap.allocate(Obj::String("one".to_string()), limits)
         .unwrap();
@@ -77,6 +78,99 @@ fn mark_sweep_collects_unreachable_objects() {
         heap.get(dropped).unwrap_err().kind,
         VmErrorKind::InvalidObjectRef { reference: dropped }
     );
+}
+
+#[test]
+fn incremental_collection_finishes_over_multiple_steps() {
+    let mut heap = Heap::new();
+    let leaf = heap
+        .allocate(Obj::String("leaf".to_string()), RuntimeLimits::default())
+        .unwrap();
+    let root = heap
+        .allocate(Obj::Array(vec![Value::Obj(leaf)]), RuntimeLimits::default())
+        .unwrap();
+    let dropped = heap
+        .allocate(Obj::String("dropped".to_string()), RuntimeLimits::default())
+        .unwrap();
+
+    assert!(heap.start_incremental_collection(&[root]));
+    assert_eq!(heap.incremental_phase(), IncrementalGcPhase::Marking);
+    assert_eq!(heap.step_incremental_collection(1), None);
+    assert!(heap.is_incremental_collection_active());
+
+    let stats = loop {
+        if let Some(stats) = heap.step_incremental_collection(1) {
+            break stats;
+        }
+    };
+
+    assert_eq!(stats.marked, 2);
+    assert_eq!(stats.swept, 1);
+    assert_eq!(stats.live, 2);
+    assert_eq!(heap.incremental_phase(), IncrementalGcPhase::Idle);
+    assert!(heap.get(root).is_ok());
+    assert!(heap.get(leaf).is_ok());
+    assert!(heap.get(dropped).is_err());
+}
+
+#[test]
+fn incremental_write_barrier_preserves_late_heap_mutation() {
+    let mut heap = Heap::new();
+    let holder = heap
+        .allocate(Obj::Array(Vec::new()), RuntimeLimits::default())
+        .unwrap();
+    let late = heap
+        .allocate(Obj::String("late".to_string()), RuntimeLimits::default())
+        .unwrap();
+
+    assert!(heap.start_incremental_collection(&[holder]));
+    assert_eq!(heap.step_incremental_collection(1), None);
+    heap.write_barrier_value(Value::Obj(late));
+    let Obj::Array(values) = heap.get_mut(holder).unwrap() else {
+        panic!("expected array holder");
+    };
+    values.push(Value::Obj(late));
+
+    let stats = heap.finish_incremental_collection().unwrap();
+
+    assert_eq!(stats.marked, 2);
+    assert_eq!(stats.swept, 0);
+    assert_eq!(stats.live, 2);
+    assert!(heap.get(holder).is_ok());
+    assert!(heap.get(late).is_ok());
+}
+
+#[test]
+fn incremental_allocation_barrier_preserves_new_objects() {
+    let mut heap = Heap::new();
+    let root = heap
+        .allocate(Obj::Array(Vec::new()), RuntimeLimits::default())
+        .unwrap();
+    let dropped = heap
+        .allocate(Obj::String("dropped".to_string()), RuntimeLimits::default())
+        .unwrap();
+
+    assert!(heap.start_incremental_collection(&[root]));
+    assert_eq!(heap.step_incremental_collection(1), None);
+    let allocated = heap
+        .allocate(
+            Obj::String("allocated".to_string()),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    heap.write_barrier_value(Value::Obj(allocated));
+    let Obj::Array(values) = heap.get_mut(root).unwrap() else {
+        panic!("expected array root");
+    };
+    values.push(Value::Obj(allocated));
+
+    let stats = heap.finish_incremental_collection().unwrap();
+
+    assert_eq!(stats.swept, 1);
+    assert_eq!(stats.live, 2);
+    assert!(heap.get(root).is_ok());
+    assert!(heap.get(allocated).is_ok());
+    assert!(heap.get(dropped).is_err());
 }
 
 #[test]
