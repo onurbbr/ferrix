@@ -8,7 +8,8 @@ use std::{
 
 use ferrix_core::bytecode::encode_program;
 use ferrix_runtime::{
-    RunBytecodeRequest, RunSourceRequest, RuntimeGateway, RuntimeMode, RuntimeService,
+    RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus, RuntimeEventKind,
+    RuntimeGateway, RuntimeMode, RuntimeProcessStatus, RuntimeService,
 };
 
 #[test]
@@ -42,8 +43,9 @@ fn embedded_gateway_runs_source_file() {
 fn required_gateway_reports_missing_runtime_daemon() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
+    let runtime_home = dir.join("runtime");
 
-    let error = RuntimeGateway::new(RuntimeMode::Required)
+    let error = RuntimeGateway::with_home(RuntimeMode::Required, runtime_home)
         .run_source(RunSourceRequest::new(&file))
         .unwrap_err();
 
@@ -52,6 +54,78 @@ fn required_gateway_reports_missing_runtime_daemon() {
         error.render(),
         "Ferrix runtime is not running.\nStart it with: ferrix runtime start\n"
     );
+}
+
+#[test]
+fn daemon_lifecycle_reports_health_status() {
+    let dir = temp_dir();
+    let mut daemon = RuntimeDaemon::with_home(dir.join("runtime"));
+
+    let stopped = daemon.status().unwrap();
+    assert!(!stopped.is_serving());
+
+    let started = daemon.start().unwrap();
+    assert!(started.is_serving());
+    assert_eq!(started.process_count, 0);
+
+    let stopped = daemon.stop().unwrap();
+    assert!(!stopped.is_serving());
+}
+
+#[test]
+fn daemon_runs_source_and_records_process_logs_and_checkpoint() {
+    let dir = temp_dir();
+    let file = write_file(
+        &dir,
+        "main.fx",
+        "\
+print(\"hello\");
+return 42;
+",
+    );
+    let mut daemon = RuntimeDaemon::with_home(dir.join("runtime"));
+    daemon.start().unwrap();
+
+    let result = daemon.run_source(RunSourceRequest::new(&file)).unwrap();
+
+    assert_eq!(result.value_display.as_deref(), Some("42"));
+    let processes = daemon.list_processes().unwrap();
+    assert_eq!(processes.len(), 1);
+    assert_eq!(processes[0].status, RuntimeProcessStatus::Completed);
+    assert_eq!(daemon.logs(processes[0].id).unwrap(), "hello\n42\n");
+    assert_eq!(daemon.checkpoints().unwrap().len(), 1);
+}
+
+#[test]
+fn managed_gateway_starts_daemon_and_records_completed_process() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 42;\n");
+    let runtime_home = dir.join("runtime");
+
+    let result = RuntimeGateway::with_home(RuntimeMode::Managed, &runtime_home)
+        .run_source(RunSourceRequest::new(&file))
+        .unwrap();
+
+    assert_eq!(result.value_display.as_deref(), Some("42"));
+    let daemon = RuntimeDaemon::with_home(runtime_home);
+    let status = daemon.status().unwrap();
+    assert!(status.is_serving());
+    assert_eq!(status.completed_process_count, 1);
+}
+
+#[test]
+fn event_bus_drops_oldest_events_when_capacity_is_reached() {
+    let mut bus = RuntimeEventBus::with_capacity(2);
+
+    bus.publish(RuntimeEventKind::RuntimeStarted, None, None);
+    bus.publish(RuntimeEventKind::ProcessStarted, None, None);
+    bus.publish(RuntimeEventKind::ProcessCompleted, None, None);
+
+    let events = bus.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(bus.dropped_events(), 1);
+    assert_eq!(events[0].kind, RuntimeEventKind::ProcessStarted);
+    assert_eq!(events[1].kind, RuntimeEventKind::ProcessCompleted);
 }
 
 #[test]
