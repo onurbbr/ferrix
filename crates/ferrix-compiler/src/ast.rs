@@ -21,6 +21,7 @@ pub enum Stmt {
     /// `let name = expr;` local binding.
     Let {
         name: String,
+        type_annotation: Option<TypeAnnotation>,
         initializer: Expr,
         exported: bool,
         span: SourceSpan,
@@ -29,6 +30,8 @@ pub enum Stmt {
     Function {
         name: String,
         params: Vec<String>,
+        param_types: Vec<Option<TypeAnnotation>>,
+        return_type: Option<TypeAnnotation>,
         body: Vec<Stmt>,
         exported: bool,
         span: SourceSpan,
@@ -109,6 +112,8 @@ pub enum Expr {
     /// Anonymous function expression that can capture outer locals.
     Function {
         params: Vec<String>,
+        param_types: Vec<Option<TypeAnnotation>>,
+        return_type: Option<TypeAnnotation>,
         body: Vec<Stmt>,
         span: SourceSpan,
     },
@@ -141,6 +146,29 @@ pub enum Expr {
     },
     /// Parenthesized expression used to preserve source span.
     Grouping { expr: Box<Expr>, span: SourceSpan },
+}
+
+/// Optional source-level type annotation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeAnnotation {
+    /// Annotated type kind.
+    pub kind: TypeAnnotationKind,
+    /// Span for the annotation name.
+    pub span: SourceSpan,
+}
+
+/// Type names accepted by the current lightweight source type layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeAnnotationKind {
+    Any,
+    Nil,
+    Bool,
+    Int,
+    String,
+    Array,
+    Map,
+    Record,
+    Function,
 }
 
 /// Literal values accepted by the parser.
