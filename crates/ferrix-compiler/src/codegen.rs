@@ -90,7 +90,8 @@ fn compile_program_ast_with_aliases(
 
 struct Codegen {
     chunk: Chunk,
-    locals: HashMap<String, Register>,
+    locals: HashMap<String, Vec<Register>>,
+    scopes: Vec<Vec<String>>,
     boxed_locals: HashSet<String>,
     captures: HashMap<String, CaptureId>,
     functions: HashMap<String, FunctionId>,
@@ -109,6 +110,7 @@ impl Codegen {
         Self {
             chunk: Chunk::new("main", 0),
             locals: HashMap::new(),
+            scopes: vec![Vec::new()],
             boxed_locals,
             captures: HashMap::new(),
             functions,
@@ -134,14 +136,10 @@ impl Codegen {
             )
         })?;
         let boxed_locals = captured_locals(body, params, &functions);
-        let mut locals = HashMap::new();
-        for (index, param) in params.iter().enumerate() {
-            locals.insert(param.clone(), Register(index as u8));
-        }
-
         let mut compiler = Self {
             chunk: Chunk::new(name, 0).with_arity(arity),
-            locals,
+            locals: HashMap::new(),
+            scopes: vec![Vec::new()],
             boxed_locals,
             captures: HashMap::new(),
             functions,
@@ -149,6 +147,9 @@ impl Codegen {
             next_function_id,
             generated_functions: Vec::new(),
         };
+        for (index, param) in params.iter().enumerate() {
+            compiler.declare_local(param.clone(), Register(index as u8));
+        }
         compiler.box_captured_parameters(params);
         Ok(compiler)
     }
@@ -241,7 +242,7 @@ impl Codegen {
                     })?,
                     body,
                 )?;
-                compiler.compile_block(body)?;
+                compiler.compile_function_body(body)?;
                 let generated_functions = std::mem::take(&mut compiler.generated_functions);
                 program.functions[usize::from(function_id.0)] =
                     Function::bytecode(compiler.finish_chunk()?);
@@ -297,7 +298,7 @@ impl Codegen {
                 if self.boxed_locals.contains(name) {
                     self.chunk
                         .push_instruction(Instruction::MakeUpvalue { dst, src: dst });
-                    self.locals.insert(name.clone(), dst);
+                    self.declare_local(name.clone(), dst);
                     let value = self.compile_expr(initializer)?;
                     self.chunk.push_instruction(Instruction::StoreUpvalue {
                         upvalue: dst,
@@ -305,12 +306,12 @@ impl Codegen {
                     });
                 } else {
                     self.compile_expr_into(initializer, dst)?;
-                    self.locals.insert(name.clone(), dst);
+                    self.declare_local(name.clone(), dst);
                 }
                 Ok(())
             }
             Stmt::Assign { name, value, span } => {
-                if let Some(dst) = self.locals.get(name).copied() {
+                if let Some(dst) = self.lookup_local(name) {
                     if self.boxed_locals.contains(name) {
                         let value = self.compile_expr(value)?;
                         self.chunk.push_instruction_with_span(
@@ -381,8 +382,12 @@ impl Codegen {
                 body,
                 span,
             } => self.compile_while(condition, body, *span),
-            Stmt::Block { statements, .. } => self.compile_block(statements),
+            Stmt::Block { statements, .. } => self.compile_scoped_block(statements),
         }
+    }
+
+    fn compile_function_body(&mut self, statements: &[Stmt]) -> Result<(), CompileError> {
+        self.compile_scoped_block(statements)
     }
 
     fn compile_block(&mut self, statements: &[Stmt]) -> Result<(), CompileError> {
@@ -391,6 +396,13 @@ impl Codegen {
         }
 
         Ok(())
+    }
+
+    fn compile_scoped_block(&mut self, statements: &[Stmt]) -> Result<(), CompileError> {
+        self.push_scope();
+        let result = self.compile_block(statements);
+        self.pop_scope();
+        result
     }
 
     fn compile_if(
@@ -402,7 +414,7 @@ impl Codegen {
     ) -> Result<(), CompileError> {
         let condition = self.compile_expr(condition)?;
         let jump_to_else = self.emit_jump_if_false(condition, span)?;
-        self.compile_block(then_branch)?;
+        self.compile_scoped_block(then_branch)?;
 
         if else_branch.is_empty() {
             self.patch_jump(jump_to_else, self.current_instruction_index()?)?;
@@ -413,7 +425,7 @@ impl Codegen {
                 Some(self.emit_jump(span)?)
             };
             self.patch_jump(jump_to_else, self.current_instruction_index()?)?;
-            self.compile_block(else_branch)?;
+            self.compile_scoped_block(else_branch)?;
             if let Some(jump_to_end) = jump_to_end {
                 self.patch_jump(jump_to_end, self.current_instruction_index()?)?;
             }
@@ -431,7 +443,7 @@ impl Codegen {
         let loop_start = self.current_instruction_index()?;
         let condition = self.compile_expr(condition)?;
         let jump_to_end = self.emit_jump_if_false(condition, span)?;
-        self.compile_block(body)?;
+        self.compile_scoped_block(body)?;
         self.chunk.push_instruction_with_span(
             Instruction::Jump {
                 target: JumpTarget(loop_start),
@@ -445,7 +457,7 @@ impl Codegen {
     fn compile_expr(&mut self, expr: &Expr) -> Result<Register, CompileError> {
         match expr {
             Expr::Variable { name, span } => {
-                if let Some(register) = self.locals.get(name).copied() {
+                if let Some(register) = self.lookup_local(name) {
                     if self.boxed_locals.contains(name) {
                         let dst = self.alloc_register()?;
                         self.compile_expr_into(expr, dst)?;
@@ -499,7 +511,7 @@ impl Codegen {
                 Ok(())
             }
             Expr::Variable { name, span } => {
-                if let Some(src) = self.locals.get(name).copied() {
+                if let Some(src) = self.lookup_local(name) {
                     if self.boxed_locals.contains(name) {
                         self.chunk.push_instruction_with_span(
                             Instruction::LoadUpvalue { dst, upvalue: src },
@@ -720,7 +732,21 @@ impl Codegen {
             start
         };
 
-        if let Some(function) = self.functions.get(callee).copied() {
+        if self.lookup_local(callee).is_some() || self.captures.contains_key(callee) {
+            let callee = self.compile_expr(&Expr::Variable {
+                name: callee.to_string(),
+                span,
+            })?;
+            self.chunk.push_instruction_with_span(
+                Instruction::CallValue {
+                    dst,
+                    callee,
+                    args_start,
+                    arg_count: args.len() as u8,
+                },
+                Some(span),
+            );
+        } else if let Some(function) = self.functions.get(callee).copied() {
             self.chunk.push_instruction_with_span(
                 Instruction::CallFunction {
                     dst,
@@ -757,7 +783,7 @@ impl Codegen {
     ) -> Result<(), CompileError> {
         let captures = free_variables(body, params, &self.functions)
             .into_iter()
-            .filter(|name| self.locals.contains_key(name) || self.captures.contains_key(name))
+            .filter(|name| self.lookup_local(name).is_some() || self.captures.contains_key(name))
             .collect::<Vec<_>>();
         let function_id = FunctionId(self.next_function_id);
         self.next_function_id = self.next_function_id.checked_add(1).ok_or_else(|| {
@@ -777,7 +803,7 @@ impl Codegen {
             self.functions.clone(),
             self.next_function_id,
         )?;
-        compiler.compile_block(body)?;
+        compiler.compile_function_body(body)?;
         self.next_function_id = compiler.next_function_id;
         self.generated_functions
             .extend(std::mem::take(&mut compiler.generated_functions));
@@ -793,7 +819,7 @@ impl Codegen {
                 capture_registers.push(self.alloc_register()?);
             }
             for (name, register) in captures.iter().zip(capture_registers) {
-                if let Some(local) = self.locals.get(name).copied() {
+                if let Some(local) = self.lookup_local(name) {
                     if self.boxed_locals.contains(name) {
                         if local != register {
                             self.chunk.push_instruction_with_span(
@@ -843,6 +869,41 @@ impl Codegen {
             .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
         self.next_register += 1;
         Ok(Register(register))
+    }
+
+    fn lookup_local(&self, name: &str) -> Option<Register> {
+        self.locals
+            .get(name)
+            .and_then(|bindings| bindings.last())
+            .copied()
+    }
+
+    fn declare_local(&mut self, name: String, register: Register) {
+        self.locals.entry(name.clone()).or_default().push(register);
+        self.scopes
+            .last_mut()
+            .expect("codegen always has an active scope")
+            .push(name);
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    fn pop_scope(&mut self) {
+        let names = self
+            .scopes
+            .pop()
+            .expect("codegen always has an active scope");
+
+        for name in names.into_iter().rev() {
+            if let Some(bindings) = self.locals.get_mut(&name) {
+                bindings.pop();
+                if bindings.is_empty() {
+                    self.locals.remove(&name);
+                }
+            }
+        }
     }
 
     fn emit_jump_if_false(
@@ -903,7 +964,7 @@ impl Codegen {
 
     fn box_captured_parameters(&mut self, params: &[String]) {
         for param in params {
-            if let Some(register) = self.locals.get(param).copied()
+            if let Some(register) = self.lookup_local(param)
                 && self.boxed_locals.contains(param)
             {
                 self.chunk.push_instruction(Instruction::MakeUpvalue {
@@ -1128,116 +1189,14 @@ fn captured_locals(
     params: &[String],
     functions: &HashMap<String, FunctionId>,
 ) -> HashSet<String> {
-    let mut local_names = params.iter().cloned().collect::<HashSet<_>>();
-    collect_local_names(statements, &mut local_names);
-
+    let mut scopes = NameScopes::new();
+    for param in params {
+        scopes.declare(param.clone());
+    }
     let mut captured = HashSet::new();
-    for stmt in statements {
-        collect_stmt_captured_locals(stmt, &local_names, functions, &mut captured);
-    }
+
+    collect_scoped_captures(statements, &mut scopes, functions, &mut captured);
     captured
-}
-
-fn collect_stmt_captured_locals(
-    stmt: &Stmt,
-    local_names: &HashSet<String>,
-    functions: &HashMap<String, FunctionId>,
-    captured: &mut HashSet<String>,
-) {
-    match stmt {
-        Stmt::Import { .. } | Stmt::Function { .. } => {}
-        Stmt::Let { initializer, .. } => {
-            collect_expr_captured_locals(initializer, local_names, functions, captured);
-        }
-        Stmt::Assign { value, .. } => {
-            collect_expr_captured_locals(value, local_names, functions, captured);
-        }
-        Stmt::IndexAssign {
-            target,
-            index,
-            value,
-            ..
-        } => {
-            collect_expr_captured_locals(target, local_names, functions, captured);
-            collect_expr_captured_locals(index, local_names, functions, captured);
-            collect_expr_captured_locals(value, local_names, functions, captured);
-        }
-        Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
-            collect_expr_captured_locals(value, local_names, functions, captured);
-        }
-        Stmt::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_expr_captured_locals(condition, local_names, functions, captured);
-            for stmt in then_branch {
-                collect_stmt_captured_locals(stmt, local_names, functions, captured);
-            }
-            for stmt in else_branch {
-                collect_stmt_captured_locals(stmt, local_names, functions, captured);
-            }
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            collect_expr_captured_locals(condition, local_names, functions, captured);
-            for stmt in body {
-                collect_stmt_captured_locals(stmt, local_names, functions, captured);
-            }
-        }
-        Stmt::Block { statements, .. } => {
-            for stmt in statements {
-                collect_stmt_captured_locals(stmt, local_names, functions, captured);
-            }
-        }
-    }
-}
-
-fn collect_expr_captured_locals(
-    expr: &Expr,
-    local_names: &HashSet<String>,
-    functions: &HashMap<String, FunctionId>,
-    captured: &mut HashSet<String>,
-) {
-    match expr {
-        Expr::Literal { .. } | Expr::Variable { .. } => {}
-        Expr::Binary { lhs, rhs, .. } => {
-            collect_expr_captured_locals(lhs, local_names, functions, captured);
-            collect_expr_captured_locals(rhs, local_names, functions, captured);
-        }
-        Expr::Call { args, .. } => {
-            for arg in args {
-                collect_expr_captured_locals(arg, local_names, functions, captured);
-            }
-        }
-        Expr::Index { target, index, .. } => {
-            collect_expr_captured_locals(target, local_names, functions, captured);
-            collect_expr_captured_locals(index, local_names, functions, captured);
-        }
-        Expr::Array { elements, .. } => {
-            for element in elements {
-                collect_expr_captured_locals(element, local_names, functions, captured);
-            }
-        }
-        Expr::Map { entries, .. } => {
-            for (key, value) in entries {
-                collect_expr_captured_locals(key, local_names, functions, captured);
-                collect_expr_captured_locals(value, local_names, functions, captured);
-            }
-        }
-        Expr::Function { params, body, .. } => {
-            for name in free_variables(body, params, functions) {
-                if local_names.contains(&name) {
-                    captured.insert(name);
-                }
-            }
-        }
-        Expr::Grouping { expr, .. } => {
-            collect_expr_captured_locals(expr, local_names, functions, captured);
-        }
-    }
 }
 
 fn free_variables(
@@ -1245,110 +1204,248 @@ fn free_variables(
     params: &[String],
     functions: &HashMap<String, FunctionId>,
 ) -> Vec<String> {
-    let mut locals = params.iter().cloned().collect::<HashSet<_>>();
-    collect_local_names(body, &mut locals);
+    let mut scopes = NameScopes::new();
+    for param in params {
+        scopes.declare(param.clone());
+    }
+    scopes.push_scope();
     let mut seen = HashSet::new();
     let mut free = Vec::new();
-    for stmt in body {
-        collect_stmt_free_variables(stmt, &locals, functions, &mut seen, &mut free);
-    }
+
+    collect_stmt_free_variables(body, &mut scopes, functions, &mut seen, &mut free);
     free
 }
 
-fn collect_local_names(statements: &[Stmt], locals: &mut HashSet<String>) {
+#[derive(Clone, Debug)]
+struct NameScopes {
+    scopes: Vec<HashSet<String>>,
+}
+
+impl NameScopes {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashSet::new()],
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes
+            .pop()
+            .expect("name analysis always keeps one active scope");
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|scope| scope.contains(name))
+    }
+
+    fn declare(&mut self, name: String) {
+        self.scopes
+            .last_mut()
+            .expect("name analysis always has a current scope")
+            .insert(name);
+    }
+}
+
+fn collect_scoped_captures(
+    statements: &[Stmt],
+    scopes: &mut NameScopes,
+    functions: &HashMap<String, FunctionId>,
+    captured: &mut HashSet<String>,
+) {
+    scopes.push_scope();
+    collect_stmt_captured_locals(statements, scopes, functions, captured);
+    scopes.pop_scope();
+}
+
+fn collect_stmt_captured_locals(
+    statements: &[Stmt],
+    scopes: &mut NameScopes,
+    functions: &HashMap<String, FunctionId>,
+    captured: &mut HashSet<String>,
+) {
     for stmt in statements {
         match stmt {
-            Stmt::Let { name, .. } | Stmt::Function { name, .. } => {
-                locals.insert(name.clone());
+            Stmt::Import { .. } | Stmt::Function { .. } => {}
+            Stmt::Let {
+                name, initializer, ..
+            } => {
+                if matches!(initializer, Expr::Function { .. }) {
+                    scopes.declare(name.clone());
+                    collect_expr_captured_locals(initializer, scopes, functions, captured);
+                } else {
+                    collect_expr_captured_locals(initializer, scopes, functions, captured);
+                    scopes.declare(name.clone());
+                }
+            }
+            Stmt::Assign { value, .. } => {
+                collect_expr_captured_locals(value, scopes, functions, captured);
+            }
+            Stmt::IndexAssign {
+                target,
+                index,
+                value,
+                ..
+            } => {
+                collect_expr_captured_locals(target, scopes, functions, captured);
+                collect_expr_captured_locals(index, scopes, functions, captured);
+                collect_expr_captured_locals(value, scopes, functions, captured);
+            }
+            Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
+                collect_expr_captured_locals(value, scopes, functions, captured);
             }
             Stmt::If {
+                condition,
                 then_branch,
                 else_branch,
                 ..
             } => {
-                collect_local_names(then_branch, locals);
-                collect_local_names(else_branch, locals);
+                collect_expr_captured_locals(condition, scopes, functions, captured);
+                collect_scoped_captures(then_branch, scopes, functions, captured);
+                collect_scoped_captures(else_branch, scopes, functions, captured);
             }
-            Stmt::While { body, .. }
-            | Stmt::Block {
-                statements: body, ..
+            Stmt::While {
+                condition, body, ..
             } => {
-                collect_local_names(body, locals);
+                collect_expr_captured_locals(condition, scopes, functions, captured);
+                collect_scoped_captures(body, scopes, functions, captured);
             }
-            Stmt::Import { .. }
-            | Stmt::Assign { .. }
-            | Stmt::IndexAssign { .. }
-            | Stmt::Return { .. }
-            | Stmt::Expr { .. } => {}
+            Stmt::Block { statements, .. } => {
+                collect_scoped_captures(statements, scopes, functions, captured);
+            }
+        }
+    }
+}
+
+fn collect_expr_captured_locals(
+    expr: &Expr,
+    scopes: &mut NameScopes,
+    functions: &HashMap<String, FunctionId>,
+    captured: &mut HashSet<String>,
+) {
+    match expr {
+        Expr::Literal { .. } | Expr::Variable { .. } => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_captured_locals(lhs, scopes, functions, captured);
+            collect_expr_captured_locals(rhs, scopes, functions, captured);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_expr_captured_locals(arg, scopes, functions, captured);
+            }
+        }
+        Expr::Index { target, index, .. } => {
+            collect_expr_captured_locals(target, scopes, functions, captured);
+            collect_expr_captured_locals(index, scopes, functions, captured);
+        }
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                collect_expr_captured_locals(element, scopes, functions, captured);
+            }
+        }
+        Expr::Map { entries, .. } => {
+            for (key, value) in entries {
+                collect_expr_captured_locals(key, scopes, functions, captured);
+                collect_expr_captured_locals(value, scopes, functions, captured);
+            }
+        }
+        Expr::Function { params, body, .. } => {
+            for name in free_variables(body, params, functions) {
+                if scopes.contains(&name) {
+                    captured.insert(name);
+                }
+            }
+        }
+        Expr::Grouping { expr, .. } => {
+            collect_expr_captured_locals(expr, scopes, functions, captured);
         }
     }
 }
 
 fn collect_stmt_free_variables(
-    stmt: &Stmt,
-    locals: &HashSet<String>,
+    statements: &[Stmt],
+    scopes: &mut NameScopes,
     functions: &HashMap<String, FunctionId>,
     seen: &mut HashSet<String>,
     free: &mut Vec<String>,
 ) {
-    match stmt {
-        Stmt::Import { .. } | Stmt::Function { .. } => {}
-        Stmt::Let { initializer, .. } => {
-            collect_expr_free_variables(initializer, locals, functions, seen, free)
-        }
-        Stmt::Assign { name, value, .. } => {
-            if !locals.contains(name) && !functions.contains_key(name) && seen.insert(name.clone())
-            {
-                free.push(name.clone());
+    for stmt in statements {
+        match stmt {
+            Stmt::Import { .. } | Stmt::Function { .. } => {}
+            Stmt::Let {
+                name, initializer, ..
+            } => {
+                if matches!(initializer, Expr::Function { .. }) {
+                    scopes.declare(name.clone());
+                    collect_expr_free_variables(initializer, scopes, functions, seen, free);
+                } else {
+                    collect_expr_free_variables(initializer, scopes, functions, seen, free);
+                    scopes.declare(name.clone());
+                }
             }
-            collect_expr_free_variables(value, locals, functions, seen, free);
-        }
-        Stmt::IndexAssign {
-            target,
-            index,
-            value,
-            ..
-        } => {
-            collect_expr_free_variables(target, locals, functions, seen, free);
-            collect_expr_free_variables(index, locals, functions, seen, free);
-            collect_expr_free_variables(value, locals, functions, seen, free);
-        }
-        Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
-            collect_expr_free_variables(value, locals, functions, seen, free);
-        }
-        Stmt::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_expr_free_variables(condition, locals, functions, seen, free);
-            for stmt in then_branch {
-                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            Stmt::Assign { name, value, .. } => {
+                if !scopes.contains(name)
+                    && !functions.contains_key(name)
+                    && seen.insert(name.clone())
+                {
+                    free.push(name.clone());
+                }
+                collect_expr_free_variables(value, scopes, functions, seen, free);
             }
-            for stmt in else_branch {
-                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            Stmt::IndexAssign {
+                target,
+                index,
+                value,
+                ..
+            } => {
+                collect_expr_free_variables(target, scopes, functions, seen, free);
+                collect_expr_free_variables(index, scopes, functions, seen, free);
+                collect_expr_free_variables(value, scopes, functions, seen, free);
             }
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            collect_expr_free_variables(condition, locals, functions, seen, free);
-            for stmt in body {
-                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
+                collect_expr_free_variables(value, scopes, functions, seen, free);
             }
-        }
-        Stmt::Block { statements, .. } => {
-            for stmt in statements {
-                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_expr_free_variables(condition, scopes, functions, seen, free);
+                collect_scoped_free_variables(then_branch, scopes, functions, seen, free);
+                collect_scoped_free_variables(else_branch, scopes, functions, seen, free);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_expr_free_variables(condition, scopes, functions, seen, free);
+                collect_scoped_free_variables(body, scopes, functions, seen, free);
+            }
+            Stmt::Block { statements, .. } => {
+                collect_scoped_free_variables(statements, scopes, functions, seen, free);
             }
         }
     }
 }
 
+fn collect_scoped_free_variables(
+    statements: &[Stmt],
+    scopes: &mut NameScopes,
+    functions: &HashMap<String, FunctionId>,
+    seen: &mut HashSet<String>,
+    free: &mut Vec<String>,
+) {
+    scopes.push_scope();
+    collect_stmt_free_variables(statements, scopes, functions, seen, free);
+    scopes.pop_scope();
+}
+
 fn collect_expr_free_variables(
     expr: &Expr,
-    locals: &HashSet<String>,
+    scopes: &mut NameScopes,
     functions: &HashMap<String, FunctionId>,
     seen: &mut HashSet<String>,
     free: &mut Vec<String>,
@@ -1356,50 +1453,50 @@ fn collect_expr_free_variables(
     match expr {
         Expr::Literal { .. } => {}
         Expr::Variable { name, .. } => {
-            if !locals.contains(name) && !functions.contains_key(name) && seen.insert(name.clone())
+            if !scopes.contains(name) && !functions.contains_key(name) && seen.insert(name.clone())
             {
                 free.push(name.clone());
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            collect_expr_free_variables(lhs, locals, functions, seen, free);
-            collect_expr_free_variables(rhs, locals, functions, seen, free);
+            collect_expr_free_variables(lhs, scopes, functions, seen, free);
+            collect_expr_free_variables(rhs, scopes, functions, seen, free);
         }
         Expr::Call { callee, args, .. } => {
-            if !locals.contains(callee)
+            if !scopes.contains(callee)
                 && !functions.contains_key(callee)
                 && seen.insert(callee.clone())
             {
                 free.push(callee.clone());
             }
             for arg in args {
-                collect_expr_free_variables(arg, locals, functions, seen, free);
+                collect_expr_free_variables(arg, scopes, functions, seen, free);
             }
         }
         Expr::Index { target, index, .. } => {
-            collect_expr_free_variables(target, locals, functions, seen, free);
-            collect_expr_free_variables(index, locals, functions, seen, free);
+            collect_expr_free_variables(target, scopes, functions, seen, free);
+            collect_expr_free_variables(index, scopes, functions, seen, free);
         }
         Expr::Array { elements, .. } => {
             for element in elements {
-                collect_expr_free_variables(element, locals, functions, seen, free);
+                collect_expr_free_variables(element, scopes, functions, seen, free);
             }
         }
         Expr::Map { entries, .. } => {
             for (key, value) in entries {
-                collect_expr_free_variables(key, locals, functions, seen, free);
-                collect_expr_free_variables(value, locals, functions, seen, free);
+                collect_expr_free_variables(key, scopes, functions, seen, free);
+                collect_expr_free_variables(value, scopes, functions, seen, free);
             }
         }
         Expr::Function { params, body, .. } => {
             for name in free_variables(body, params, functions) {
-                if !locals.contains(&name) && seen.insert(name.clone()) {
+                if !scopes.contains(&name) && seen.insert(name.clone()) {
                     free.push(name);
                 }
             }
         }
         Expr::Grouping { expr, .. } => {
-            collect_expr_free_variables(expr, locals, functions, seen, free)
+            collect_expr_free_variables(expr, scopes, functions, seen, free)
         }
     }
 }
