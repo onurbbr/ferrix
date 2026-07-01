@@ -430,6 +430,7 @@ impl Parser {
                 name,
                 span: token.span,
             }),
+            TokenKind::Fn => self.function_literal(token.span),
             TokenKind::LeftParen => {
                 let expr = self.expression()?;
                 let right = self.consume(&TokenKind::RightParen, "`)`")?.span;
@@ -468,6 +469,40 @@ impl Parser {
         Ok(Expr::Array {
             elements,
             span: join(start, right),
+        })
+    }
+
+    fn function_literal(&mut self, start: SourceSpan) -> Result<Expr, CompileError> {
+        self.consume(&TokenKind::LeftParen, "`(`")?;
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                let param_token = self.advance().clone();
+                match param_token.kind {
+                    TokenKind::Identifier(param) => params.push(param),
+                    found => {
+                        return Err(self.error(
+                            CompileErrorKind::UnexpectedToken {
+                                expected: "parameter name".to_string(),
+                                found: found.describe(),
+                            },
+                            param_token.span,
+                        ));
+                    }
+                }
+
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(&TokenKind::RightParen, "`)`")?;
+        let (body, end) = self.block()?;
+
+        Ok(Expr::Function {
+            params,
+            body,
+            span: join(start, end),
         })
     }
 
@@ -576,6 +611,7 @@ fn target_description(expr: &Expr) -> &'static str {
         Expr::Variable { .. } => "variable",
         Expr::Binary { .. } => "binary expression",
         Expr::Call { .. } => "function call",
+        Expr::Function { .. } => "function literal",
         Expr::Index { .. } => "index expression",
         Expr::Array { .. } => "array literal",
         Expr::Map { .. } => "map literal",
