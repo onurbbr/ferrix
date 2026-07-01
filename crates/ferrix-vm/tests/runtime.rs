@@ -9,8 +9,8 @@ use ferrix_core::{
     diagnostics::{FileId, SourceManager, SourceSpan},
 };
 use ferrix_vm::{
-    DebugAction, DebugEvent, DebugOutcome, Debugger, RuntimeLimits, Vm, VmError, VmErrorKind,
-    VmStackFrame,
+    DebugAction, DebugEvent, DebugOutcome, Debugger, IncrementalGcPhase, RuntimeLimits, Vm,
+    VmError, VmErrorKind, VmStackFrame,
 };
 
 #[test]
@@ -20,6 +20,7 @@ fn vm_stores_runtime_limits() {
         max_call_depth: 2,
         max_heap_objects: 16,
         gc_allocation_threshold: 8,
+        gc_incremental_step_budget: 64,
     };
 
     let vm = Vm::with_limits(limits);
@@ -50,6 +51,7 @@ fn vm_allocation_respects_heap_limit() {
         max_call_depth: 2,
         max_heap_objects: 0,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     });
 
     let err = vm
@@ -211,6 +213,7 @@ fn allocation_runs_gc_before_heap_limit_error() {
         max_call_depth: 2,
         max_heap_objects: 1,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     });
     let old = vm.allocate_object(Obj::String("old".to_string())).unwrap();
 
@@ -232,6 +235,7 @@ fn allocation_threshold_runs_gc_before_heap_limit() {
         max_call_depth: 2,
         max_heap_objects: 10,
         gc_allocation_threshold: 2,
+        gc_incremental_step_budget: 64,
     });
     let first = vm
         .allocate_object(Obj::String("first".to_string()))
@@ -260,12 +264,65 @@ fn allocation_threshold_runs_gc_before_heap_limit() {
 }
 
 #[test]
+fn allocation_threshold_can_finish_incrementally_at_safepoints() {
+    let mut vm = Vm::with_limits(RuntimeLimits {
+        max_instruction_count: 32,
+        max_call_depth: 2,
+        max_heap_objects: 16,
+        gc_allocation_threshold: 3,
+        gc_incremental_step_budget: 1,
+    });
+    let first = vm
+        .allocate_object(Obj::String("first".to_string()))
+        .unwrap();
+    let second = vm
+        .allocate_object(Obj::String("second".to_string()))
+        .unwrap();
+    let third = vm
+        .allocate_object(Obj::String("third".to_string()))
+        .unwrap();
+
+    let allocated_during_gc = vm
+        .allocate_object(Obj::String("during".to_string()))
+        .unwrap();
+
+    assert_ne!(vm.incremental_gc_phase(), IncrementalGcPhase::Idle);
+    assert_eq!(vm.gc_stats().collections, 0);
+
+    let mut chunk = Chunk::new("safepoints", 1);
+    let value = chunk.add_constant(Value::Int(7)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: value,
+    });
+    for _ in 0..6 {
+        chunk.push_instruction(Instruction::Move {
+            dst: Register(0),
+            src: Register(0),
+        });
+    }
+    chunk.push_instruction(Instruction::Return { src: Register(0) });
+    let chunk = VerifiedChunk::new(chunk).unwrap();
+
+    assert_eq!(vm.run(&chunk).unwrap(), Value::Int(7));
+
+    assert_eq!(vm.incremental_gc_phase(), IncrementalGcPhase::Idle);
+    assert_eq!(vm.gc_stats().collections, 1);
+    assert!(vm.gc_stats().incremental_steps > 1);
+    assert!(vm.heap_object(first).is_err());
+    assert!(vm.heap_object(second).is_err());
+    assert!(vm.heap_object(third).is_err());
+    assert!(vm.heap_object(allocated_during_gc).is_ok());
+}
+
+#[test]
 fn threshold_gc_preserves_register_roots_during_execution() {
     let mut vm = Vm::with_limits(RuntimeLimits {
         max_instruction_count: 10,
         max_call_depth: 2,
         max_heap_objects: 10,
         gc_allocation_threshold: 1,
+        gc_incremental_step_budget: 64,
     });
     let mut chunk = Chunk::new("main", 2);
     let kept = chunk.add_string("kept").unwrap();
@@ -329,6 +386,7 @@ fn chunk_constants_are_roots_during_execution_gc() {
         max_call_depth: 2,
         max_heap_objects: 2,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     });
     let kept = vm
         .allocate_object(Obj::String("constant".to_string()))
@@ -363,6 +421,7 @@ fn chunk_constants_are_roots_during_traced_execution_gc() {
         max_call_depth: 2,
         max_heap_objects: 2,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     });
     let kept = vm
         .allocate_object(Obj::String("constant".to_string()))
@@ -407,6 +466,7 @@ fn chunk_execution_enforces_instruction_budget() {
         max_call_depth: 16,
         max_heap_objects: 16,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     });
 
     let err = vm.run(&chunk).unwrap_err();
@@ -437,6 +497,7 @@ fn program_execution_enforces_instruction_budget() {
         max_call_depth: 16,
         max_heap_objects: 16,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     });
 
     let err = vm.run_program(&program).unwrap_err();
@@ -1315,6 +1376,7 @@ fn call_depth_limit_is_enforced() {
         max_call_depth: 4,
         max_heap_objects: 16,
         gc_allocation_threshold: 0,
+        gc_incremental_step_budget: 64,
     });
 
     let err = vm.run_program(&program).unwrap_err();
