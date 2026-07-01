@@ -191,6 +191,7 @@ fn program_verifier_rejects_native_metadata_mismatches() {
         name: "public".to_string(),
         arity: 1,
         register_count: 1,
+        capture_count: 0,
         kind: FunctionKind::Native {
             name: "internal".to_string(),
         },
