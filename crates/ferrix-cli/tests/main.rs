@@ -11,12 +11,42 @@ use ferrix_core::bytecode::{bytecode_features, inspect_container};
 
 #[test]
 fn help_prints_usage() {
-    let output = run(["--help"]);
+    let output = run(["help"]);
 
     assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).contains("ferrix help [command]"));
     assert!(stdout(&output).contains("ferrix run <file|package>"));
+    assert!(stdout(&output).contains("ferrix run --type bytecode <bytecode>"));
     assert!(stdout(&output).contains("ferrix check <file|package>"));
     assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn help_flag_points_to_help_command() {
+    let output = run(["--help"]);
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("use `ferrix help`"));
+    assert!(stderr(&output).contains("ferrix help [command]"));
+}
+
+#[test]
+fn topic_help_prints_command_usage() {
+    for (topic, expected) in [
+        ("run", "ferrix run <file|package>"),
+        ("check", "ferrix check <file|package>"),
+        ("logs", "ferrix logs"),
+        ("ps", "ferrix ps info <pid>"),
+        ("inspect", "ferrix inspect <bytecode>"),
+        ("explain", "ferrix explain <source|package>"),
+    ] {
+        let output = run(["help", topic]);
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout(&output).contains(expected));
+        assert!(stderr(&output).is_empty());
+    }
 }
 
 #[test]
@@ -53,7 +83,7 @@ fn cli_creates_local_ferrix_layout_next_to_binary() {
 }
 
 #[test]
-fn run_file_prints_non_nil_result() {
+fn run_file_defaults_to_normal_type_and_prints_non_nil_result() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
 
@@ -423,7 +453,12 @@ return 42;
     assert_eq!(stdout(&output), "hello\n42\n");
     assert!(stderr(&output).is_empty());
 
-    let ps = run(["--runtime-home", runtime_home.to_str().unwrap(), "ps"]);
+    let ps = run([
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "ps",
+        "list",
+    ]);
     assert_eq!(ps.status.code(), Some(0));
     assert!(stdout(&ps).contains("pid\tsession\tstatus\tkind\tpath"));
     assert!(!stdout(&ps).contains("completed\trun"));
@@ -439,6 +474,7 @@ return 42;
     let info = run([
         "--runtime-home",
         runtime_home.to_str().unwrap(),
+        "ps",
         "info",
         "1",
     ]);
@@ -546,7 +582,7 @@ fn compile_and_run_bytecode_file() {
     assert!(stdout(&compile).is_empty());
     assert!(stderr(&compile).is_empty());
 
-    let output = run(["run-bytecode", bytecode.to_str().unwrap()]);
+    let output = run(["run", "--type", "bytecode", bytecode.to_str().unwrap()]);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "42\n");
@@ -580,10 +616,20 @@ fn logs_lists_recorded_cli_file_operations_by_kind() {
     let run_bytecode = run([
         "--runtime-home",
         runtime_home.to_str().unwrap(),
-        "run-bytecode",
+        "run",
+        "--type",
+        "bytecode",
         bytecode.to_str().unwrap(),
     ]);
     assert_eq!(run_bytecode.status.code(), Some(0));
+
+    let legacy_run_bytecode = run([
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "run-bytecode",
+        bytecode.to_str().unwrap(),
+    ]);
+    assert_eq!(legacy_run_bytecode.status.code(), Some(0));
 
     let debug = run_with_input(
         [
@@ -611,7 +657,8 @@ fn logs_lists_recorded_cli_file_operations_by_kind() {
     assert!(logs.contains("1\tcheck\tcompleted\t0\t"));
     assert!(logs.contains("2\tcompile\tcompleted\t0\t"));
     assert!(logs.contains("3\trun-bytecode\tcompleted\t0\t"));
-    assert!(logs.contains("4\tdebug\tcompleted\t0\t"));
+    assert!(logs.contains("4\trun-bytecode\tcompleted\t0\t"));
+    assert!(logs.contains("5\tdebug\tcompleted\t0\t"));
     assert!(logs.contains(file.to_str().unwrap()));
     assert!(logs.contains(bytecode.to_str().unwrap()));
 
@@ -631,7 +678,7 @@ fn logs_with_pid_points_to_info_command() {
     assert_eq!(output.status.code(), Some(64));
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("logs does not accept a process id"));
-    assert!(stderr(&output).contains("ferrix info <pid>"));
+    assert!(stderr(&output).contains("ferrix ps info <pid>"));
 }
 
 #[test]
@@ -1003,7 +1050,7 @@ module_roots = [\"src\"]
     assert!(stdout(&compile).is_empty());
     assert!(stderr(&compile).is_empty());
 
-    let output = run(["run-bytecode", bytecode.to_str().unwrap()]);
+    let output = run(["run", "--type=bytecode", bytecode.to_str().unwrap()]);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "42\n");
