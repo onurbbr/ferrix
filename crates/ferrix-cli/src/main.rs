@@ -15,13 +15,13 @@ use std::{
 };
 
 use ferrix_compiler::{
-    CompileError, ImportedModuleAst,
+    CompileError, CompileOutput, ImportedModuleAst,
     ast::{ProgramAst, Stmt},
-    compile_program_ast_with_named_modules, parse_source_with_file_id,
+    compile_program_ast_with_named_modules_report, parse_source_with_file_id,
 };
 use ferrix_core::{
     Obj, Value,
-    bytecode::{FunctionId, VerifiedProgram, encode_program, format_instruction},
+    bytecode::{BytecodeContainerMetadata, FunctionId, encode_container, format_instruction},
     diagnostics::{SourceLocation, SourceManager},
 };
 use ferrix_runtime::{
@@ -38,7 +38,7 @@ Usage:
   ferrix [--runtime-mode <mode>] [--runtime-home <dir>] <command>
   ferrix run <file|package> [--stats] [--audit]
   ferrix check <file|package>
-  ferrix compile <file|package> <output>
+  ferrix compile <file|package> <output> [--explain-optimizations]
   ferrix run-bytecode <file> [--stats] [--audit]
   ferrix debug <file|package>
   ferrix runtime start|stop|status|restart
@@ -101,8 +101,19 @@ fn run_cli(
             run_file(path, &config, options, stdout, stderr)
         }
         [command, path] if command == "check" => check_file(path, &config, &mut read_file, stderr),
-        [command, path, output] if command == "compile" => {
-            compile_bytecode(path, output, &config, &mut read_file, stderr)
+        [command, path, output, options @ ..] if command == "compile" => {
+            let Some(options) = parse_compile_display_options(options, stderr) else {
+                return 64;
+            };
+            compile_bytecode(
+                path,
+                output,
+                &config,
+                options,
+                &mut read_file,
+                stdout,
+                stderr,
+            )
         }
         [command, path, options @ ..] if command == "run-bytecode" => {
             let Some(options) = parse_run_display_options(options, stderr) else {
@@ -204,6 +215,11 @@ struct RunDisplayOptions {
     audit: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CompileDisplayOptions {
+    explain_optimizations: bool,
+}
+
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
@@ -273,6 +289,24 @@ fn parse_run_display_options(
             "--audit" => options.audit = true,
             _ => {
                 writeln!(stderr, "error: unknown run option `{arg}`").expect("stderr write failed");
+                return None;
+            }
+        }
+    }
+    Some(options)
+}
+
+fn parse_compile_display_options(
+    args: &[String],
+    stderr: &mut impl io::Write,
+) -> Option<CompileDisplayOptions> {
+    let mut options = CompileDisplayOptions::default();
+    for arg in args {
+        match arg.as_str() {
+            "--explain-optimizations" => options.explain_optimizations = true,
+            _ => {
+                writeln!(stderr, "error: unknown compile option `{arg}`")
+                    .expect("stderr write failed");
                 return None;
             }
         }
@@ -767,12 +801,14 @@ fn compile_bytecode(
     path: &str,
     output: &str,
     config: &CliConfig,
+    options: CompileDisplayOptions,
     read_file: &mut impl FnMut(&str) -> io::Result<String>,
+    stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> i32 {
     // Source compilation and bytecode encoding are separated so diagnostics
     // still point at the original source file before serialization happens.
-    let (_, program) = match compile_file(path, read_file, stderr) {
+    let (_, compiled) = match compile_file(path, read_file, stderr) {
         Ok(compiled) => compiled,
         Err(code) => {
             record_cli_history(
@@ -786,7 +822,11 @@ fn compile_bytecode(
             return code;
         }
     };
-    let bytes = match encode_program(program.as_program()) {
+    let mut metadata = BytecodeContainerMetadata::for_program(compiled.program.as_program());
+    metadata.feature_flags |= compiled.report.analysis.required_feature_flags;
+    metadata.required_capabilities = compiled.report.analysis.required_capabilities.clone();
+    metadata.optimization_level = u8::from(compiled.report.optimization.changed());
+    let bytes = match encode_container(compiled.program.as_program(), Some(metadata)) {
         Ok(bytes) => bytes,
         Err(error) => {
             writeln!(stderr, "error: could not encode bytecode: {error}")
@@ -815,8 +855,80 @@ fn compile_bytecode(
         );
         return 66;
     }
+    if options.explain_optimizations {
+        write_compile_report(stdout, &compiled.report);
+    }
     record_cli_history(config, RuntimeProcessKind::Compile, path, 0, output, None);
     0
+}
+
+fn write_compile_report(stdout: &mut impl io::Write, report: &ferrix_compiler::CompileReport) {
+    writeln!(
+        stdout,
+        "features: {}",
+        comma_or_none(&report.analysis.required_features)
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "capabilities: {}",
+        comma_or_none(&report.analysis.required_capabilities)
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "modules: {}",
+        comma_or_none(&report.analysis.module_dependencies)
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "natives: {}",
+        comma_or_none(&report.analysis.native_dependencies)
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "bytecode: functions={} instructions={}",
+        report.analysis.bytecode_function_count, report.analysis.bytecode_instruction_count
+    )
+    .expect("stdout write failed");
+    writeln!(
+        stdout,
+        "optimizer: chunks={} passes={} transformations={} changed={}",
+        report.optimization.chunks.len(),
+        report.optimization.total_passes(),
+        report.optimization.total_transformations(),
+        report.optimization.changed()
+    )
+    .expect("stdout write failed");
+    for chunk in &report.optimization.chunks {
+        writeln!(
+            stdout,
+            "  chunk {}: before={} after={} transformations={}",
+            chunk.chunk_name,
+            chunk.instructions_before,
+            chunk.instructions_after,
+            chunk.total_transformations()
+        )
+        .expect("stdout write failed");
+        for pass in &chunk.passes {
+            writeln!(
+                stdout,
+                "    {}: changed={} inspected={} transformations={}",
+                pass.name, pass.changed, pass.instructions_inspected, pass.transformations_applied
+            )
+            .expect("stdout write failed");
+        }
+    }
+}
+
+fn comma_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "<none>".to_string()
+    } else {
+        values.join(",")
+    }
 }
 
 fn run_bytecode(
@@ -1029,7 +1141,7 @@ fn compile_file(
     path: &str,
     read_file: &mut impl FnMut(&str) -> io::Result<String>,
     stderr: &mut impl io::Write,
-) -> Result<(SourceManager, VerifiedProgram), i32> {
+) -> Result<(SourceManager, CompileOutput), i32> {
     // Load the import graph into one source manager so parse/codegen/runtime
     // diagnostics can all render against the same file table.
     let input = match resolve_compile_input(Path::new(path)) {
@@ -1134,7 +1246,7 @@ fn compile_file(
         }
     };
 
-    let program = match compile_program_ast_with_named_modules(graph.entry, graph.modules) {
+    let compiled = match compile_program_ast_with_named_modules_report(graph.entry, graph.modules) {
         Ok(program) => program,
         Err(error) => {
             write!(
@@ -1147,7 +1259,7 @@ fn compile_file(
         }
     };
 
-    Ok((sources, program))
+    Ok((sources, compiled))
 }
 
 struct CompileInput {
