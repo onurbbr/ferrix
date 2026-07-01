@@ -3,8 +3,8 @@
 use ferrix_core::{
     Value,
     bytecode::{
-        BytecodeDecodeError, CaptureId, Chunk, Function, FunctionId, Instruction, Program,
-        Register, VerifiedProgram, decode_program, encode_program,
+        BytecodeDecodeError, CaptureId, Chunk, Function, FunctionId, Instruction, JumpTarget,
+        Program, Register, VerifiedProgram, decode_program, encode_program,
     },
 };
 
@@ -102,6 +102,32 @@ fn bytecode_program_roundtrips_closure_instructions() {
 
     let mut program = Program::new(FunctionId(1));
     program.add_function(Function::bytecode(closure)).unwrap();
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let bytes = encode_program(program.as_program()).unwrap();
+    let decoded = decode_program(&bytes).unwrap();
+
+    assert_eq!(decoded.as_program(), program.as_program());
+}
+
+#[test]
+fn bytecode_program_roundtrips_error_handling_instructions() {
+    let mut main = Chunk::new("main", 2);
+    let value = main.add_constant(Value::Int(42)).unwrap();
+    main.push_instruction(Instruction::PushHandler {
+        error: Register(1),
+        target: JumpTarget(4),
+    });
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: value,
+    });
+    main.push_instruction(Instruction::Throw { src: Register(0) });
+    main.push_instruction(Instruction::PopHandler);
+    main.push_instruction(Instruction::Return { src: Register(1) });
+
+    let mut program = Program::new(FunctionId(0));
     program.add_function(Function::bytecode(main)).unwrap();
     let program = VerifiedProgram::new(program).unwrap();
 
