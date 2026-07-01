@@ -2,7 +2,10 @@
 
 use ferrix_core::{
     Value,
-    bytecode::{Chunk, Instruction, JumpTarget, Register, StructuralVerifier, optimize_chunk},
+    bytecode::{
+        Chunk, Instruction, JumpTarget, Register, StructuralVerifier, optimize_chunk,
+        optimize_chunk_with_report,
+    },
 };
 
 #[test]
@@ -39,6 +42,43 @@ fn folds_constant_integer_arithmetic() {
     };
     assert_eq!(optimized.constants[usize::from(constant.0)], Value::Int(42));
     StructuralVerifier::verify(optimized).unwrap();
+}
+
+#[test]
+fn optimization_report_records_pass_metrics() {
+    let mut chunk = Chunk::new("report", 3);
+    let forty = chunk.add_constant(Value::Int(40)).unwrap();
+    let two = chunk.add_constant(Value::Int(2)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: forty,
+    });
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(1),
+        constant: two,
+    });
+    chunk.push_instruction(Instruction::Add {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+
+    let optimized = optimize_chunk_with_report(chunk);
+
+    assert_eq!(optimized.report.chunk_name, "report");
+    assert_eq!(optimized.report.instructions_before, 4);
+    assert_eq!(optimized.report.instructions_after, 4);
+    assert_eq!(optimized.report.passes.len(), 6);
+    assert!(optimized.report.total_transformations() >= 1);
+    assert!(
+        optimized
+            .report
+            .passes
+            .iter()
+            .any(|pass| pass.name == "constant-folding" && pass.changed)
+    );
+    StructuralVerifier::verify(optimized.chunk).unwrap();
 }
 
 #[test]
