@@ -119,6 +119,30 @@ fn builder_supports_string_pool_and_load_string() {
 }
 
 #[test]
+fn builder_supports_record_and_field_opcodes() {
+    let chunk = Assembler::new("records")
+        .registers(4)
+        .string("answer")
+        .int(42)
+        .load_const(0, 0)
+        .record_new(1, 0, vec![0])
+        .field_get(2, 1, 0)
+        .field_set(1, 0, 2)
+        .ret(2)
+        .finish()
+        .unwrap();
+
+    assert!(matches!(
+        chunk.as_chunk().instructions[1],
+        Instruction::RecordNew { .. }
+    ));
+
+    let result = Vm::new().run(&chunk).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
 fn label_patching_builds_if_else_program() {
     let chunk = Assembler::new("if_else")
         .registers(2)
