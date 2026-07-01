@@ -86,6 +86,23 @@ fn print_formats_heap_maps() {
 }
 
 #[test]
+fn print_formats_heap_records() {
+    let output = SharedOutput::default();
+    let mut vm = Vm::new();
+    let record = vm
+        .allocate_object(Obj::Record(vec![("name".to_string(), Value::Int(42))]))
+        .unwrap();
+    let program = program_calling_native("print", Value::Obj(record));
+    vm.set_output_writer(output.clone());
+    install(&mut vm, program.as_program());
+
+    let result = vm.run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Nil);
+    assert_eq!(output.lines(), vec!["{name: 42}".to_string()]);
+}
+
+#[test]
 fn len_counts_heap_strings() {
     let mut vm = Vm::new();
     let string = vm
@@ -128,6 +145,20 @@ fn len_counts_heap_maps() {
 }
 
 #[test]
+fn len_counts_heap_records() {
+    let mut vm = Vm::new();
+    let record = vm
+        .allocate_object(Obj::Record(vec![("answer".to_string(), Value::Int(42))]))
+        .unwrap();
+    let program = program_calling_native("len", Value::Obj(record));
+    install(&mut vm, program.as_program());
+
+    let result = vm.run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(1));
+}
+
+#[test]
 fn len_reports_type_errors() {
     let program = program_calling_native("len", Value::Int(42));
     let mut vm = Vm::new();
@@ -139,7 +170,7 @@ fn len_reports_type_errors() {
     assert_eq!(
         err.kind,
         VmErrorKind::TypeError {
-            expected: "string, array, or map",
+            expected: "string, array, map, or record",
             found: Value::Int(42),
         }
     );
@@ -157,6 +188,22 @@ fn type_of_returns_heap_string() {
     assert_eq!(
         vm.heap_object(reference).unwrap(),
         &Obj::String("bool".to_string())
+    );
+}
+
+#[test]
+fn type_of_reports_records() {
+    let mut vm = Vm::new();
+    let record = vm.allocate_object(Obj::Record(Vec::new())).unwrap();
+    let program = program_calling_native("type_of", Value::Obj(record));
+    install(&mut vm, program.as_program());
+
+    let result = vm.run_program(&program).unwrap();
+    let reference = result.as_obj_ref().unwrap();
+
+    assert_eq!(
+        vm.heap_object(reference).unwrap(),
+        &Obj::String("record".to_string())
     );
 }
 
