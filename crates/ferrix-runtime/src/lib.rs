@@ -5,15 +5,27 @@
 //! runs the program, and returns structured request results for tools such as
 //! `ferrix-cli`.
 
+pub mod daemon;
+pub mod event;
 pub mod mode;
 pub mod output;
+pub mod process;
 pub mod profile;
 pub mod request;
 pub mod result;
 pub mod service;
 
+pub use daemon::{
+    RuntimeCheckpoint, RuntimeDaemon, RuntimeHealth, RuntimeStateStore, RuntimeStatusReport,
+    default_runtime_home,
+};
+pub use event::{RuntimeEvent, RuntimeEventBus, RuntimeEventKind};
 pub use mode::{RuntimeGateway, RuntimeMode, RuntimeModeParseError};
-pub use profile::RuntimeProfile;
+pub use process::{
+    RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord, RuntimeProcessStatus,
+    RuntimeProcessTable, RuntimeSessionId,
+};
+pub use profile::{RuntimeProfile, RuntimeProfileParseError};
 pub use request::{
     CompileRequest, DebugRequest, InspectBytecodeRequest, OutputMode, RunBytecodeRequest,
     RunSourceRequest,
