@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::RuntimeProfile;
+use crate::{RuntimeProcessKind, RuntimeProfile};
 
 /// How VM/native output should be handled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,6 +84,46 @@ pub struct CompileRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InspectBytecodeRequest {
     pub path: PathBuf,
+}
+
+/// Request to append one CLI command to runtime-owned history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordProcessRequest {
+    /// CLI command kind.
+    pub kind: RuntimeProcessKind,
+    /// File/package/bytecode path associated with the command.
+    pub path: PathBuf,
+    /// Process-style exit code.
+    pub exit_code: i32,
+    /// Captured output snapshot, if any.
+    pub output: String,
+    /// Last rendered error, if the command failed.
+    pub last_error: Option<String>,
+}
+
+impl RecordProcessRequest {
+    /// Creates a history record request.
+    pub fn new(kind: RuntimeProcessKind, path: impl Into<PathBuf>, exit_code: i32) -> Self {
+        Self {
+            kind,
+            path: path.into(),
+            exit_code,
+            output: String::new(),
+            last_error: None,
+        }
+    }
+
+    /// Adds an output snapshot.
+    pub fn with_output(mut self, output: impl Into<String>) -> Self {
+        self.output = output.into();
+        self
+    }
+
+    /// Adds a rendered error snapshot.
+    pub fn with_last_error(mut self, error: impl Into<String>) -> Self {
+        self.last_error = Some(error.into());
+        self
+    }
 }
 
 /// Request to run a program under a debugger.
