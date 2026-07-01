@@ -3,7 +3,7 @@
 use ferrix_core::{
     Value,
     bytecode::{
-        BytecodeFormat, Chunk, ConstId, Function, FunctionId, FunctionKind, Instruction,
+        BytecodeFormat, CaptureId, Chunk, ConstId, Function, FunctionId, FunctionKind, Instruction,
         JumpTarget, Program, Register, StringId, StructuralVerifier, VerificationErrorKind,
         VerifiedProgram,
     },
@@ -183,6 +183,105 @@ fn verifies_program_with_direct_call() {
 }
 
 #[test]
+fn verifies_program_with_closure_call() {
+    let mut add_capture = Chunk::new("closure#0", 3)
+        .with_arity(1)
+        .with_capture_count(1);
+    add_capture.push_instruction(Instruction::LoadCapture {
+        dst: Register(1),
+        capture: CaptureId(0),
+    });
+    add_capture.push_instruction(Instruction::Add {
+        dst: Register(2),
+        lhs: Register(1),
+        rhs: Register(0),
+    });
+    add_capture.push_instruction(Instruction::Return { src: Register(2) });
+
+    let mut main = Chunk::new("main", 4);
+    let forty = main.add_constant(Value::Int(40)).unwrap();
+    let two = main.add_constant(Value::Int(2)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: forty,
+    });
+    main.push_instruction(Instruction::MakeClosure {
+        dst: Register(1),
+        function: FunctionId(0),
+        captures_start: Register(0),
+        capture_count: 1,
+    });
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(2),
+        constant: two,
+    });
+    main.push_instruction(Instruction::CallValue {
+        dst: Register(3),
+        callee: Register(1),
+        args_start: Register(2),
+        arg_count: 1,
+    });
+    main.push_instruction(Instruction::Return { src: Register(3) });
+
+    let mut program = Program::new(FunctionId(1));
+    program
+        .add_function(Function::bytecode(add_capture))
+        .unwrap();
+    program.add_function(Function::bytecode(main)).unwrap();
+
+    let verified = VerifiedProgram::new(program).unwrap();
+
+    assert_eq!(verified.as_program().entry, FunctionId(1));
+}
+
+#[test]
+fn rejects_invalid_capture_operand() {
+    let mut chunk = Chunk::new("closure#0", 2)
+        .with_arity(1)
+        .with_capture_count(1);
+    chunk.push_instruction(Instruction::LoadCapture {
+        dst: Register(1),
+        capture: CaptureId(1),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(1) });
+
+    let err = StructuralVerifier::verify(chunk).unwrap_err();
+
+    assert_eq!(err.instruction_ip, Some(0));
+    assert_eq!(
+        err.kind,
+        VerificationErrorKind::InvalidCapture {
+            capture: CaptureId(1),
+            capture_count: 1,
+        }
+    );
+}
+
+#[test]
+fn rejects_closure_captures_that_exceed_register_file() {
+    let mut chunk = Chunk::new("main", 2);
+    chunk.push_instruction(Instruction::MakeClosure {
+        dst: Register(0),
+        function: FunctionId(0),
+        captures_start: Register(1),
+        capture_count: 2,
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(0) });
+
+    let err = StructuralVerifier::verify(chunk).unwrap_err();
+
+    assert_eq!(err.instruction_ip, Some(0));
+    assert_eq!(
+        err.kind,
+        VerificationErrorKind::ClosureCapturesOutOfRange {
+            captures_start: Register(1),
+            capture_count: 2,
+            register_count: 2,
+        }
+    );
+}
+
+#[test]
 fn rejects_unsupported_bytecode_format() {
     let mut chunk = Chunk::new("main", 1);
     chunk.push_instruction(Instruction::Return { src: Register(0) });
@@ -212,6 +311,7 @@ fn rejects_function_chunk_metadata_mismatch() {
         name: "renamed".to_string(),
         arity: 0,
         register_count: 1,
+        capture_count: 0,
         kind: FunctionKind::Bytecode(chunk),
     };
     let mut program = Program::new(FunctionId(0));
@@ -232,6 +332,7 @@ fn rejects_native_function_metadata_mismatch() {
         name: "display_name".to_string(),
         arity: 1,
         register_count: 1,
+        capture_count: 0,
         kind: FunctionKind::Native {
             name: "native_name".to_string(),
         },
@@ -254,6 +355,7 @@ fn rejects_native_register_count_that_does_not_match_arity() {
         name: "clock".to_string(),
         arity: 0,
         register_count: 1,
+        capture_count: 0,
         kind: FunctionKind::Native {
             name: "clock".to_string(),
         },
