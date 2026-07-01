@@ -3,8 +3,10 @@
 use ferrix_core::{
     Value,
     bytecode::{
-        BytecodeDecodeError, CaptureId, Chunk, Function, FunctionId, Instruction, JumpTarget,
-        Program, Register, VerifiedProgram, decode_program, encode_program,
+        BytecodeContainerMetadata, BytecodeDecodeError, BytecodeSectionKind, CaptureId, Chunk,
+        FEATURE_CUSTOM_EXTENSIONS, FEATURE_NATIVE_CALLS, Function, FunctionId, Instruction,
+        JumpTarget, Program, Register, VerifiedProgram, decode_bytecode, decode_container,
+        decode_program, encode_container, encode_program, inspect_container,
     },
 };
 
@@ -37,6 +39,82 @@ fn bytecode_program_roundtrips_through_binary_format() {
     let decoded = decode_program(&bytes).unwrap();
 
     assert_eq!(decoded.as_program(), program.as_program());
+}
+
+#[test]
+fn bytecode_container_wraps_program_with_metadata_and_sections() {
+    let mut main = Chunk::new("main", 1);
+    main.push_instruction(Instruction::Return { src: Register(0) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+    let metadata = BytecodeContainerMetadata::for_program(program.as_program())
+        .with_module_name("demo")
+        .with_required_capability("native.call");
+
+    let bytes = encode_container(program.as_program(), Some(metadata)).unwrap();
+    let container = decode_container(&bytes).unwrap();
+    let inspected = inspect_container(&bytes).unwrap();
+
+    assert_eq!(container.program.as_program(), program.as_program());
+    assert_eq!(container.metadata.module_name.as_deref(), Some("demo"));
+    assert_eq!(container.metadata.required_capabilities, ["native.call"]);
+    assert_eq!(
+        container.sections[0].kind,
+        BytecodeSectionKind::ProgramPayload
+    );
+    assert_eq!(inspected.checksum, container.metadata.checksum);
+}
+
+#[test]
+fn bytecode_container_decodes_through_compat_loader() {
+    let mut main = Chunk::new("main", 1);
+    main.push_instruction(Instruction::Return { src: Register(0) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let bytes = encode_container(program.as_program(), None).unwrap();
+    let decoded = decode_bytecode(&bytes).unwrap();
+
+    assert_eq!(decoded.as_program(), program.as_program());
+}
+
+#[test]
+fn bytecode_container_rejects_checksum_mismatch() {
+    let mut main = Chunk::new("main", 1);
+    main.push_instruction(Instruction::Return { src: Register(0) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let mut bytes = encode_container(program.as_program(), None).unwrap();
+    let last = bytes.last_mut().unwrap();
+    *last ^= 0x01;
+
+    assert!(matches!(
+        decode_container(&bytes).unwrap_err(),
+        BytecodeDecodeError::ChecksumMismatch { .. }
+            | BytecodeDecodeError::InvalidBytecode(_)
+            | BytecodeDecodeError::InvalidInstructionOpcode { .. }
+    ));
+}
+
+#[test]
+fn bytecode_container_preserves_declared_feature_flags() {
+    let mut program = Program::new(FunctionId(0));
+    let mut main = Chunk::new("main", 1);
+    main.push_instruction(Instruction::Return { src: Register(0) });
+    program.add_function(Function::bytecode(main)).unwrap();
+    program.add_function(Function::native("clock", 0)).unwrap();
+    program.format.feature_flags = FEATURE_CUSTOM_EXTENSIONS;
+    let program = VerifiedProgram::new(program).unwrap();
+
+    let bytes = encode_container(program.as_program(), None).unwrap();
+    let metadata = inspect_container(&bytes).unwrap();
+
+    assert!(metadata.feature_flags & FEATURE_CUSTOM_EXTENSIONS != 0);
+    assert!(metadata.feature_flags & FEATURE_NATIVE_CALLS != 0);
 }
 
 #[test]
