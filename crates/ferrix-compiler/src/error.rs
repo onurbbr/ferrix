@@ -74,6 +74,9 @@ pub enum CompileErrorKind {
     TooManyMapEntries {
         max: usize,
     },
+    TooManyRecordFields {
+        max: usize,
+    },
     TooManyRegisters,
     TooManyInstructions,
     TooManyConstants {
@@ -157,6 +160,9 @@ impl fmt::Display for CompileError {
             }
             CompileErrorKind::TooManyMapEntries { max } => {
                 write!(f, "too many map entries; maximum is {max}")
+            }
+            CompileErrorKind::TooManyRecordFields { max } => {
+                write!(f, "too many record fields; maximum is {max}")
             }
             CompileErrorKind::TooManyRegisters => f.write_str("too many registers in function"),
             CompileErrorKind::TooManyInstructions => {
