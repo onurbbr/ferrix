@@ -1,0 +1,11 @@
+[package]
+name = "ferrix-assembler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrix-core.workspace = true
+
+[dev-dependencies]
+ferrix-vm.workspace = true
