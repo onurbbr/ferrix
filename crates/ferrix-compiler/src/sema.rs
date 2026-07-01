@@ -4,29 +4,66 @@
 //! are resolved through lexical scopes so block-local bindings can shadow outer
 //! names without leaking after the block exits.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ProgramAst, Stmt},
+    ast::{BinaryOp, Expr, Literal, ProgramAst, Stmt},
     error::{CompileError, CompileErrorKind},
 };
 
 const BUILTIN_FUNCTIONS: &[(&str, usize)] = &[("print", 1), ("len", 1), ("type_of", 1)];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceType {
+    Unknown,
+    Nil,
+    Bool,
+    Int,
+    String,
+    Array,
+    Map,
+    Function,
+}
+
+impl SourceType {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Nil => "nil",
+            Self::Bool => "bool",
+            Self::Int => "int",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Map => "map",
+            Self::Function => "function",
+        }
+    }
+
+    fn is_known(self) -> bool {
+        !matches!(self, Self::Unknown | Self::Nil)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FunctionSignature {
+    arity: usize,
+    return_type: SourceType,
+}
+
 #[derive(Clone, Debug)]
 struct ScopeStack {
-    scopes: Vec<HashSet<String>>,
+    scopes: Vec<HashMap<String, SourceType>>,
 }
 
 impl ScopeStack {
     fn new() -> Self {
         Self {
-            scopes: vec![HashSet::new()],
+            scopes: vec![HashMap::new()],
         }
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashSet::new());
+        self.scopes.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
@@ -36,21 +73,39 @@ impl ScopeStack {
     }
 
     fn contains(&self, name: &str) -> bool {
-        self.scopes.iter().rev().any(|scope| scope.contains(name))
+        self.resolve(name).is_some()
     }
 
     fn contains_current(&self, name: &str) -> bool {
         self.scopes
             .last()
             .expect("semantic analyzer always has a current scope")
-            .contains(name)
+            .contains_key(name)
     }
 
-    fn declare(&mut self, name: String) {
+    fn declare(&mut self, name: String, source_type: SourceType) {
         self.scopes
             .last_mut()
             .expect("semantic analyzer always has a current scope")
-            .insert(name);
+            .insert(name, source_type);
+    }
+
+    fn assign(&mut self, name: &str, source_type: SourceType) {
+        if let Some((_, existing_type)) = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.get_mut(name).map(|source_type| ((), source_type)))
+        {
+            *existing_type = merge_assignment_type(*existing_type, source_type);
+        }
+    }
+
+    fn resolve(&self, name: &str) -> Option<SourceType> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
     }
 }
 
@@ -90,17 +145,33 @@ pub fn analyze_with_function_aliases(
 fn collect_functions(
     program: &ProgramAst,
     aliases: &[(String, String)],
-) -> Result<HashMap<String, usize>, CompileError> {
+) -> Result<HashMap<String, FunctionSignature>, CompileError> {
     let mut functions = BUILTIN_FUNCTIONS
         .iter()
-        .map(|(name, arity)| ((*name).to_string(), *arity))
+        .map(|(name, arity)| {
+            (
+                (*name).to_string(),
+                FunctionSignature {
+                    arity: *arity,
+                    return_type: builtin_return_type(name),
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
 
     for stmt in &program.statements {
         if let Stmt::Function {
             name, params, span, ..
         } = stmt
-            && functions.insert(name.clone(), params.len()).is_some()
+            && functions
+                .insert(
+                    name.clone(),
+                    FunctionSignature {
+                        arity: params.len(),
+                        return_type: SourceType::Unknown,
+                    },
+                )
+                .is_some()
         {
             return Err(CompileError::new(
                 CompileErrorKind::DuplicateFunction { name: name.clone() },
@@ -110,18 +181,27 @@ fn collect_functions(
     }
 
     for (alias, target) in aliases {
-        if let Some(arity) = functions.get(target).copied() {
-            functions.entry(alias.clone()).or_insert(arity);
+        if let Some(signature) = functions.get(target).copied() {
+            functions.entry(alias.clone()).or_insert(signature);
         }
     }
 
     Ok(functions)
 }
 
+fn builtin_return_type(name: &str) -> SourceType {
+    match name {
+        "len" => SourceType::Int,
+        "type_of" => SourceType::String,
+        "print" => SourceType::Nil,
+        _ => SourceType::Unknown,
+    }
+}
+
 fn check_scoped_statements(
     stmts: &[Stmt],
     scopes: &mut ScopeStack,
-    functions: &HashMap<String, usize>,
+    functions: &HashMap<String, FunctionSignature>,
 ) -> Result<(), CompileError> {
     scopes.push_scope();
     let result = check_statements(stmts, scopes, functions);
@@ -132,7 +212,7 @@ fn check_scoped_statements(
 fn check_statements(
     stmts: &[Stmt],
     scopes: &mut ScopeStack,
-    functions: &HashMap<String, usize>,
+    functions: &HashMap<String, FunctionSignature>,
 ) -> Result<(), CompileError> {
     for stmt in stmts {
         check_stmt(stmt, scopes, functions)?;
@@ -144,7 +224,7 @@ fn check_statements(
 fn check_stmt(
     stmt: &Stmt,
     scopes: &mut ScopeStack,
-    functions: &HashMap<String, usize>,
+    functions: &HashMap<String, FunctionSignature>,
 ) -> Result<(), CompileError> {
     match stmt {
         Stmt::Import { .. } | Stmt::Function { .. } => Ok(()),
@@ -158,7 +238,11 @@ fn check_stmt(
             if !scopes.contains(name) {
                 return Err(undefined_name_error(name, *span, NameUse::Variable));
             }
-            check_expr(value, scopes, functions)
+            let expected = scopes.resolve(name).unwrap_or(SourceType::Unknown);
+            let found = check_expr(value, scopes, functions)?;
+            expect_assignable(expected, found, value.span())?;
+            scopes.assign(name, found);
+            Ok(())
         }
         Stmt::IndexAssign {
             target,
@@ -166,12 +250,14 @@ fn check_stmt(
             value,
             ..
         } => {
-            check_expr(target, scopes, functions)?;
-            check_expr(index, scopes, functions)?;
-            check_expr(value, scopes, functions)
+            let target_type = check_expr(target, scopes, functions)?;
+            let index_type = check_expr(index, scopes, functions)?;
+            check_index_access(target_type, index_type, target.span(), index.span())?;
+            check_expr(value, scopes, functions)?;
+            Ok(())
         }
         Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
-            check_expr(value, scopes, functions)
+            check_expr(value, scopes, functions).map(|_| ())
         }
         Stmt::If {
             condition,
@@ -179,14 +265,16 @@ fn check_stmt(
             else_branch,
             ..
         } => {
-            check_expr(condition, scopes, functions)?;
+            let condition_type = check_expr(condition, scopes, functions)?;
+            expect_type(SourceType::Bool, condition_type, condition.span())?;
             check_scoped_statements(then_branch, scopes, functions)?;
             check_scoped_statements(else_branch, scopes, functions)
         }
         Stmt::While {
             condition, body, ..
         } => {
-            check_expr(condition, scopes, functions)?;
+            let condition_type = check_expr(condition, scopes, functions)?;
+            expect_type(SourceType::Bool, condition_type, condition.span())?;
             check_scoped_statements(body, scopes, functions)
         }
         Stmt::Block { statements, .. } => check_scoped_statements(statements, scopes, functions),
@@ -198,7 +286,7 @@ fn check_let(
     initializer: &Expr,
     span: ferrix_core::diagnostics::SourceSpan,
     scopes: &mut ScopeStack,
-    functions: &HashMap<String, usize>,
+    functions: &HashMap<String, FunctionSignature>,
 ) -> Result<(), CompileError> {
     if scopes.contains_current(name) {
         return Err(CompileError::new(
@@ -210,11 +298,11 @@ fn check_let(
     }
 
     if matches!(initializer, Expr::Function { .. }) {
-        scopes.declare(name.to_string());
-        check_expr(initializer, scopes, functions)
+        scopes.declare(name.to_string(), SourceType::Function);
+        check_expr(initializer, scopes, functions).map(|_| ())
     } else {
-        check_expr(initializer, scopes, functions)?;
-        scopes.declare(name.to_string());
+        let source_type = check_expr(initializer, scopes, functions)?;
+        scopes.declare(name.to_string(), source_type);
         Ok(())
     }
 }
@@ -242,7 +330,7 @@ fn declare_parameters(
                 Some(span),
             ));
         }
-        scopes.declare(param.clone());
+        scopes.declare(param.clone(), SourceType::Unknown);
     }
 
     Ok(())
@@ -251,20 +339,22 @@ fn declare_parameters(
 fn check_expr(
     expr: &Expr,
     scopes: &mut ScopeStack,
-    functions: &HashMap<String, usize>,
-) -> Result<(), CompileError> {
+    functions: &HashMap<String, FunctionSignature>,
+) -> Result<SourceType, CompileError> {
     match expr {
-        Expr::Literal { .. } => Ok(()),
-        Expr::Variable { name, span } => {
-            if scopes.contains(name) {
-                Ok(())
-            } else {
-                Err(undefined_name_error(name, *span, NameUse::Variable))
-            }
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            check_expr(lhs, scopes, functions)?;
-            check_expr(rhs, scopes, functions)
+        Expr::Literal { value, .. } => Ok(literal_type(value)),
+        Expr::Variable { name, span } => scopes
+            .resolve(name)
+            .ok_or_else(|| undefined_name_error(name, *span, NameUse::Variable)),
+        Expr::Binary {
+            op,
+            lhs,
+            rhs,
+            span: _,
+        } => {
+            let lhs_type = check_expr(lhs, scopes, functions)?;
+            let rhs_type = check_expr(rhs, scopes, functions)?;
+            check_binary(*op, lhs_type, rhs_type, lhs.span(), rhs.span())
         }
         Expr::Array { elements, .. } => {
             if elements.len() > u8::MAX as usize {
@@ -279,7 +369,7 @@ fn check_expr(
             for element in elements {
                 check_expr(element, scopes, functions)?;
             }
-            Ok(())
+            Ok(SourceType::Array)
         }
         Expr::Map { entries, .. } => {
             if entries.len() > u8::MAX as usize {
@@ -295,11 +385,13 @@ fn check_expr(
                 check_expr(key, scopes, functions)?;
                 check_expr(value, scopes, functions)?;
             }
-            Ok(())
+            Ok(SourceType::Map)
         }
         Expr::Index { target, index, .. } => {
-            check_expr(target, scopes, functions)?;
-            check_expr(index, scopes, functions)
+            let target_type = check_expr(target, scopes, functions)?;
+            let index_type = check_expr(index, scopes, functions)?;
+            check_index_access(target_type, index_type, target.span(), index.span())?;
+            Ok(SourceType::Unknown)
         }
         Expr::Call { callee, args, span } => {
             if args.len() > u8::MAX as usize {
@@ -311,41 +403,133 @@ fn check_expr(
                 ));
             }
 
-            if scopes.contains(callee) {
+            if let Some(callee_type) = scopes.resolve(callee) {
+                expect_type(SourceType::Function, callee_type, *span)?;
                 for arg in args {
                     check_expr(arg, scopes, functions)?;
                 }
-                return Ok(());
+                return Ok(SourceType::Unknown);
             }
 
-            if let Some(expected) = functions.get(callee).copied() {
-                if expected != args.len() {
-                    return Err(CompileError::new(
-                        CompileErrorKind::WrongCallArity {
-                            name: callee.clone(),
-                            expected,
-                            actual: args.len(),
-                        },
-                        Some(*span),
-                    ));
-                }
-            } else {
-                return Err(undefined_name_error(callee, *span, NameUse::Function));
+            let signature = functions
+                .get(callee)
+                .copied()
+                .ok_or_else(|| undefined_name_error(callee, *span, NameUse::Function))?;
+            if signature.arity != args.len() {
+                return Err(CompileError::new(
+                    CompileErrorKind::WrongCallArity {
+                        name: callee.clone(),
+                        expected: signature.arity,
+                        actual: args.len(),
+                    },
+                    Some(*span),
+                ));
             }
 
             for arg in args {
                 check_expr(arg, scopes, functions)?;
             }
-            Ok(())
+            Ok(signature.return_type)
         }
         Expr::Function { params, body, span } => {
             let mut function_scopes = scopes.clone();
             function_scopes.push_scope();
             declare_parameters(params, *span, &mut function_scopes)?;
-            check_scoped_statements(body, &mut function_scopes, functions)
+            check_scoped_statements(body, &mut function_scopes, functions)?;
+            Ok(SourceType::Function)
         }
         Expr::Grouping { expr, .. } => check_expr(expr, scopes, functions),
     }
+}
+
+fn literal_type(value: &Literal) -> SourceType {
+    match value {
+        Literal::Int(_) => SourceType::Int,
+        Literal::Bool(_) => SourceType::Bool,
+        Literal::String(_) => SourceType::String,
+        Literal::Nil => SourceType::Nil,
+    }
+}
+
+fn check_binary(
+    op: BinaryOp,
+    lhs_type: SourceType,
+    rhs_type: SourceType,
+    lhs_span: ferrix_core::diagnostics::SourceSpan,
+    rhs_span: ferrix_core::diagnostics::SourceSpan,
+) -> Result<SourceType, CompileError> {
+    match op {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            expect_type(SourceType::Int, lhs_type, lhs_span)?;
+            expect_type(SourceType::Int, rhs_type, rhs_span)?;
+            Ok(SourceType::Int)
+        }
+        BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+            expect_type(SourceType::Int, lhs_type, lhs_span)?;
+            expect_type(SourceType::Int, rhs_type, rhs_span)?;
+            Ok(SourceType::Bool)
+        }
+        BinaryOp::Equal | BinaryOp::NotEqual => Ok(SourceType::Bool),
+    }
+}
+
+fn check_index_access(
+    target_type: SourceType,
+    index_type: SourceType,
+    target_span: ferrix_core::diagnostics::SourceSpan,
+    index_span: ferrix_core::diagnostics::SourceSpan,
+) -> Result<(), CompileError> {
+    match target_type {
+        SourceType::Array => expect_type(SourceType::Int, index_type, index_span),
+        SourceType::Map | SourceType::Unknown | SourceType::Nil => Ok(()),
+        found => Err(type_error("array or map", found, target_span)),
+    }
+}
+
+fn expect_assignable(
+    expected: SourceType,
+    found: SourceType,
+    span: ferrix_core::diagnostics::SourceSpan,
+) -> Result<(), CompileError> {
+    if expected.is_known() && found.is_known() && expected != found {
+        Err(type_error(expected.name(), found, span))
+    } else {
+        Ok(())
+    }
+}
+
+fn expect_type(
+    expected: SourceType,
+    found: SourceType,
+    span: ferrix_core::diagnostics::SourceSpan,
+) -> Result<(), CompileError> {
+    if found.is_known() && found != expected {
+        Err(type_error(expected.name(), found, span))
+    } else {
+        Ok(())
+    }
+}
+
+fn merge_assignment_type(previous: SourceType, assigned: SourceType) -> SourceType {
+    if previous.is_known() && assigned == SourceType::Nil {
+        previous
+    } else {
+        assigned
+    }
+}
+
+fn type_error(
+    expected: impl Into<String>,
+    found: SourceType,
+    span: ferrix_core::diagnostics::SourceSpan,
+) -> CompileError {
+    CompileError::new(
+        CompileErrorKind::TypeMismatch {
+            expected: expected.into(),
+            found: found.name().to_string(),
+        },
+        Some(span),
+    )
 }
 
 enum NameUse {
