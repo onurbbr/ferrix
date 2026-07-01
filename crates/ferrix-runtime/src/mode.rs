@@ -8,8 +8,9 @@ use std::{error::Error, fmt, path::PathBuf, str::FromStr};
 
 use crate::{
     CompiledProgram, DebugRequest, RecordProcessRequest, RunBytecodeRequest, RunResult,
-    RunSourceRequest, RuntimeDaemon, RuntimeError, RuntimeErrorKind, RuntimeProcessId,
-    RuntimeProcessKind, RuntimeProcessRecord, RuntimeService,
+    RunSourceRequest, RuntimeConfig, RuntimeDaemon, RuntimeError, RuntimeErrorKind, RuntimeEvent,
+    RuntimeMetricsReport, RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord,
+    RuntimeService, RuntimeStatusReport,
 };
 
 /// Runtime service mode requested by a caller.
@@ -296,6 +297,42 @@ impl RuntimeGateway {
         match controller.connect()? {
             RuntimeConnection::Socket(daemon) => daemon.request_kill_process(process_id),
             RuntimeConnection::Local(mut daemon) => daemon.kill_process(process_id),
+        }
+    }
+
+    /// Returns runtime daemon status through the selected runtime layer.
+    pub fn status(&self) -> Result<RuntimeStatusReport, RuntimeError> {
+        let mut controller = self.controller();
+        match controller.connect()? {
+            RuntimeConnection::Socket(daemon) => daemon.request_status(),
+            RuntimeConnection::Local(mut daemon) => daemon.checked_status(),
+        }
+    }
+
+    /// Returns aggregate runtime metrics through the selected runtime layer.
+    pub fn metrics(&self) -> Result<RuntimeMetricsReport, RuntimeError> {
+        let mut controller = self.controller();
+        match controller.connect()? {
+            RuntimeConnection::Socket(daemon) => daemon.request_metrics(),
+            RuntimeConnection::Local(daemon) => daemon.metrics(),
+        }
+    }
+
+    /// Returns retained runtime events through the selected runtime layer.
+    pub fn events(&self) -> Result<Vec<RuntimeEvent>, RuntimeError> {
+        let mut controller = self.controller();
+        match controller.connect()? {
+            RuntimeConnection::Socket(daemon) => daemon.request_events(),
+            RuntimeConnection::Local(daemon) => Ok(daemon.events()),
+        }
+    }
+
+    /// Returns runtime config through the selected runtime layer.
+    pub fn config(&self) -> Result<RuntimeConfig, RuntimeError> {
+        let mut controller = self.controller();
+        match controller.connect()? {
+            RuntimeConnection::Socket(daemon) => daemon.request_config(),
+            RuntimeConnection::Local(daemon) => Ok(daemon.config().clone()),
         }
     }
 
