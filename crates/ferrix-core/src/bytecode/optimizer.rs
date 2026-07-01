@@ -268,6 +268,7 @@ fn fold_constant_instructions(chunk: &mut Chunk) -> usize {
                         | Instruction::RecordNew { .. }
                         | Instruction::FieldGet { .. }
                         | Instruction::FieldSet { .. }
+                        | Instruction::CallExtension { .. }
                         | Instruction::PushHandler { .. }
                         | Instruction::Throw { .. }
                         | Instruction::Return { .. }
@@ -432,6 +433,7 @@ fn written_registers(instruction: &Instruction) -> Vec<Register> {
         | Instruction::LoadCapture { dst, .. }
         | Instruction::LoadCaptureCell { dst, .. }
         | Instruction::CallValue { dst, .. }
+        | Instruction::CallExtension { dst, .. }
         | Instruction::ArrayNew { dst, .. }
         | Instruction::MapNew { dst, .. }
         | Instruction::RecordNew { dst, .. }
