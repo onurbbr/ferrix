@@ -28,6 +28,22 @@ return sum;
 ",
     },
     BenchCase {
+        name: "dispatch",
+        iterations: 10_000,
+        source: "\
+let i = 0;
+let value = 1;
+while (i < 250) {
+    value = value + i;
+    value = value - i;
+    value = value * 2;
+    value = value / 2;
+    i = i + 1;
+}
+return value;
+",
+    },
+    BenchCase {
         name: "calls",
         iterations: 10_000,
         source: "\
