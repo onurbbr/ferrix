@@ -44,6 +44,9 @@ pub enum CompileErrorKind {
         module: String,
         name: String,
     },
+    UndefinedMethod {
+        name: String,
+    },
     DuplicateVariable {
         name: String,
     },
@@ -131,6 +134,9 @@ impl fmt::Display for CompileError {
             }
             CompileErrorKind::UndefinedModuleExport { module, name } => {
                 write!(f, "undefined export `{name}` in module `{module}`")
+            }
+            CompileErrorKind::UndefinedMethod { name } => {
+                write!(f, "undefined method `{name}`")
             }
             CompileErrorKind::DuplicateVariable { name } => {
                 write!(f, "duplicate variable `{name}`")
