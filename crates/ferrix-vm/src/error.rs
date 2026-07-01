@@ -13,6 +13,8 @@ use ferrix_core::{
     diagnostics::{Diagnostic, SourceSpan},
 };
 
+use crate::HostCapability;
+
 /// Runtime failure raised while executing bytecode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmError {
@@ -82,6 +84,11 @@ pub enum VmErrorKind {
     TypeError {
         expected: &'static str,
         found: Value,
+    },
+    /// Host operation was denied by runtime capability policy.
+    CapabilityDenied {
+        capability: HostCapability,
+        operation: &'static str,
     },
     /// Integer division attempted with zero as divisor.
     DivisionByZero,
@@ -243,6 +250,14 @@ impl fmt::Display for VmError {
             VmErrorKind::TypeError { expected, found } => {
                 write!(f, "type error: expected {expected}, found {found:?}")
             }
+            VmErrorKind::CapabilityDenied {
+                capability,
+                operation,
+            } => write!(
+                f,
+                "capability denied: `{}` is required to {operation}",
+                capability.as_str()
+            ),
             VmErrorKind::DivisionByZero => f.write_str("division by zero"),
             VmErrorKind::ArithmeticOverflow { operation } => {
                 write!(f, "arithmetic overflow during {operation}")
