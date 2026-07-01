@@ -21,18 +21,20 @@ use ferrix_core::{
     },
     diagnostics::SourceManager,
 };
-use ferrix_vm::{Heap, HostCapability, Vm};
+use ferrix_vm::{Heap, HostCapability, Vm, VmError, VmErrorKind};
 
 use crate::{
     DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind,
-    RuntimePolicy, RuntimeStats, output::install_output,
+    RuntimeExtensionRegistry, RuntimePolicy, RuntimeStats, output::install_output,
 };
 
 const MANIFEST_FILES: &[&str] = &["Ferrix.toml", "ferrix.toml"];
 
 /// High-level runtime gateway used by CLI and future embeddings.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RuntimeService;
+#[derive(Clone, Default)]
+pub struct RuntimeService {
+    extensions: RuntimeExtensionRegistry,
+}
 
 /// Source manager and verified program produced by runtime compilation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,7 +50,12 @@ pub struct CompiledProgram {
 impl RuntimeService {
     /// Creates a runtime service with default behavior.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Creates a runtime service with a custom extension registry.
+    pub fn with_extensions(extensions: RuntimeExtensionRegistry) -> Self {
+        Self { extensions }
     }
 
     /// Compiles and runs a source file, package directory, or package manifest.
@@ -58,6 +65,7 @@ impl RuntimeService {
         let mut vm = vm_for_policy(&policy);
         let capture = install_output(&mut vm, request.output);
         install_stdlib_for_policy(&mut vm, compiled.program.as_program(), &policy)?;
+        self.install_extensions_for_policy(&mut vm, &policy);
         let collect_audit = request.collect_audit || request.profile.audit_enabled();
         let mut audit_events = audit_start_events(collect_audit, request.profile, &request.path);
 
@@ -114,6 +122,7 @@ impl RuntimeService {
         let mut vm = vm_for_policy(&policy);
         let capture = install_output(&mut vm, request.output);
         install_stdlib_for_policy(&mut vm, program.as_program(), &policy)?;
+        self.install_extensions_for_policy(&mut vm, &policy);
         let collect_audit = request.collect_audit || request.profile.audit_enabled();
         let mut audit_events = audit_start_events(collect_audit, request.profile, &request.path);
 
@@ -197,6 +206,42 @@ impl RuntimeService {
             }
         }
         Ok(crate::InspectResult { diagnostics })
+    }
+
+    fn install_extensions_for_policy(&self, vm: &mut Vm, policy: &RuntimePolicy) {
+        for metadata in self.extensions.metadata() {
+            let extension_id = metadata.id.clone();
+            let registry = self.extensions.clone();
+            let policy = policy.clone();
+            vm.register_extension_fn(extension_id.clone(), move |args| {
+                registry
+                    .call(&extension_id, args, &policy)
+                    .map(|result| result.value)
+                    .map_err(|error| extension_runtime_error_to_vm_error(&extension_id, error))
+            });
+        }
+    }
+}
+
+fn extension_runtime_error_to_vm_error(id: &str, error: RuntimeError) -> VmError {
+    match error.kind {
+        RuntimeErrorKind::MissingExtension { id } => {
+            VmError::new(None, VmErrorKind::MissingExtension { id })
+        }
+        RuntimeErrorKind::PolicyDenied { message } => VmError::new(
+            None,
+            VmErrorKind::ExtensionError {
+                id: id.to_string(),
+                message,
+            },
+        ),
+        other => VmError::new(
+            None,
+            VmErrorKind::ExtensionError {
+                id: id.to_string(),
+                message: RuntimeError::new(error.exit_code, other).render(),
+            },
+        ),
     }
 }
 
