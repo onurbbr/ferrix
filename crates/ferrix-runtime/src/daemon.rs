@@ -123,6 +123,37 @@ impl RuntimeStatusReport {
     }
 }
 
+/// Runtime inspection counters for `ferrix runtime metrics`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeMetricsReport {
+    /// Active runtime process records.
+    pub active_process_count: usize,
+    /// Completed runtime process records.
+    pub completed_process_count: usize,
+    /// Failed runtime process records.
+    pub failed_process_count: usize,
+    /// Total retained process records.
+    pub process_count: usize,
+    /// Retained runtime event count.
+    pub event_queue_len: usize,
+    /// Runtime events dropped because the event queue reached capacity.
+    pub dropped_event_count: u64,
+    /// Retained lightweight checkpoints.
+    pub checkpoint_count: usize,
+    /// Middleware requests retained in this daemon instance.
+    pub middleware_request_count: usize,
+    /// Total executed bytecode instructions across retained process records.
+    pub executed_instructions: usize,
+    /// Total successful heap allocations across retained process records.
+    pub allocations: u64,
+    /// Total GC collections across retained process records.
+    pub gc_collections: u64,
+    /// Total native calls across retained process records.
+    pub native_calls: u64,
+    /// Total measured runtime execution time.
+    pub execution_time_ms: u128,
+}
+
 /// Lightweight checkpoint metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCheckpoint {
@@ -359,6 +390,38 @@ impl RuntimeDaemon {
         })
     }
 
+    /// Returns aggregate runtime counters for inspection commands.
+    pub fn metrics(&self) -> Result<RuntimeMetricsReport, RuntimeError> {
+        let status = self.status()?;
+        let history = self.list_history()?;
+        let checkpoints = self.checkpoints()?;
+
+        Ok(RuntimeMetricsReport {
+            active_process_count: status.active_process_count,
+            completed_process_count: status.completed_process_count,
+            failed_process_count: status.failed_process_count,
+            process_count: status.process_count,
+            event_queue_len: status.event_queue_len,
+            dropped_event_count: status.dropped_event_count,
+            checkpoint_count: checkpoints.len(),
+            middleware_request_count: self.middleware.logs().len(),
+            executed_instructions: history
+                .iter()
+                .map(|record| record.stats.executed_instructions)
+                .sum(),
+            allocations: history.iter().map(|record| record.stats.allocations).sum(),
+            gc_collections: history
+                .iter()
+                .map(|record| record.stats.gc_collections)
+                .sum(),
+            native_calls: history.iter().map(|record| record.stats.native_calls).sum(),
+            execution_time_ms: history
+                .iter()
+                .map(|record| record.stats.execution_time_ms)
+                .sum(),
+        })
+    }
+
     /// Serves local Unix socket requests until a stop request is received.
     pub fn serve_forever(&mut self) -> Result<(), RuntimeError> {
         self.ensure_layout()?;
@@ -393,6 +456,26 @@ impl RuntimeDaemon {
     pub fn request_protocol_info(&self) -> Result<RuntimeProtocolInfo, RuntimeError> {
         let response = self.request("HELLO")?;
         decode_protocol_response(&response)
+    }
+
+    /// Reads daemon status through the socket protocol.
+    pub fn request_status(&self) -> Result<RuntimeStatusReport, RuntimeError> {
+        decode_status_response(&self.request("STATUS")?)
+    }
+
+    /// Reads daemon metrics through the socket protocol.
+    pub fn request_metrics(&self) -> Result<RuntimeMetricsReport, RuntimeError> {
+        decode_metrics_response(&self.request("METRICS")?)
+    }
+
+    /// Reads daemon retained events through the socket protocol.
+    pub fn request_events(&self) -> Result<Vec<crate::RuntimeEvent>, RuntimeError> {
+        decode_events_response(&self.request("EVENTS")?)
+    }
+
+    /// Reads daemon config through the socket protocol.
+    pub fn request_config(&self) -> Result<RuntimeConfig, RuntimeError> {
+        decode_config_response(&self.request("CONFIG")?)
     }
 
     /// Fails when the daemon protocol cannot be spoken by this CLI/runtime crate.
@@ -753,6 +836,10 @@ impl RuntimeDaemon {
         let response = match command {
             "HELLO" => format!("OK\tHELLO\t{}", RuntimeProtocolInfo::current().encode()),
             "PING" => "OK\tPONG".to_string(),
+            "STATUS" => encode_status_response(self.status()),
+            "METRICS" => encode_metrics_response(self.metrics()),
+            "EVENTS" => encode_events_response(self.events()),
+            "CONFIG" => encode_config_response(Ok(self.config.clone())),
             "STOP" => {
                 should_stop = true;
                 "OK\tSTOPPED".to_string()
@@ -1424,6 +1511,327 @@ fn parse_audit_events(source: &str) -> Vec<String> {
         .collect()
 }
 
+fn format_status_report(status: &RuntimeStatusReport) -> String {
+    format_key_values(&[
+        ("health", status.health.as_str().to_string()),
+        ("version", status.version.clone()),
+        ("protocol_version", status.protocol_version.to_string()),
+        ("protocol_min", status.protocol_min.to_string()),
+        ("protocol_max", status.protocol_max.to_string()),
+        ("protocol_features", status.protocol_features.join(",")),
+        (
+            "uptime_ms",
+            status
+                .uptime_ms
+                .map_or_else(String::new, |value| value.to_string()),
+        ),
+        (
+            "active_process_count",
+            status.active_process_count.to_string(),
+        ),
+        (
+            "completed_process_count",
+            status.completed_process_count.to_string(),
+        ),
+        (
+            "failed_process_count",
+            status.failed_process_count.to_string(),
+        ),
+        ("process_count", status.process_count.to_string()),
+        ("default_mode", status.default_mode.as_str().to_string()),
+        (
+            "bytecode_cache_size",
+            status.bytecode_cache_size.to_string(),
+        ),
+        ("module_cache_size", status.module_cache_size.to_string()),
+        ("event_queue_len", status.event_queue_len.to_string()),
+        (
+            "dropped_event_count",
+            status.dropped_event_count.to_string(),
+        ),
+        (
+            "last_runtime_error",
+            status.last_runtime_error.clone().unwrap_or_default(),
+        ),
+    ])
+}
+
+fn parse_status_report(source: &str) -> Result<RuntimeStatusReport, RuntimeError> {
+    let values = parse_key_value_source(source);
+    let protocol_version = values
+        .get("protocol_version")
+        .and_then(|value| RuntimeProtocolVersion::parse(value))
+        .unwrap_or(crate::CURRENT_PROTOCOL_VERSION);
+    let protocol_min = values
+        .get("protocol_min")
+        .and_then(|value| RuntimeProtocolVersion::parse(value))
+        .unwrap_or(crate::MIN_SUPPORTED_PROTOCOL_VERSION);
+    let protocol_max = values
+        .get("protocol_max")
+        .and_then(|value| RuntimeProtocolVersion::parse(value))
+        .unwrap_or(crate::MAX_SUPPORTED_PROTOCOL_VERSION);
+    let default_mode = values
+        .get("default_mode")
+        .and_then(|value| value.parse::<RuntimeMode>().ok())
+        .unwrap_or(RuntimeMode::Required);
+
+    Ok(RuntimeStatusReport {
+        health: values
+            .get("health")
+            .map_or(RuntimeHealth::Stopped, |value| RuntimeHealth::parse(value)),
+        version: values
+            .get("version")
+            .cloned()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        protocol_version,
+        protocol_min,
+        protocol_max,
+        protocol_features: split_list(values.get("protocol_features")),
+        uptime_ms: values.get("uptime_ms").and_then(|value| value.parse().ok()),
+        active_process_count: parse_source_value(&values, "active_process_count"),
+        completed_process_count: parse_source_value(&values, "completed_process_count"),
+        failed_process_count: parse_source_value(&values, "failed_process_count"),
+        process_count: parse_source_value(&values, "process_count"),
+        default_mode,
+        bytecode_cache_size: parse_source_value(&values, "bytecode_cache_size"),
+        module_cache_size: parse_source_value(&values, "module_cache_size"),
+        event_queue_len: parse_source_value(&values, "event_queue_len"),
+        dropped_event_count: parse_source_value(&values, "dropped_event_count"),
+        last_runtime_error: values
+            .get("last_runtime_error")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+    })
+}
+
+fn format_metrics_report(metrics: &RuntimeMetricsReport) -> String {
+    format_key_values(&[
+        (
+            "active_process_count",
+            metrics.active_process_count.to_string(),
+        ),
+        (
+            "completed_process_count",
+            metrics.completed_process_count.to_string(),
+        ),
+        (
+            "failed_process_count",
+            metrics.failed_process_count.to_string(),
+        ),
+        ("process_count", metrics.process_count.to_string()),
+        ("event_queue_len", metrics.event_queue_len.to_string()),
+        (
+            "dropped_event_count",
+            metrics.dropped_event_count.to_string(),
+        ),
+        ("checkpoint_count", metrics.checkpoint_count.to_string()),
+        (
+            "middleware_request_count",
+            metrics.middleware_request_count.to_string(),
+        ),
+        (
+            "executed_instructions",
+            metrics.executed_instructions.to_string(),
+        ),
+        ("allocations", metrics.allocations.to_string()),
+        ("gc_collections", metrics.gc_collections.to_string()),
+        ("native_calls", metrics.native_calls.to_string()),
+        ("execution_time_ms", metrics.execution_time_ms.to_string()),
+    ])
+}
+
+fn parse_metrics_report(source: &str) -> RuntimeMetricsReport {
+    let values = parse_key_value_source(source);
+    RuntimeMetricsReport {
+        active_process_count: parse_source_value(&values, "active_process_count"),
+        completed_process_count: parse_source_value(&values, "completed_process_count"),
+        failed_process_count: parse_source_value(&values, "failed_process_count"),
+        process_count: parse_source_value(&values, "process_count"),
+        event_queue_len: parse_source_value(&values, "event_queue_len"),
+        dropped_event_count: parse_source_value(&values, "dropped_event_count"),
+        checkpoint_count: parse_source_value(&values, "checkpoint_count"),
+        middleware_request_count: parse_source_value(&values, "middleware_request_count"),
+        executed_instructions: parse_source_value(&values, "executed_instructions"),
+        allocations: parse_source_value(&values, "allocations"),
+        gc_collections: parse_source_value(&values, "gc_collections"),
+        native_calls: parse_source_value(&values, "native_calls"),
+        execution_time_ms: parse_source_value(&values, "execution_time_ms"),
+    }
+}
+
+fn format_runtime_config(config: &RuntimeConfig) -> String {
+    let socket = config
+        .socket_path
+        .as_ref()
+        .map_or_else(String::new, |path| path.display().to_string());
+    [
+        "[runtime]".to_string(),
+        format!("mode = \"{}\"", config.mode.as_str()),
+        format!("home = \"{}\"", config.home.display()),
+        format!("auto_start = {}", config.auto_start),
+        format!("default_profile = \"{}\"", config.default_profile.as_str()),
+        format!("log_level = \"{}\"", config.log_level.as_str()),
+        format!("audit_enabled = {}", config.audit_enabled),
+        format!("stats_enabled = {}", config.stats_enabled),
+        format!("request_timeout_ms = {}", config.request_timeout_ms),
+        format!(
+            "max_concurrent_processes = {}",
+            config.max_concurrent_runtime_processes
+        ),
+        format!("rate_limit_per_second = {}", config.rate_limit_per_second),
+        format!("socket = \"{socket}\""),
+    ]
+    .join("\n")
+}
+
+fn parse_runtime_config(source: &str) -> Result<RuntimeConfig, RuntimeError> {
+    RuntimeConfig::parse(source, Path::new("<runtime-config>"))
+}
+
+fn format_runtime_event(event: &crate::RuntimeEvent) -> String {
+    [
+        event.id.to_string(),
+        event.timestamp_ms.to_string(),
+        event
+            .process_id
+            .map_or_else(String::new, |process| process.0.to_string()),
+        event
+            .session_id
+            .map_or_else(String::new, |session| session.0.to_string()),
+        event_kind_name(&event.kind).to_string(),
+        event.metadata.severity.as_str().to_string(),
+        escape(event.metadata.message.as_deref().unwrap_or_default()),
+    ]
+    .join("\t")
+}
+
+fn parse_runtime_event(line: &str) -> Option<crate::RuntimeEvent> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 7 {
+        return None;
+    }
+    Some(crate::RuntimeEvent {
+        id: fields[0].parse().ok()?,
+        timestamp_ms: fields[1].parse().ok()?,
+        process_id: (!fields[2].is_empty())
+            .then(|| fields[2].parse().ok().map(RuntimeProcessId))
+            .flatten(),
+        session_id: (!fields[3].is_empty())
+            .then(|| fields[3].parse().ok().map(RuntimeSessionId))
+            .flatten(),
+        kind: parse_event_kind(fields[4])?,
+        metadata: RuntimeEventMetadata {
+            severity: parse_event_severity(fields[5]),
+            message: (!fields[6].is_empty()).then(|| unescape(fields[6])),
+            source_span: None,
+            function_name: None,
+            module_name: None,
+        },
+    })
+}
+
+fn event_kind_name(kind: &RuntimeEventKind) -> &'static str {
+    match kind {
+        RuntimeEventKind::RuntimeStarted => "runtime_started",
+        RuntimeEventKind::RuntimeStopped => "runtime_stopped",
+        RuntimeEventKind::ProcessStarted => "process_started",
+        RuntimeEventKind::ProcessCompleted => "process_completed",
+        RuntimeEventKind::ProcessFailed => "process_failed",
+        RuntimeEventKind::ProcessKilled => "process_killed",
+        RuntimeEventKind::DebuggerAttached => "debugger_attached",
+        RuntimeEventKind::ProfileSelected(_) => "profile_selected",
+        RuntimeEventKind::CheckpointRecorded => "checkpoint_recorded",
+        RuntimeEventKind::AuditEvent(_) => "audit_event",
+        RuntimeEventKind::ProgramStarted => "program_started",
+        RuntimeEventKind::ProgramCompleted => "program_completed",
+        RuntimeEventKind::ProgramFailed => "program_failed",
+        RuntimeEventKind::NativeFunctionCalled(_) => "native_function_called",
+        RuntimeEventKind::CapabilityDenied(_) => "capability_denied",
+        RuntimeEventKind::ExceptionThrown => "exception_thrown",
+        RuntimeEventKind::ExceptionHandled => "exception_handled",
+        RuntimeEventKind::ModuleLoaded(_) => "module_loaded",
+        RuntimeEventKind::GcStarted => "gc_started",
+        RuntimeEventKind::GcCompleted => "gc_completed",
+        RuntimeEventKind::DebuggerBreakpointHit => "debugger_breakpoint_hit",
+        RuntimeEventKind::CustomExtensionCalled(_) => "custom_extension_called",
+        RuntimeEventKind::InstructionBudgetExceeded => "instruction_budget_exceeded",
+    }
+}
+
+fn parse_event_kind(value: &str) -> Option<RuntimeEventKind> {
+    match value {
+        "runtime_started" => Some(RuntimeEventKind::RuntimeStarted),
+        "runtime_stopped" => Some(RuntimeEventKind::RuntimeStopped),
+        "process_started" => Some(RuntimeEventKind::ProcessStarted),
+        "process_completed" => Some(RuntimeEventKind::ProcessCompleted),
+        "process_failed" => Some(RuntimeEventKind::ProcessFailed),
+        "process_killed" => Some(RuntimeEventKind::ProcessKilled),
+        "debugger_attached" => Some(RuntimeEventKind::DebuggerAttached),
+        "profile_selected" => Some(RuntimeEventKind::ProfileSelected(String::new())),
+        "checkpoint_recorded" => Some(RuntimeEventKind::CheckpointRecorded),
+        "audit_event" => Some(RuntimeEventKind::AuditEvent(String::new())),
+        "program_started" => Some(RuntimeEventKind::ProgramStarted),
+        "program_completed" => Some(RuntimeEventKind::ProgramCompleted),
+        "program_failed" => Some(RuntimeEventKind::ProgramFailed),
+        "native_function_called" => Some(RuntimeEventKind::NativeFunctionCalled(String::new())),
+        "capability_denied" => Some(RuntimeEventKind::CapabilityDenied(String::new())),
+        "exception_thrown" => Some(RuntimeEventKind::ExceptionThrown),
+        "exception_handled" => Some(RuntimeEventKind::ExceptionHandled),
+        "module_loaded" => Some(RuntimeEventKind::ModuleLoaded(String::new())),
+        "gc_started" => Some(RuntimeEventKind::GcStarted),
+        "gc_completed" => Some(RuntimeEventKind::GcCompleted),
+        "debugger_breakpoint_hit" => Some(RuntimeEventKind::DebuggerBreakpointHit),
+        "custom_extension_called" => Some(RuntimeEventKind::CustomExtensionCalled(String::new())),
+        "instruction_budget_exceeded" => Some(RuntimeEventKind::InstructionBudgetExceeded),
+        _ => None,
+    }
+}
+
+fn parse_event_severity(value: &str) -> RuntimeEventSeverity {
+    match value {
+        "warn" => RuntimeEventSeverity::Warn,
+        "error" => RuntimeEventSeverity::Error,
+        _ => RuntimeEventSeverity::Info,
+    }
+}
+
+fn format_key_values(values: &[(&str, String)]) -> String {
+    values
+        .iter()
+        .map(|(key, value)| format!("{key}={}", escape(value)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_key_value_source(source: &str) -> BTreeMap<String, String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.to_string(), unescape(value)))
+        })
+        .collect()
+}
+
+fn parse_source_value<T>(values: &BTreeMap<String, String>, key: &str) -> T
+where
+    T: Default + std::str::FromStr,
+{
+    values
+        .get(key)
+        .and_then(|value| value.parse::<T>().ok())
+        .unwrap_or_default()
+}
+
+fn split_list(value: Option<&String>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn encode_record_response(result: Result<RuntimeProcessRecord, RuntimeError>) -> String {
     match result {
         Ok(record) => format!("OK\t{}", escape(&format_process_record(&record))),
@@ -1462,6 +1870,36 @@ fn encode_text_response(result: Result<String, RuntimeError>) -> String {
     }
 }
 
+fn encode_status_response(result: Result<RuntimeStatusReport, RuntimeError>) -> String {
+    match result {
+        Ok(status) => format!("OK\t{}", escape(&format_status_report(&status))),
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
+fn encode_metrics_response(result: Result<RuntimeMetricsReport, RuntimeError>) -> String {
+    match result {
+        Ok(metrics) => format!("OK\t{}", escape(&format_metrics_report(&metrics))),
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
+fn encode_events_response(events: Vec<crate::RuntimeEvent>) -> String {
+    let payload = events
+        .iter()
+        .map(format_runtime_event)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("OK\t{}", escape(&payload))
+}
+
+fn encode_config_response(result: Result<RuntimeConfig, RuntimeError>) -> String {
+    match result {
+        Ok(config) => format!("OK\t{}", escape(&format_runtime_config(&config))),
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
 fn encode_error_response(error: RuntimeError) -> String {
     format!("ERR\t{}\t{}", error.exit_code, escape(&error.render()))
 }
@@ -1485,6 +1923,26 @@ fn decode_protocol_response(response: &str) -> Result<RuntimeProtocolInfo, Runti
         )),
         _ => invalid_daemon_response(response),
     }
+}
+
+fn decode_status_response(response: &str) -> Result<RuntimeStatusReport, RuntimeError> {
+    let payload = decode_text_response(response)?;
+    parse_status_report(&payload)
+}
+
+fn decode_metrics_response(response: &str) -> Result<RuntimeMetricsReport, RuntimeError> {
+    let payload = decode_text_response(response)?;
+    Ok(parse_metrics_report(&payload))
+}
+
+fn decode_events_response(response: &str) -> Result<Vec<crate::RuntimeEvent>, RuntimeError> {
+    let payload = decode_text_response(response)?;
+    Ok(payload.lines().filter_map(parse_runtime_event).collect())
+}
+
+fn decode_config_response(response: &str) -> Result<RuntimeConfig, RuntimeError> {
+    let payload = decode_text_response(response)?;
+    parse_runtime_config(&payload)
 }
 
 fn decode_record_response(response: &str) -> Result<RuntimeProcessRecord, RuntimeError> {
