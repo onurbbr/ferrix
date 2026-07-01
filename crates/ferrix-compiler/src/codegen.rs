@@ -10,7 +10,7 @@ use ferrix_core::{
     Value,
     bytecode::{
         CaptureId, Chunk, ChunkBuildError, Function, FunctionId, Instruction, JumpTarget, Program,
-        ProgramBuildError, Register, VerifiedProgram,
+        ProgramBuildError, Register, VerifiedProgram, optimize_chunk,
     },
     diagnostics::FileId,
 };
@@ -286,7 +286,7 @@ impl Codegen {
             .try_into()
             .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
 
-        Ok(self.chunk)
+        Ok(optimize_chunk(self.chunk))
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
