@@ -238,6 +238,94 @@ return add(2);
 }
 
 #[test]
+fn compiles_closure_that_mutates_captured_local() {
+    let program = compile_source(
+        "\
+let x = 0;
+let inc = fn() {
+    x = x + 1;
+    return x;
+};
+
+inc();
+return inc();
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(2));
+}
+
+#[test]
+fn compiles_shared_capture_between_closures() {
+    let program = compile_source(
+        "\
+let x = 0;
+let inc = fn() {
+    x = x + 1;
+    return x;
+};
+let get = fn() {
+    return x;
+};
+
+inc();
+inc();
+return get();
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(2));
+}
+
+#[test]
+fn compiles_closure_that_observes_later_assignment() {
+    let program = compile_source(
+        "\
+let x = 1;
+let get = fn() {
+    return x;
+};
+
+x = 42;
+return get();
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compiles_recursive_function_literal() {
+    let program = compile_source(
+        "\
+let fact = fn(n) {
+    if (n == 0) {
+        return 1;
+    } else {
+        return n * fact(n - 1);
+    }
+};
+
+return fact(5);
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(120));
+}
+
+#[test]
 fn compiles_recursive_function_call() {
     let program = compile_source(
         "\
