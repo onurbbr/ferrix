@@ -9,7 +9,7 @@ use std::{
 use ferrix_core::bytecode::encode_program;
 use ferrix_runtime::{
     RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus, RuntimeEventKind,
-    RuntimeGateway, RuntimeMode, RuntimeProcessStatus, RuntimeService,
+    RuntimeGateway, RuntimeMode, RuntimeProcessKind, RuntimeProcessStatus, RuntimeService,
 };
 
 #[test]
@@ -57,6 +57,36 @@ fn required_gateway_reports_missing_runtime_daemon() {
 }
 
 #[test]
+fn required_gateway_checks_runtime_before_metadata_requests() {
+    let dir = temp_dir();
+    let runtime_home = dir.join("runtime");
+
+    let error = RuntimeGateway::with_home(RuntimeMode::Required, runtime_home)
+        .list_logs()
+        .unwrap_err();
+
+    assert_eq!(error.exit_code, 69);
+    assert_eq!(
+        error.render(),
+        "Ferrix runtime is not running.\nStart it with: ferrix runtime start\n"
+    );
+}
+
+#[test]
+fn managed_gateway_starts_runtime_before_metadata_requests() {
+    let dir = temp_dir();
+    let runtime_home = dir.join("runtime");
+    let gateway = RuntimeGateway::with_home(RuntimeMode::Managed, &runtime_home);
+
+    let logs = gateway.list_logs().unwrap();
+
+    assert!(logs.is_empty());
+    let mut daemon = RuntimeDaemon::with_home(runtime_home);
+    assert!(daemon.status().unwrap().is_serving());
+    daemon.stop().unwrap();
+}
+
+#[test]
 fn daemon_lifecycle_reports_health_status() {
     let dir = temp_dir();
     let mut daemon = RuntimeDaemon::with_home(dir.join("runtime"));
@@ -89,10 +119,12 @@ return 42;
     let result = daemon.run_source(RunSourceRequest::new(&file)).unwrap();
 
     assert_eq!(result.value_display.as_deref(), Some("42"));
-    let processes = daemon.list_processes().unwrap();
-    assert_eq!(processes.len(), 1);
-    assert_eq!(processes[0].status, RuntimeProcessStatus::Completed);
-    assert_eq!(daemon.logs(processes[0].id).unwrap(), "hello\n42\n");
+    assert!(daemon.list_processes().unwrap().is_empty());
+    let history = daemon.list_history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].status, RuntimeProcessStatus::Completed);
+    assert_eq!(history[0].kind, RuntimeProcessKind::Run);
+    assert_eq!(daemon.logs(history[0].id).unwrap(), "hello\n42\n");
     assert_eq!(daemon.checkpoints().unwrap().len(), 1);
 }
 
