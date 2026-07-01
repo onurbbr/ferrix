@@ -18,7 +18,9 @@ use crate::{
     DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind,
     RuntimeEventBus, RuntimeEventKind, RuntimeMode, RuntimeProcessId, RuntimeProcessKind,
     RuntimeProcessRecord, RuntimeProcessStatus, RuntimeProcessTable, RuntimeProfile,
-    RuntimeSessionId, RuntimeStats, event::timestamp_ms, request::RecordProcessRequest,
+    RuntimeSessionId, RuntimeStats,
+    event::{RuntimeEventMetadata, RuntimeEventSeverity, timestamp_ms},
+    request::RecordProcessRequest,
     service::CompiledProgram,
 };
 
@@ -97,6 +99,10 @@ pub struct RuntimeStatusReport {
     pub bytecode_cache_size: usize,
     /// Placeholder module cache size.
     pub module_cache_size: usize,
+    /// Retained runtime event count.
+    pub event_queue_len: usize,
+    /// Runtime events dropped because the queue reached capacity.
+    pub dropped_event_count: u64,
     /// Last runtime error, if one was recorded.
     pub last_runtime_error: Option<String>,
 }
@@ -295,6 +301,8 @@ impl RuntimeDaemon {
             None
         };
 
+        let event_stats = self.events.stats();
+
         Ok(RuntimeStatusReport {
             health,
             version: state
@@ -305,10 +313,12 @@ impl RuntimeDaemon {
             active_process_count,
             completed_process_count,
             failed_process_count,
-            process_count: active_process_count,
+            process_count: history.len(),
             default_mode: RuntimeMode::Required,
             bytecode_cache_size: 0,
             module_cache_size: 0,
+            event_queue_len: event_stats.len,
+            dropped_event_count: event_stats.dropped_events,
             last_runtime_error: state
                 .get("last_runtime_error")
                 .filter(|value| !value.is_empty())
@@ -362,9 +372,11 @@ impl RuntimeDaemon {
     /// Runs source through the daemon socket.
     pub fn request_run_source(&self, request: RunSourceRequest) -> Result<RunResult, RuntimeError> {
         self.decode_run_response(&self.request(&format!(
-            "RUN_SOURCE\t{}\t{}",
+            "RUN_SOURCE\t{}\t{}\t{}\t{}",
             escape(&request.path.display().to_string()),
-            escape(request.profile.as_str())
+            escape(request.profile.as_str()),
+            request.collect_stats,
+            request.collect_audit
         ))?)
     }
 
@@ -374,9 +386,11 @@ impl RuntimeDaemon {
         request: RunBytecodeRequest,
     ) -> Result<RunResult, RuntimeError> {
         self.decode_run_response(&self.request(&format!(
-            "RUN_BYTECODE\t{}\t{}",
+            "RUN_BYTECODE\t{}\t{}\t{}\t{}",
             escape(&request.path.display().to_string()),
-            escape(request.profile.as_str())
+            escape(request.profile.as_str()),
+            request.collect_stats,
+            request.collect_audit
         ))?)
     }
 
@@ -436,6 +450,13 @@ impl RuntimeDaemon {
             request.path.clone(),
             request.args.clone(),
         )?;
+        self.events.publish_event(
+            RuntimeEventKind::ProgramStarted,
+            Some(record.id),
+            Some(record.session_id),
+            RuntimeEventMetadata::new(RuntimeEventSeverity::Info)
+                .with_message(format!("run {}", record.path.display())),
+        );
         let result = crate::RuntimeService::new().run_source(request);
         self.finish_process(record, result)
     }
@@ -453,6 +474,13 @@ impl RuntimeDaemon {
             request.path.clone(),
             Vec::new(),
         )?;
+        self.events.publish_event(
+            RuntimeEventKind::ProgramStarted,
+            Some(record.id),
+            Some(record.session_id),
+            RuntimeEventMetadata::new(RuntimeEventSeverity::Info)
+                .with_message(format!("run-bytecode {}", record.path.display())),
+        );
         let result = crate::RuntimeService::new().run_bytecode(request);
         self.finish_process(record, result)
     }
@@ -634,6 +662,8 @@ impl RuntimeDaemon {
                     .unwrap_or(RuntimeProfile::Cli);
                 let mut request = RunSourceRequest::new(path);
                 request.profile = profile;
+                request.collect_stats = parts.next().and_then(parse_bool).unwrap_or(false);
+                request.collect_audit = parts.next().and_then(parse_bool).unwrap_or(false);
                 encode_run_response(self.run_source(request))
             }
             "RUN_BYTECODE" => {
@@ -645,6 +675,8 @@ impl RuntimeDaemon {
                     .unwrap_or(RuntimeProfile::Cli);
                 let mut request = RunBytecodeRequest::new(path);
                 request.profile = profile;
+                request.collect_stats = parts.next().and_then(parse_bool).unwrap_or(false);
+                request.collect_audit = parts.next().and_then(parse_bool).unwrap_or(false);
                 encode_run_response(self.run_bytecode(request))
             }
             "RECORD_PROCESS" => {
@@ -741,6 +773,14 @@ impl RuntimeDaemon {
                 stats: RuntimeStats::default(),
                 audit_events: Vec::new(),
             }),
+            ["OK", exit_code, output, value_display, stats, audit_events] => Ok(RunResult {
+                exit_code: exit_code.parse().unwrap_or(0),
+                value: ferrix_core::Value::Nil,
+                value_display: optional_unescape(value_display),
+                output: unescape(output),
+                stats: parse_runtime_stats(&unescape(stats)),
+                audit_events: parse_audit_events(&unescape(audit_events)),
+            }),
             ["ERR", exit_code, message] => Err(RuntimeError::new(
                 exit_code.parse().unwrap_or(70),
                 RuntimeErrorKind::Execution(unescape(message)),
@@ -797,6 +837,14 @@ impl RuntimeDaemon {
                     Some(record.id),
                     Some(record.session_id),
                 );
+                self.events.publish_event(
+                    RuntimeEventKind::ProgramCompleted,
+                    Some(record.id),
+                    Some(record.session_id),
+                    RuntimeEventMetadata::new(RuntimeEventSeverity::Info)
+                        .with_message(format!("exit_code={}", result.exit_code)),
+                );
+                self.publish_audit_events(&record, &result.audit_events);
                 Ok(result)
             }
             Err(error) => {
@@ -810,8 +858,40 @@ impl RuntimeDaemon {
                     Some(record.id),
                     Some(record.session_id),
                 );
+                self.events.publish_event(
+                    RuntimeEventKind::ProgramFailed,
+                    Some(record.id),
+                    Some(record.session_id),
+                    RuntimeEventMetadata::new(RuntimeEventSeverity::Error)
+                        .with_message(format!("exit_code={}", error.exit_code)),
+                );
                 Err(error)
             }
+        }
+    }
+
+    fn publish_audit_events(&mut self, record: &RuntimeProcessRecord, audit_events: &[String]) {
+        for event in audit_events {
+            let severity = if event.contains("denied") || event.contains("failed") {
+                RuntimeEventSeverity::Error
+            } else {
+                RuntimeEventSeverity::Info
+            };
+            let kind = if event.contains("capability_denied") {
+                RuntimeEventKind::CapabilityDenied(event.clone())
+            } else if event.contains("program_completed") {
+                RuntimeEventKind::ProgramCompleted
+            } else if event.contains("program_failed") {
+                RuntimeEventKind::ProgramFailed
+            } else {
+                RuntimeEventKind::AuditEvent(event.clone())
+            };
+            self.events.publish_event(
+                kind,
+                Some(record.id),
+                Some(record.session_id),
+                RuntimeEventMetadata::new(severity).with_message(event.clone()),
+            );
         }
     }
 
@@ -1000,11 +1080,31 @@ fn write_process_record(path: &Path, record: &RuntimeProcessRecord) -> Result<()
                 record.stats.executed_instructions.to_string(),
             ),
             ("call_depth", record.stats.call_depth.to_string()),
+            ("max_call_depth", record.stats.max_call_depth.to_string()),
+            (
+                "max_register_count",
+                record.stats.max_register_count.to_string(),
+            ),
             ("heap_objects", record.stats.heap_objects.to_string()),
+            ("allocations", record.stats.allocations.to_string()),
+            (
+                "allocation_pressure",
+                record.stats.allocation_pressure.to_string(),
+            ),
             ("gc_collections", record.stats.gc_collections.to_string()),
             (
                 "incremental_gc_steps",
                 record.stats.incremental_gc_steps.to_string(),
+            ),
+            ("native_calls", record.stats.native_calls.to_string()),
+            ("thrown_errors", record.stats.thrown_errors.to_string()),
+            (
+                "handled_exceptions",
+                record.stats.handled_exceptions.to_string(),
+            ),
+            (
+                "execution_time_ms",
+                record.stats.execution_time_ms.to_string(),
             ),
             ("last_error", record.last_error.clone().unwrap_or_default()),
         ],
@@ -1042,9 +1142,17 @@ fn read_process_record(path: &Path) -> Result<Option<RuntimeProcessRecord>, Runt
     let stats = RuntimeStats {
         executed_instructions: parse_value(&values, "executed_instructions"),
         call_depth: parse_value(&values, "call_depth"),
+        max_call_depth: parse_value(&values, "max_call_depth"),
+        max_register_count: parse_value(&values, "max_register_count"),
         heap_objects: parse_value(&values, "heap_objects"),
+        allocations: parse_value(&values, "allocations"),
+        allocation_pressure: parse_value(&values, "allocation_pressure"),
         gc_collections: parse_value(&values, "gc_collections"),
         incremental_gc_steps: parse_value(&values, "incremental_gc_steps"),
+        native_calls: parse_value(&values, "native_calls"),
+        thrown_errors: parse_value(&values, "thrown_errors"),
+        handled_exceptions: parse_value(&values, "handled_exceptions"),
+        execution_time_ms: parse_value(&values, "execution_time_ms"),
     };
 
     Ok(Some(RuntimeProcessRecord {
@@ -1091,6 +1199,14 @@ where
         .unwrap_or_default()
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn process_output_snapshot(output: &str, value_display: Option<&str>) -> String {
     let mut snapshot = String::from(output);
     if let Some(value) = value_display {
@@ -1114,16 +1230,74 @@ fn parse_process_kind(value: &str) -> Option<RuntimeProcessKind> {
 fn encode_run_response(result: Result<RunResult, RuntimeError>) -> String {
     match result {
         Ok(result) => format!(
-            "OK\t{}\t{}\t{}",
+            "OK\t{}\t{}\t{}\t{}\t{}",
             result.exit_code,
             escape(&result.output),
             result
                 .value_display
                 .as_deref()
-                .map_or(String::new(), escape)
+                .map_or(String::new(), escape),
+            escape(&format_runtime_stats(&result.stats)),
+            escape(&result.audit_events.join("\n"))
         ),
         Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
     }
+}
+
+fn format_runtime_stats(stats: &RuntimeStats) -> String {
+    [
+        stats.executed_instructions.to_string(),
+        stats.call_depth.to_string(),
+        stats.max_call_depth.to_string(),
+        stats.max_register_count.to_string(),
+        stats.heap_objects.to_string(),
+        stats.allocations.to_string(),
+        stats.allocation_pressure.to_string(),
+        stats.gc_collections.to_string(),
+        stats.incremental_gc_steps.to_string(),
+        stats.native_calls.to_string(),
+        stats.thrown_errors.to_string(),
+        stats.handled_exceptions.to_string(),
+        stats.execution_time_ms.to_string(),
+    ]
+    .join(",")
+}
+
+fn parse_runtime_stats(source: &str) -> RuntimeStats {
+    let fields = source.split(',').collect::<Vec<_>>();
+    RuntimeStats {
+        executed_instructions: parse_stat_field(&fields, 0),
+        call_depth: parse_stat_field(&fields, 1),
+        max_call_depth: parse_stat_field(&fields, 2),
+        max_register_count: parse_stat_field(&fields, 3),
+        heap_objects: parse_stat_field(&fields, 4),
+        allocations: parse_stat_field(&fields, 5),
+        allocation_pressure: parse_stat_field(&fields, 6),
+        gc_collections: parse_stat_field(&fields, 7),
+        incremental_gc_steps: parse_stat_field(&fields, 8),
+        native_calls: parse_stat_field(&fields, 9),
+        thrown_errors: parse_stat_field(&fields, 10),
+        handled_exceptions: parse_stat_field(&fields, 11),
+        execution_time_ms: parse_stat_field(&fields, 12),
+    }
+}
+
+fn parse_stat_field<T>(fields: &[&str], index: usize) -> T
+where
+    T: Default + std::str::FromStr,
+{
+    fields
+        .get(index)
+        .and_then(|value| value.parse::<T>().ok())
+        .unwrap_or_default()
+}
+
+fn parse_audit_events(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn encode_record_response(result: Result<RuntimeProcessRecord, RuntimeError>) -> String {
@@ -1273,9 +1447,17 @@ fn format_process_record(record: &RuntimeProcessRecord) -> String {
             .map_or_else(String::new, |value| value.to_string()),
         record.stats.executed_instructions.to_string(),
         record.stats.call_depth.to_string(),
+        record.stats.max_call_depth.to_string(),
+        record.stats.max_register_count.to_string(),
         record.stats.heap_objects.to_string(),
+        record.stats.allocations.to_string(),
+        record.stats.allocation_pressure.to_string(),
         record.stats.gc_collections.to_string(),
         record.stats.incremental_gc_steps.to_string(),
+        record.stats.native_calls.to_string(),
+        record.stats.thrown_errors.to_string(),
+        record.stats.handled_exceptions.to_string(),
+        record.stats.execution_time_ms.to_string(),
         record.last_error.as_deref().map_or(String::new(), escape),
     ]
     .join("\t")
@@ -1283,7 +1465,7 @@ fn format_process_record(record: &RuntimeProcessRecord) -> String {
 
 fn parse_process_record_line(line: &str) -> Option<RuntimeProcessRecord> {
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 17 {
+    if fields.len() != 17 && fields.len() != 25 {
         return None;
     }
     let id = RuntimeProcessId(fields[0].parse().ok()?);
@@ -1305,11 +1487,13 @@ fn parse_process_record_line(line: &str) -> Option<RuntimeProcessRecord> {
     } else {
         Some(fields[10].parse().ok()?)
     };
-    let last_error = if fields[16].is_empty() {
+    let last_error_index = fields.len() - 1;
+    let last_error = if fields[last_error_index].is_empty() {
         None
     } else {
-        Some(unescape(fields[16]))
+        Some(unescape(fields[last_error_index]))
     };
+    let new_stats = fields.len() == 25;
 
     Some(RuntimeProcessRecord {
         id,
@@ -1330,9 +1514,49 @@ fn parse_process_record_line(line: &str) -> Option<RuntimeProcessRecord> {
         stats: RuntimeStats {
             executed_instructions: fields[11].parse().ok()?,
             call_depth: fields[12].parse().ok()?,
-            heap_objects: fields[13].parse().ok()?,
-            gc_collections: fields[14].parse().ok()?,
-            incremental_gc_steps: fields[15].parse().ok()?,
+            max_call_depth: if new_stats {
+                fields[13].parse().ok()?
+            } else {
+                0
+            },
+            max_register_count: if new_stats {
+                fields[14].parse().ok()?
+            } else {
+                0
+            },
+            heap_objects: fields[if new_stats { 15 } else { 13 }].parse().ok()?,
+            allocations: if new_stats {
+                fields[16].parse().ok()?
+            } else {
+                0
+            },
+            allocation_pressure: if new_stats {
+                fields[17].parse().ok()?
+            } else {
+                0
+            },
+            gc_collections: fields[if new_stats { 18 } else { 14 }].parse().ok()?,
+            incremental_gc_steps: fields[if new_stats { 19 } else { 15 }].parse().ok()?,
+            native_calls: if new_stats {
+                fields[20].parse().ok()?
+            } else {
+                0
+            },
+            thrown_errors: if new_stats {
+                fields[21].parse().ok()?
+            } else {
+                0
+            },
+            handled_exceptions: if new_stats {
+                fields[22].parse().ok()?
+            } else {
+                0
+            },
+            execution_time_ms: if new_stats {
+                fields[23].parse().ok()?
+            } else {
+                0
+            },
         },
         last_error,
     })
