@@ -431,6 +431,119 @@ return math.add(40, 2);
 }
 
 #[test]
+fn compiles_explicit_module_function_exports() {
+    let module = parse_source_with_file_id(
+        "\
+fn hidden() {
+    return 40;
+}
+
+export fn answer() {
+    return hidden() + 2;
+}
+",
+        FileId(1),
+    )
+    .unwrap();
+    let entry = parse_source_with_file_id(
+        "\
+import math;
+return math.answer();
+",
+        FileId(0),
+    )
+    .unwrap();
+
+    let program = compile_program_ast_with_named_modules(
+        entry,
+        vec![ImportedModuleAst {
+            name: "math".to_string(),
+            ast: module,
+        }],
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn private_module_function_is_not_exported() {
+    let module = parse_source_with_file_id(
+        "\
+fn hidden() {
+    return 42;
+}
+
+export fn visible() {
+    return hidden();
+}
+",
+        FileId(1),
+    )
+    .unwrap();
+    let entry = parse_source_with_file_id(
+        "\
+import math;
+return math.hidden();
+",
+        FileId(0),
+    )
+    .unwrap();
+
+    let err = compile_program_ast_with_named_modules(
+        entry,
+        vec![ImportedModuleAst {
+            name: "math".to_string(),
+            ast: module,
+        }],
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::UndefinedModuleExport {
+            module: "math".to_string(),
+            name: "hidden".to_string(),
+        }
+    );
+}
+
+#[test]
+fn compiles_exported_module_values_before_entry() {
+    let module = parse_source_with_file_id(
+        "\
+export let base = 40;
+export let answer = base + 2;
+",
+        FileId(1),
+    )
+    .unwrap();
+    let entry = parse_source_with_file_id(
+        "\
+import constants;
+return constants.answer;
+",
+        FileId(0),
+    )
+    .unwrap();
+
+    let program = compile_program_ast_with_named_modules(
+        entry,
+        vec![ImportedModuleAst {
+            name: "constants".to_string(),
+            ast: module,
+        }],
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
 fn compiles_if_else_assignment() {
     let program = compile_source(
         "\
