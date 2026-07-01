@@ -165,10 +165,28 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 register(*rhs)
             )
         }
+        Instruction::AddInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "AddInt",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
         Instruction::Sub { dst, lhs, rhs } => {
             format!(
                 "{:<11} {}, {}, {}",
                 "Sub",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
+        Instruction::SubInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "SubInt",
                 register(*dst),
                 register(*lhs),
                 register(*rhs)
@@ -183,10 +201,28 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 register(*rhs)
             )
         }
+        Instruction::MulInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "MulInt",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
         Instruction::Div { dst, lhs, rhs } => {
             format!(
                 "{:<11} {}, {}, {}",
                 "Div",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
+        Instruction::DivInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "DivInt",
                 register(*dst),
                 register(*lhs),
                 register(*rhs)
@@ -238,10 +274,28 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 register(*rhs)
             )
         }
+        Instruction::LessInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "LessInt",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
         Instruction::LessEqual { dst, lhs, rhs } => {
             format!(
                 "{:<11} {}, {}, {}",
                 "LessEqual",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
+        Instruction::LessEqualInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "LessEqualInt",
                 register(*dst),
                 register(*lhs),
                 register(*rhs)
@@ -256,10 +310,28 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 register(*rhs)
             )
         }
+        Instruction::GreaterInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "GreaterInt",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
         Instruction::GreaterEqual { dst, lhs, rhs } => {
             format!(
                 "{:<11} {}, {}, {}",
                 "GreaterEqual",
+                register(*dst),
+                register(*lhs),
+                register(*rhs)
+            )
+        }
+        Instruction::GreaterEqualInt { dst, lhs, rhs } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "GreaterEqualInt",
                 register(*dst),
                 register(*lhs),
                 register(*rhs)
