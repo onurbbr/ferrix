@@ -22,6 +22,10 @@ pub struct FunctionId(pub u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JumpTarget(pub u32);
 
+/// Captured value operand index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CaptureId(pub u8);
+
 /// Register VM instruction set with explicit typed operands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Instruction {
@@ -108,6 +112,22 @@ pub enum Instruction {
         args_start: Register,
         arg_count: u8,
     },
+    MakeClosure {
+        dst: Register,
+        function: FunctionId,
+        captures_start: Register,
+        capture_count: u8,
+    },
+    LoadCapture {
+        dst: Register,
+        capture: CaptureId,
+    },
+    CallValue {
+        dst: Register,
+        callee: Register,
+        args_start: Register,
+        arg_count: u8,
+    },
     ArrayNew {
         dst: Register,
         elements_start: Register,
@@ -169,6 +189,18 @@ impl Instruction {
             Self::CallFunction {
                 dst, args_start, ..
             } => vec![*dst, *args_start],
+            Self::MakeClosure {
+                dst,
+                captures_start,
+                ..
+            } => vec![*dst, *captures_start],
+            Self::LoadCapture { dst, .. } => vec![*dst],
+            Self::CallValue {
+                dst,
+                callee,
+                args_start,
+                ..
+            } => vec![*dst, *callee, *args_start],
             Self::ArrayNew {
                 dst,
                 elements_start,
@@ -223,6 +255,15 @@ impl Instruction {
     pub fn function_operand(&self) -> Option<FunctionId> {
         match self {
             Self::CallFunction { function, .. } => Some(*function),
+            Self::MakeClosure { function, .. } => Some(*function),
+            _ => None,
+        }
+    }
+
+    /// Returns the capture operand, if the instruction has one.
+    pub fn capture_operand(&self) -> Option<CaptureId> {
+        match self {
+            Self::LoadCapture { capture, .. } => Some(*capture),
             _ => None,
         }
     }
@@ -249,6 +290,12 @@ impl fmt::Display for StringId {
 impl fmt::Display for FunctionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "fn#{}", self.0)
+    }
+}
+
+impl fmt::Display for CaptureId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cap#{}", self.0)
     }
 }
 
