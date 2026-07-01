@@ -4,12 +4,12 @@
 //! AST, or compile an entry file with named imported modules. Internally,
 //! [`Codegen`] lowers AST nodes into register-based bytecode.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ferrix_core::{
     Value,
     bytecode::{
-        Chunk, ChunkBuildError, Function, FunctionId, Instruction, JumpTarget, Program,
+        CaptureId, Chunk, ChunkBuildError, Function, FunctionId, Instruction, JumpTarget, Program,
         ProgramBuildError, Register, VerifiedProgram,
     },
     diagnostics::FileId,
@@ -91,17 +91,23 @@ fn compile_program_ast_with_aliases(
 struct Codegen {
     chunk: Chunk,
     locals: HashMap<String, Register>,
+    captures: HashMap<String, CaptureId>,
     functions: HashMap<String, FunctionId>,
     next_register: u16,
+    next_function_id: u16,
+    generated_functions: Vec<(FunctionId, Function)>,
 }
 
 impl Codegen {
-    fn new_main(functions: HashMap<String, FunctionId>) -> Self {
+    fn new_main(functions: HashMap<String, FunctionId>, next_function_id: u16) -> Self {
         Self {
             chunk: Chunk::new("main", 0),
             locals: HashMap::new(),
+            captures: HashMap::new(),
             functions,
             next_register: 0,
+            next_function_id,
+            generated_functions: Vec::new(),
         }
     }
 
@@ -109,6 +115,7 @@ impl Codegen {
         name: &str,
         params: &[String],
         functions: HashMap<String, FunctionId>,
+        next_function_id: u16,
     ) -> Result<Self, CompileError> {
         let arity = u8::try_from(params.len()).map_err(|_| {
             CompileError::new(
@@ -126,9 +133,37 @@ impl Codegen {
         Ok(Self {
             chunk: Chunk::new(name, 0).with_arity(arity),
             locals,
+            captures: HashMap::new(),
             functions,
             next_register: params.len() as u16,
+            next_function_id,
+            generated_functions: Vec::new(),
         })
+    }
+
+    fn new_closure(
+        name: &str,
+        params: &[String],
+        captures: &[String],
+        functions: HashMap<String, FunctionId>,
+        next_function_id: u16,
+    ) -> Result<Self, CompileError> {
+        let mut compiler = Self::new_function(name, params, functions, next_function_id)?;
+        let capture_count = u8::try_from(captures.len()).map_err(|_| {
+            CompileError::new(
+                CompileErrorKind::TooManyArguments {
+                    max: u8::MAX as usize,
+                },
+                None,
+            )
+        })?;
+        compiler.chunk.capture_count = capture_count;
+        compiler.captures = captures
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), CaptureId(index as u8)))
+            .collect();
+        Ok(compiler)
     }
 
     fn compile_program(
@@ -152,18 +187,15 @@ impl Codegen {
             )
         })?);
         let mut program = Program::new(main_id);
-
-        for stmt in &program_ast.statements {
-            if let Stmt::Function {
-                name, params, body, ..
-            } = stmt
-            {
-                let mut compiler = Self::new_function(name, params, function_ids.clone())?;
-                compiler.compile_block(body)?;
-                program
-                    .add_function(Function::bytecode(compiler.finish_chunk()?))
-                    .map_err(map_program_error)?;
-            }
+        let function_count = program_ast
+            .statements
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Function { .. }))
+            .count();
+        for _ in 0..function_count {
+            program
+                .add_function(Function::native("__pending", 0))
+                .map_err(map_program_error)?;
         }
         for (name, arity) in &referenced_builtins {
             program
@@ -171,15 +203,60 @@ impl Codegen {
                 .map_err(map_program_error)?;
         }
 
-        let mut main_compiler = Self::new_main(function_ids);
+        for stmt in &program_ast.statements {
+            if let Stmt::Function {
+                name,
+                params,
+                body,
+                span,
+            } = stmt
+            {
+                let function_id = *function_ids
+                    .get(name)
+                    .expect("function ids are precomputed");
+                let mut compiler = Self::new_function(
+                    name,
+                    params,
+                    function_ids.clone(),
+                    program.functions.len().try_into().map_err(|_| {
+                        CompileError::new(
+                            CompileErrorKind::TooManyFunctions {
+                                max: u16::MAX as usize,
+                            },
+                            Some(*span),
+                        )
+                    })?,
+                )?;
+                compiler.compile_block(body)?;
+                let generated_functions = std::mem::take(&mut compiler.generated_functions);
+                program.functions[usize::from(function_id.0)] =
+                    Function::bytecode(compiler.finish_chunk()?);
+                append_generated_functions(&mut program, generated_functions)?;
+            }
+        }
+
+        let mut main_compiler = Self::new_main(
+            function_ids,
+            program.functions.len().try_into().map_err(|_| {
+                CompileError::new(
+                    CompileErrorKind::TooManyFunctions {
+                        max: u16::MAX as usize,
+                    },
+                    None,
+                )
+            })?,
+        );
         for stmt in &program_ast.statements {
             if !matches!(stmt, Stmt::Function { .. }) {
                 main_compiler.compile_stmt(stmt)?;
             }
         }
-        program
+        let generated_functions = std::mem::take(&mut main_compiler.generated_functions);
+        append_generated_functions(&mut program, generated_functions)?;
+        let main_id = program
             .add_function(Function::bytecode(main_compiler.finish_chunk()?))
             .map_err(map_program_error)?;
+        program.entry = main_id;
 
         VerifiedProgram::new(program)
             .map_err(|error| CompileError::new(CompileErrorKind::BytecodeVerification(error), None))
@@ -318,12 +395,20 @@ impl Codegen {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<Register, CompileError> {
         match expr {
-            Expr::Variable { name, span } => self.locals.get(name).copied().ok_or_else(|| {
-                CompileError::new(
-                    CompileErrorKind::UndefinedVariable { name: name.clone() },
-                    Some(*span),
-                )
-            }),
+            Expr::Variable { name, span } => {
+                if let Some(register) = self.locals.get(name).copied() {
+                    Ok(register)
+                } else if self.captures.contains_key(name) {
+                    let dst = self.alloc_register()?;
+                    self.compile_expr_into(expr, dst)?;
+                    Ok(dst)
+                } else {
+                    Err(CompileError::new(
+                        CompileErrorKind::UndefinedVariable { name: name.clone() },
+                        Some(*span),
+                    ))
+                }
+            }
             _ => {
                 let dst = self.alloc_register()?;
                 self.compile_expr_into(expr, dst)?;
@@ -359,16 +444,25 @@ impl Codegen {
                 Ok(())
             }
             Expr::Variable { name, span } => {
-                let src = self.locals.get(name).copied().ok_or_else(|| {
+                if let Some(src) = self.locals.get(name).copied() {
+                    if src != dst {
+                        self.chunk.push_instruction_with_span(
+                            Instruction::Move { dst, src },
+                            Some(*span),
+                        );
+                    }
+                    return Ok(());
+                }
+                let capture = self.captures.get(name).copied().ok_or_else(|| {
                     CompileError::new(
                         CompileErrorKind::UndefinedVariable { name: name.clone() },
                         Some(*span),
                     )
                 })?;
-                if src != dst {
-                    self.chunk
-                        .push_instruction_with_span(Instruction::Move { dst, src }, Some(*span));
-                }
+                self.chunk.push_instruction_with_span(
+                    Instruction::LoadCapture { dst, capture },
+                    Some(*span),
+                );
                 Ok(())
             }
             Expr::Binary { op, lhs, rhs, span } => {
@@ -446,6 +540,9 @@ impl Codegen {
                 Ok(())
             }
             Expr::Call { callee, args, span } => self.compile_call_into(callee, args, dst, *span),
+            Expr::Function { params, body, span } => {
+                self.compile_function_literal_into(params, body, dst, *span)
+            }
             Expr::Grouping { expr, .. } => self.compile_expr_into(expr, dst),
         }
     }
@@ -548,14 +645,6 @@ impl Codegen {
                 Some(span),
             ));
         }
-        let function = self.functions.get(callee).copied().ok_or_else(|| {
-            CompileError::new(
-                CompileErrorKind::UndefinedFunction {
-                    name: callee.to_string(),
-                },
-                Some(span),
-            )
-        })?;
         let args_start = if args.is_empty() {
             Register(0)
         } else {
@@ -571,12 +660,95 @@ impl Codegen {
             start
         };
 
+        if let Some(function) = self.functions.get(callee).copied() {
+            self.chunk.push_instruction_with_span(
+                Instruction::CallFunction {
+                    dst,
+                    function,
+                    args_start,
+                    arg_count: args.len() as u8,
+                },
+                Some(span),
+            );
+        } else {
+            let callee = self.compile_expr(&Expr::Variable {
+                name: callee.to_string(),
+                span,
+            })?;
+            self.chunk.push_instruction_with_span(
+                Instruction::CallValue {
+                    dst,
+                    callee,
+                    args_start,
+                    arg_count: args.len() as u8,
+                },
+                Some(span),
+            );
+        }
+        Ok(())
+    }
+
+    fn compile_function_literal_into(
+        &mut self,
+        params: &[String],
+        body: &[Stmt],
+        dst: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        let captures = free_variables(body, params, &self.functions)
+            .into_iter()
+            .filter(|name| self.locals.contains_key(name) || self.captures.contains_key(name))
+            .collect::<Vec<_>>();
+        let function_id = FunctionId(self.next_function_id);
+        self.next_function_id = self.next_function_id.checked_add(1).ok_or_else(|| {
+            CompileError::new(
+                CompileErrorKind::TooManyFunctions {
+                    max: u16::MAX as usize,
+                },
+                Some(span),
+            )
+        })?;
+
+        let mut compiler = Self::new_closure(
+            &format!("closure#{}", function_id.0),
+            params,
+            &captures,
+            self.functions.clone(),
+            self.next_function_id,
+        )?;
+        compiler.compile_block(body)?;
+        self.next_function_id = compiler.next_function_id;
+        self.generated_functions
+            .extend(std::mem::take(&mut compiler.generated_functions));
+        self.generated_functions
+            .push((function_id, Function::bytecode(compiler.finish_chunk()?)));
+
+        let captures_start = if captures.is_empty() {
+            Register(0)
+        } else {
+            let start = self.alloc_register()?;
+            let mut capture_registers = vec![start];
+            for _ in captures.iter().skip(1) {
+                capture_registers.push(self.alloc_register()?);
+            }
+            for (name, register) in captures.iter().zip(capture_registers) {
+                self.compile_expr_into(
+                    &Expr::Variable {
+                        name: name.clone(),
+                        span,
+                    },
+                    register,
+                )?;
+            }
+            start
+        };
+
         self.chunk.push_instruction_with_span(
-            Instruction::CallFunction {
+            Instruction::MakeClosure {
                 dst,
-                function,
-                args_start,
-                arg_count: args.len() as u8,
+                function: function_id,
+                captures_start,
+                capture_count: captures.len() as u8,
             },
             Some(span),
         );
@@ -714,6 +886,25 @@ fn map_program_error(error: ProgramBuildError) -> CompileError {
     }
 }
 
+fn append_generated_functions(
+    program: &mut Program,
+    mut functions: Vec<(FunctionId, Function)>,
+) -> Result<(), CompileError> {
+    functions.sort_by_key(|(id, _)| id.0);
+    for (function_id, function) in functions {
+        if usize::from(function_id.0) != program.functions.len() {
+            return Err(CompileError::new(
+                CompileErrorKind::TooManyFunctions {
+                    max: u16::MAX as usize,
+                },
+                None,
+            ));
+        }
+        program.add_function(function).map_err(map_program_error)?;
+    }
+    Ok(())
+}
+
 fn function_ids(
     program_ast: &ProgramAst,
     referenced_builtins: &[(&'static str, u8)],
@@ -831,7 +1022,172 @@ fn expr_references_call(expr: &Expr, name: &str) -> bool {
         Expr::Map { entries, .. } => entries.iter().any(|(key, value)| {
             expr_references_call(key, name) || expr_references_call(value, name)
         }),
+        Expr::Function { body, .. } => body.iter().any(|stmt| stmt_references_call(stmt, name)),
         Expr::Grouping { expr, .. } => expr_references_call(expr, name),
+    }
+}
+
+fn free_variables(
+    body: &[Stmt],
+    params: &[String],
+    functions: &HashMap<String, FunctionId>,
+) -> Vec<String> {
+    let mut locals = params.iter().cloned().collect::<HashSet<_>>();
+    collect_local_names(body, &mut locals);
+    let mut seen = HashSet::new();
+    let mut free = Vec::new();
+    for stmt in body {
+        collect_stmt_free_variables(stmt, &locals, functions, &mut seen, &mut free);
+    }
+    free
+}
+
+fn collect_local_names(statements: &[Stmt], locals: &mut HashSet<String>) {
+    for stmt in statements {
+        match stmt {
+            Stmt::Let { name, .. } | Stmt::Function { name, .. } => {
+                locals.insert(name.clone());
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_local_names(then_branch, locals);
+                collect_local_names(else_branch, locals);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Block {
+                statements: body, ..
+            } => {
+                collect_local_names(body, locals);
+            }
+            Stmt::Import { .. }
+            | Stmt::Assign { .. }
+            | Stmt::IndexAssign { .. }
+            | Stmt::Return { .. }
+            | Stmt::Expr { .. } => {}
+        }
+    }
+}
+
+fn collect_stmt_free_variables(
+    stmt: &Stmt,
+    locals: &HashSet<String>,
+    functions: &HashMap<String, FunctionId>,
+    seen: &mut HashSet<String>,
+    free: &mut Vec<String>,
+) {
+    match stmt {
+        Stmt::Import { .. } | Stmt::Function { .. } => {}
+        Stmt::Let { initializer, .. } => {
+            collect_expr_free_variables(initializer, locals, functions, seen, free)
+        }
+        Stmt::Assign { name, value, .. } => {
+            if !locals.contains(name) && !functions.contains_key(name) && seen.insert(name.clone())
+            {
+                free.push(name.clone());
+            }
+            collect_expr_free_variables(value, locals, functions, seen, free);
+        }
+        Stmt::IndexAssign {
+            target,
+            index,
+            value,
+            ..
+        } => {
+            collect_expr_free_variables(target, locals, functions, seen, free);
+            collect_expr_free_variables(index, locals, functions, seen, free);
+            collect_expr_free_variables(value, locals, functions, seen, free);
+        }
+        Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
+            collect_expr_free_variables(value, locals, functions, seen, free);
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_free_variables(condition, locals, functions, seen, free);
+            for stmt in then_branch {
+                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            }
+            for stmt in else_branch {
+                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_expr_free_variables(condition, locals, functions, seen, free);
+            for stmt in body {
+                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            }
+        }
+        Stmt::Block { statements, .. } => {
+            for stmt in statements {
+                collect_stmt_free_variables(stmt, locals, functions, seen, free);
+            }
+        }
+    }
+}
+
+fn collect_expr_free_variables(
+    expr: &Expr,
+    locals: &HashSet<String>,
+    functions: &HashMap<String, FunctionId>,
+    seen: &mut HashSet<String>,
+    free: &mut Vec<String>,
+) {
+    match expr {
+        Expr::Literal { .. } => {}
+        Expr::Variable { name, .. } => {
+            if !locals.contains(name) && !functions.contains_key(name) && seen.insert(name.clone())
+            {
+                free.push(name.clone());
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_free_variables(lhs, locals, functions, seen, free);
+            collect_expr_free_variables(rhs, locals, functions, seen, free);
+        }
+        Expr::Call { callee, args, .. } => {
+            if !locals.contains(callee)
+                && !functions.contains_key(callee)
+                && seen.insert(callee.clone())
+            {
+                free.push(callee.clone());
+            }
+            for arg in args {
+                collect_expr_free_variables(arg, locals, functions, seen, free);
+            }
+        }
+        Expr::Index { target, index, .. } => {
+            collect_expr_free_variables(target, locals, functions, seen, free);
+            collect_expr_free_variables(index, locals, functions, seen, free);
+        }
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                collect_expr_free_variables(element, locals, functions, seen, free);
+            }
+        }
+        Expr::Map { entries, .. } => {
+            for (key, value) in entries {
+                collect_expr_free_variables(key, locals, functions, seen, free);
+                collect_expr_free_variables(value, locals, functions, seen, free);
+            }
+        }
+        Expr::Function { params, body, .. } => {
+            for name in free_variables(body, params, functions) {
+                if !locals.contains(&name) && seen.insert(name.clone()) {
+                    free.push(name);
+                }
+            }
+        }
+        Expr::Grouping { expr, .. } => {
+            collect_expr_free_variables(expr, locals, functions, seen, free)
+        }
     }
 }
 
