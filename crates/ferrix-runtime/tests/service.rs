@@ -6,12 +6,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ferrix_core::bytecode::encode_program;
+use ferrix_core::{
+    Value,
+    bytecode::{
+        BytecodeContainerMetadata, FEATURE_CUSTOM_EXTENSIONS, encode_container, encode_program,
+    },
+};
 use ferrix_runtime::{
-    HostCapability, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus,
-    RuntimeEventKind, RuntimeEventMetadata, RuntimeEventSeverity, RuntimeGateway, RuntimeMode,
-    RuntimePolicy, RuntimeProcessKind, RuntimeProcessStatus, RuntimeProfile, RuntimeService,
-    RuntimeSessionId,
+    CustomExtension, CustomExtensionMetadata, ExtensionCostClass, HostCapability,
+    RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus, RuntimeEventKind,
+    RuntimeEventMetadata, RuntimeEventSeverity, RuntimeExtensionRegistry, RuntimeGateway,
+    RuntimeMode, RuntimePolicy, RuntimeProcessKind, RuntimeProcessStatus, RuntimeProfile,
+    RuntimeService, RuntimeSessionId,
 };
 
 #[test]
@@ -363,6 +369,162 @@ fn runtime_runs_bytecode_file() {
         .unwrap();
 
     assert_eq!(result.value_display.as_deref(), Some("42"));
+}
+
+#[test]
+fn runtime_rejects_unsupported_bytecode_container_features() {
+    let dir = temp_dir();
+    let source = write_file(&dir, "main.fx", "return 42;\n");
+    let bytecode = dir.join("main.fxb");
+    let runtime = RuntimeService::new();
+    let compiled = runtime.compile_source_path(&source).unwrap();
+    let mut metadata = BytecodeContainerMetadata::for_program(compiled.program.as_program());
+    metadata.feature_flags |= FEATURE_CUSTOM_EXTENSIONS;
+    fs::write(
+        &bytecode,
+        encode_container(compiled.program.as_program(), Some(metadata)).unwrap(),
+    )
+    .unwrap();
+
+    let error = runtime
+        .run_bytecode(RunBytecodeRequest::new(&bytecode))
+        .unwrap_err();
+
+    assert_eq!(error.exit_code, 65);
+    assert!(
+        error
+            .render()
+            .contains("unsupported bytecode feature `custom-extensions`")
+    );
+}
+
+#[test]
+fn runtime_rejects_container_required_capabilities() {
+    let dir = temp_dir();
+    let source = write_file(&dir, "main.fx", "return 42;\n");
+    let bytecode = dir.join("main.fxb");
+    let runtime = RuntimeService::new();
+    let compiled = runtime.compile_source_path(&source).unwrap();
+    let metadata = BytecodeContainerMetadata::for_program(compiled.program.as_program())
+        .with_required_capability("fs.write");
+    fs::write(
+        &bytecode,
+        encode_container(compiled.program.as_program(), Some(metadata)).unwrap(),
+    )
+    .unwrap();
+    let mut request = RunBytecodeRequest::new(&bytecode);
+    request.profile = RuntimeProfile::Safe;
+
+    let error = runtime.run_bytecode(request).unwrap_err();
+
+    assert_eq!(error.exit_code, 70);
+    assert!(
+        error
+            .render()
+            .contains("policy denied `fs.write` for profile `safe`")
+    );
+}
+
+#[test]
+fn runtime_inspects_bytecode_container_metadata_without_execution() {
+    let dir = temp_dir();
+    let source = write_file(&dir, "main.fx", "return 42;\n");
+    let bytecode = dir.join("main.fxb");
+    let runtime = RuntimeService::new();
+    let compiled = runtime.compile_source_path(&source).unwrap();
+    let metadata = BytecodeContainerMetadata::for_program(compiled.program.as_program())
+        .with_module_name("demo");
+    fs::write(
+        &bytecode,
+        encode_container(compiled.program.as_program(), Some(metadata)).unwrap(),
+    )
+    .unwrap();
+
+    let inspected = runtime
+        .inspect_bytecode(ferrix_runtime::InspectBytecodeRequest { path: bytecode })
+        .unwrap();
+
+    assert!(
+        inspected
+            .diagnostics
+            .iter()
+            .any(|line| line == "module=demo")
+    );
+    assert!(
+        inspected
+            .diagnostics
+            .iter()
+            .any(|line| line.starts_with("checksum="))
+    );
+}
+
+#[test]
+fn custom_extension_registry_checks_policy_and_dispatches_handler() {
+    let mut registry = RuntimeExtensionRegistry::new();
+    registry.register(CustomExtension::new(
+        CustomExtensionMetadata {
+            id: "math.double".to_string(),
+            name: "Double".to_string(),
+            arity: 1,
+            output_register: Some(0),
+            required_capabilities: Vec::new(),
+            cost: ExtensionCostClass::Cheap,
+            docs: "Doubles an integer.".to_string(),
+        },
+        |args: &[Value]| {
+            let Value::Int(value) = args[0] else {
+                return Ok(Value::Nil);
+            };
+            Ok(Value::Int(value * 2))
+        },
+    ));
+    let policy = RuntimePolicy::new(RuntimeProfile::Trusted, []);
+
+    let result = registry
+        .call("math.double", &[Value::Int(21)], &policy)
+        .unwrap();
+
+    assert_eq!(result.value, Value::Int(42));
+    assert_eq!(
+        result.audit_event,
+        "custom_extension_called id=math.double arity=1"
+    );
+}
+
+#[test]
+fn custom_extension_registry_reports_missing_and_denied_handlers() {
+    let registry = RuntimeExtensionRegistry::new();
+    let safe_policy = RuntimePolicy::new(RuntimeProfile::Safe, []);
+
+    let missing = registry.call("missing", &[], &safe_policy).unwrap_err();
+
+    assert!(
+        missing
+            .render()
+            .contains("missing custom extension handler")
+    );
+
+    let mut registry = RuntimeExtensionRegistry::new();
+    registry.register(CustomExtension::new(
+        CustomExtensionMetadata {
+            id: "host.echo".to_string(),
+            name: "Echo".to_string(),
+            arity: 0,
+            output_register: None,
+            required_capabilities: Vec::new(),
+            cost: ExtensionCostClass::Normal,
+            docs: "Returns nil.".to_string(),
+        },
+        |_args: &[Value]| Ok(Value::Nil),
+    ));
+
+    let denied = registry.call("host.echo", &[], &safe_policy).unwrap_err();
+
+    assert!(
+        denied
+            .render()
+            .contains("policy denied `extension.call` for profile `safe`")
+    );
 }
 
 fn temp_dir() -> PathBuf {
