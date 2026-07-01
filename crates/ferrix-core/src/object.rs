@@ -30,6 +30,13 @@ pub enum Obj {
     Map(Vec<(Value, Value)>),
     /// Function object placeholder for callable object growth.
     Function(FunctionId),
+    /// First-class function closure with captured values.
+    Closure {
+        /// Function table entry executed when the closure is called.
+        function: FunctionId,
+        /// Values captured from the surrounding lexical environment.
+        captures: Vec<Value>,
+    },
     /// Native function metadata object placeholder.
     NativeFunction(String),
     /// Module object placeholder for richer module systems.
