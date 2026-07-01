@@ -29,6 +29,7 @@ pub struct Vm {
     executed_instruction_count: usize,
     registers: Vec<Value>,
     frames: Vec<CallFrame>,
+    exception_handlers: Vec<ExceptionHandler>,
     program_roots: Vec<ObjRef>,
     heap: Heap,
     gc_stats: VmGcStats,
@@ -52,6 +53,13 @@ pub struct CallFrame {
     pub captures: Vec<Value>,
     /// Caller register that should receive this frame's return value.
     pub return_dst: Option<Register>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExceptionHandler {
+    frame_depth: usize,
+    error_register: Register,
+    target_ip: usize,
 }
 
 /// Cumulative GC and allocation counters for one VM instance.
@@ -88,6 +96,7 @@ impl Vm {
             executed_instruction_count: 0,
             registers: Vec::new(),
             frames: Vec::new(),
+            exception_handlers: Vec::new(),
             program_roots: Vec::new(),
             heap: Heap::new(),
             gc_stats: VmGcStats::default(),
@@ -497,7 +506,25 @@ impl Vm {
                 } => {
                     self.array_set(ip, *array, *index, *value)?;
                 }
+                Instruction::PushHandler { error, target } => {
+                    self.push_exception_handler_for_chunk(
+                        ip,
+                        *error,
+                        *target,
+                        chunk.instructions.len(),
+                    )?;
+                }
+                Instruction::PopHandler => {
+                    self.pop_exception_handler();
+                }
+                Instruction::Throw { src } => {
+                    let value = self.read_register(ip, *src)?;
+                    if self.throw_value(ip, value)? {
+                        continue;
+                    }
+                }
                 Instruction::Return { src } => {
+                    self.clear_chunk_exception_handlers();
                     return self.read_register(ip, *src);
                 }
             }
@@ -509,6 +536,7 @@ impl Vm {
         self.executed_instruction_count = 0;
         self.registers = vec![Value::Nil; usize::from(chunk.register_count)];
         self.frames.clear();
+        self.exception_handlers.clear();
     }
 
     fn run_program_inner(
@@ -518,6 +546,7 @@ impl Vm {
         mut debugger: Option<&mut dyn Debugger>,
     ) -> Result<DebugOutcome, VmError> {
         self.frames.clear();
+        self.exception_handlers.clear();
         self.registers.clear();
         self.instruction_ip = 0;
         self.executed_instruction_count = 0;
@@ -768,8 +797,21 @@ impl Vm {
                 } => {
                     self.array_set(ip, array, index, value)?;
                 }
+                Instruction::PushHandler { error, target } => {
+                    self.push_exception_handler(ip, error, target, chunk.instructions.len())?;
+                }
+                Instruction::PopHandler => {
+                    self.pop_exception_handler();
+                }
+                Instruction::Throw { src } => {
+                    let value = self.read_register(ip, src)?;
+                    if self.throw_value(ip, value)? {
+                        continue;
+                    }
+                }
                 Instruction::Return { src } => {
                     let value = self.read_register(ip, src)?;
+                    self.clear_returning_frame_exception_handlers();
                     let returned_frame = self.frames.pop().expect("current frame exists");
                     if let Some(caller) = self.frames.last_mut() {
                         let return_dst = returned_frame
@@ -897,6 +939,123 @@ impl Vm {
             &captures,
             Some(ip),
         )?;
+        Ok(true)
+    }
+
+    fn push_exception_handler_for_chunk(
+        &mut self,
+        ip: usize,
+        error_register: Register,
+        target: JumpTarget,
+        instruction_count: usize,
+    ) -> Result<(), VmError> {
+        let target_ip = usize::try_from(target.0).map_err(|_| {
+            VmError::new(
+                Some(ip),
+                VmErrorKind::InvalidJumpTarget {
+                    target,
+                    instruction_count,
+                },
+            )
+        })?;
+        if target_ip >= instruction_count {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::InvalidJumpTarget {
+                    target,
+                    instruction_count,
+                },
+            ));
+        }
+
+        self.exception_handlers.push(ExceptionHandler {
+            frame_depth: 0,
+            error_register,
+            target_ip,
+        });
+        Ok(())
+    }
+
+    fn push_exception_handler(
+        &mut self,
+        ip: usize,
+        error_register: Register,
+        target: JumpTarget,
+        instruction_count: usize,
+    ) -> Result<(), VmError> {
+        let target_ip = usize::try_from(target.0).map_err(|_| {
+            VmError::new(
+                Some(ip),
+                VmErrorKind::InvalidJumpTarget {
+                    target,
+                    instruction_count,
+                },
+            )
+        })?;
+        if target_ip >= instruction_count {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::InvalidJumpTarget {
+                    target,
+                    instruction_count,
+                },
+            ));
+        }
+
+        self.exception_handlers.push(ExceptionHandler {
+            frame_depth: self.frames.len(),
+            error_register,
+            target_ip,
+        });
+        Ok(())
+    }
+
+    fn pop_exception_handler(&mut self) {
+        self.exception_handlers.pop();
+    }
+
+    fn clear_chunk_exception_handlers(&mut self) {
+        self.exception_handlers
+            .retain(|handler| handler.frame_depth != 0);
+    }
+
+    fn clear_returning_frame_exception_handlers(&mut self) {
+        let returning_depth = self.frames.len();
+        self.exception_handlers
+            .retain(|handler| handler.frame_depth < returning_depth);
+    }
+
+    fn throw_value(&mut self, ip: usize, value: Value) -> Result<bool, VmError> {
+        let Some(handler) = self.exception_handlers.pop() else {
+            return Err(VmError::new(Some(ip), VmErrorKind::UncaughtThrow { value }));
+        };
+
+        if handler.frame_depth == 0 {
+            write_register_in(Some(ip), &mut self.registers, handler.error_register, value)?;
+            self.instruction_ip = handler.target_ip;
+            return Ok(true);
+        }
+
+        while self.frames.len() > handler.frame_depth {
+            self.frames.pop();
+        }
+        let frame_index = handler
+            .frame_depth
+            .checked_sub(1)
+            .ok_or_else(|| VmError::new(Some(ip), VmErrorKind::UncaughtThrow { value }))?;
+        let frame = self
+            .frames
+            .get_mut(frame_index)
+            .ok_or_else(|| VmError::new(Some(ip), VmErrorKind::UncaughtThrow { value }))?;
+        write_register_in(
+            Some(ip),
+            &mut frame.registers,
+            handler.error_register,
+            value,
+        )?;
+        frame.ip = handler.target_ip;
+        self.registers = frame.registers.clone();
+        self.instruction_ip = handler.target_ip;
         Ok(true)
     }
 
