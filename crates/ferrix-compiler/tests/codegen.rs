@@ -2,7 +2,8 @@
 
 use ferrix_compiler::{
     CompileErrorKind, ImportedModuleAst, compile_program_ast_with_modules,
-    compile_program_ast_with_named_modules, compile_source, parse_source_with_file_id,
+    compile_program_ast_with_named_modules, compile_source, compile_source_with_report,
+    parse_source_with_file_id,
 };
 use ferrix_core::{
     Obj, Value,
@@ -25,6 +26,43 @@ return x + y;
     let result = Vm::new().run_program(&program).unwrap();
 
     assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compile_report_explains_features_dependencies_and_optimizations() {
+    let compiled = compile_source_with_report(
+        "\
+print(\"hello\");
+return len([1, 2, 3]);
+",
+    )
+    .unwrap();
+
+    assert!(
+        compiled
+            .report
+            .analysis
+            .required_features
+            .contains(&"arrays".to_string())
+    );
+    assert!(
+        compiled
+            .report
+            .analysis
+            .required_features
+            .contains(&"native-calls".to_string())
+    );
+    assert_eq!(
+        compiled.report.analysis.native_dependencies,
+        vec!["len".to_string(), "print".to_string()]
+    );
+    assert_eq!(
+        compiled.report.analysis.required_capabilities,
+        vec!["io.output".to_string(), "native.call".to_string()]
+    );
+    assert!(compiled.report.analysis.bytecode_instruction_count > 0);
+    assert!(!compiled.report.optimization.chunks.is_empty());
+    assert!(compiled.report.optimization.total_passes() > 0);
 }
 
 #[test]
