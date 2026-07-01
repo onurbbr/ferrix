@@ -88,6 +88,8 @@ pub enum RuntimeErrorKind {
     },
     /// Source compilation or runtime execution produced a rendered diagnostic.
     Diagnostic(String),
+    /// Runtime policy rejected a host-visible operation before execution.
+    PolicyDenied { message: String },
     /// Import graph loading found a cycle.
     ImportCycle { path: PathBuf },
     /// Bytecode serialization failed to decode.
@@ -151,6 +153,9 @@ impl RuntimeError {
                 )
             }
             RuntimeErrorKind::Diagnostic(rendered) => rendered.clone(),
+            RuntimeErrorKind::PolicyDenied { message } => {
+                format!("error: runtime policy denied request: {message}\n")
+            }
             RuntimeErrorKind::ImportCycle { path } => {
                 format!("error: import cycle involving `{}`\n", path.display())
             }
