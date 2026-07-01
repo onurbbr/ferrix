@@ -541,6 +541,76 @@ fn check_expr(
             }
             Ok(signature.return_type)
         }
+        Expr::MethodCall {
+            target,
+            method,
+            args,
+            span,
+        } => {
+            if args.len() > u8::MAX as usize {
+                return Err(CompileError::new(
+                    CompileErrorKind::TooManyArguments {
+                        max: u8::MAX as usize,
+                    },
+                    Some(*span),
+                ));
+            }
+
+            if let Some(callee) = namespaced_function_name(target, method)
+                && let Some(signature) = functions.get(&callee).cloned()
+            {
+                if signature.arity != args.len() {
+                    return Err(CompileError::new(
+                        CompileErrorKind::WrongCallArity {
+                            name: callee,
+                            expected: signature.arity,
+                            actual: args.len(),
+                        },
+                        Some(*span),
+                    ));
+                }
+                check_call_arguments(args, &signature.param_types, 0, scopes, functions)?;
+                return Ok(signature.return_type);
+            }
+
+            if let Expr::Variable { name, .. } = &**target
+                && scopes.resolve(name).is_none()
+                && !functions.contains_key(method)
+            {
+                return Err(undefined_name_error(
+                    &format!("{name}.{method}"),
+                    *span,
+                    NameUse::Function,
+                ));
+            }
+
+            let receiver_type = check_expr(target, scopes, functions)?;
+            let signature = functions.get(method).cloned().ok_or_else(|| {
+                CompileError::new(
+                    CompileErrorKind::UndefinedMethod {
+                        name: method.clone(),
+                    },
+                    Some(*span),
+                )
+            })?;
+            let expected_arg_count = signature.arity.saturating_sub(1);
+            if signature.arity == 0 || expected_arg_count != args.len() {
+                return Err(CompileError::new(
+                    CompileErrorKind::WrongCallArity {
+                        name: method.clone(),
+                        expected: expected_arg_count,
+                        actual: args.len(),
+                    },
+                    Some(*span),
+                ));
+            }
+
+            if let Some(expected_receiver) = signature.param_types.first().copied() {
+                expect_assignable(expected_receiver, receiver_type, target.span())?;
+            }
+            check_call_arguments(args, &signature.param_types, 1, scopes, functions)?;
+            Ok(signature.return_type)
+        }
         Expr::Function {
             params,
             param_types,
@@ -642,6 +712,29 @@ fn namespaced_field_type(target: &Expr, field: &str, scopes: &ScopeStack) -> Opt
         return None;
     };
     scopes.resolve(&format!("{name}.{field}"))
+}
+
+fn namespaced_function_name(target: &Expr, method: &str) -> Option<String> {
+    let Expr::Variable { name, .. } = target else {
+        return None;
+    };
+    Some(format!("{name}.{method}"))
+}
+
+fn check_call_arguments(
+    args: &[Expr],
+    param_types: &[SourceType],
+    offset: usize,
+    scopes: &mut ScopeStack,
+    functions: &HashMap<String, FunctionSignature>,
+) -> Result<(), CompileError> {
+    for (index, arg) in args.iter().enumerate() {
+        let found = check_expr(arg, scopes, functions)?;
+        if let Some(expected) = param_types.get(index + offset).copied() {
+            expect_assignable(expected, found, arg.span())?;
+        }
+    }
+    Ok(())
 }
 
 fn expect_assignable(
