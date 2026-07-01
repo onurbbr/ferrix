@@ -96,6 +96,10 @@ pub enum RuntimeErrorKind {
     Execution(String),
     /// The selected runtime mode needs a daemon that is not available yet.
     RuntimeUnavailable { mode: RuntimeMode },
+    /// A start request targeted a service that is already running.
+    ServiceAlreadyRunning,
+    /// A stop request targeted a service that is not running.
+    ServiceNotRunning,
     /// Runtime daemon state or process metadata operation failed.
     DaemonState { message: String },
 }
@@ -162,11 +166,13 @@ impl RuntimeError {
             RuntimeErrorKind::RuntimeUnavailable {
                 mode: RuntimeMode::Managed,
             } => {
-                "Ferrix managed runtime mode is not available yet.\nUse FERRIX_RUNTIME_MODE=embedded for local execution.\n".to_string()
+                "Ferrix managed runtime mode is not available yet.\nUse --runtime-mode embedded for local execution.\n".to_string()
             }
             RuntimeErrorKind::RuntimeUnavailable {
                 mode: RuntimeMode::Embedded,
             } => "Ferrix embedded runtime is not available.\n".to_string(),
+            RuntimeErrorKind::ServiceAlreadyRunning => "Service is already running\n".to_string(),
+            RuntimeErrorKind::ServiceNotRunning => "Service is not running\n".to_string(),
             RuntimeErrorKind::DaemonState { message } => {
                 format!("error: runtime daemon state error: {message}\n")
             }
