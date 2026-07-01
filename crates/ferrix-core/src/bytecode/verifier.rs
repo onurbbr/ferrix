@@ -6,8 +6,8 @@
 use std::{error::Error, fmt};
 
 use crate::bytecode::{
-    BYTECODE_MAGIC, BytecodeLimits, CURRENT_BYTECODE_VERSION, Chunk, ConstId, FunctionId,
-    FunctionKind, Instruction, JumpTarget, Program, Register, StringId,
+    BYTECODE_MAGIC, BytecodeLimits, CURRENT_BYTECODE_VERSION, CaptureId, Chunk, ConstId,
+    FunctionId, FunctionKind, Instruction, JumpTarget, Program, Register, StringId,
 };
 
 /// Wrapper proving a chunk passed structural verification.
@@ -96,6 +96,15 @@ pub enum VerificationErrorKind {
         args_start: Register,
         arg_count: u8,
         register_count: u8,
+    },
+    ClosureCapturesOutOfRange {
+        captures_start: Register,
+        capture_count: u8,
+        register_count: u8,
+    },
+    InvalidCapture {
+        capture: CaptureId,
+        capture_count: u8,
     },
     ArrayElementsOutOfRange {
         elements_start: Register,
@@ -286,6 +295,11 @@ impl StructuralVerifier {
                 args_start,
                 arg_count,
                 ..
+            }
+            | Instruction::CallValue {
+                args_start,
+                arg_count,
+                ..
             } = instruction
                 && *arg_count > 0
             {
@@ -302,6 +316,41 @@ impl StructuralVerifier {
                         },
                     ));
                 }
+            }
+
+            if let Instruction::MakeClosure {
+                captures_start,
+                capture_count,
+                ..
+            } = instruction
+                && *capture_count > 0
+            {
+                let start = usize::from(captures_start.0);
+                let end = start + usize::from(*capture_count);
+                if end > usize::from(chunk.register_count) {
+                    return Err(VerificationError::new(
+                        None,
+                        Some(ip),
+                        VerificationErrorKind::ClosureCapturesOutOfRange {
+                            captures_start: *captures_start,
+                            capture_count: *capture_count,
+                            register_count: chunk.register_count,
+                        },
+                    ));
+                }
+            }
+
+            if let Some(capture) = instruction.capture_operand()
+                && capture.0 >= chunk.capture_count
+            {
+                return Err(VerificationError::new(
+                    None,
+                    Some(ip),
+                    VerificationErrorKind::InvalidCapture {
+                        capture,
+                        capture_count: chunk.capture_count,
+                    },
+                ));
             }
 
             if let Instruction::ArrayNew {
@@ -438,6 +487,34 @@ impl ProgramVerifier {
                                 ));
                             }
                         }
+
+                        if let Instruction::MakeClosure {
+                            function,
+                            capture_count,
+                            ..
+                        } = instruction
+                        {
+                            let Some(callee) = program.function(*function) else {
+                                return Err(VerificationError::new(
+                                    Some(function_id),
+                                    Some(ip),
+                                    VerificationErrorKind::InvalidFunction {
+                                        function: *function,
+                                        function_count: program.functions.len(),
+                                    },
+                                ));
+                            };
+
+                            if callee.capture_count != *capture_count {
+                                return Err(VerificationError::new(
+                                    Some(function_id),
+                                    Some(ip),
+                                    VerificationErrorKind::FunctionMetadataMismatch {
+                                        field: "capture_count",
+                                    },
+                                ));
+                            }
+                        }
                     }
                 }
                 FunctionKind::Native { name } => {
@@ -481,6 +558,16 @@ fn validate_function_chunk_metadata(
         ));
     }
 
+    if function.capture_count != chunk.capture_count {
+        return Err(VerificationError::new(
+            Some(function_id),
+            None,
+            VerificationErrorKind::FunctionMetadataMismatch {
+                field: "capture_count",
+            },
+        ));
+    }
+
     Ok(())
 }
 
@@ -503,6 +590,16 @@ fn validate_native_function_metadata(
             None,
             VerificationErrorKind::FunctionMetadataMismatch {
                 field: "register_count",
+            },
+        ));
+    }
+
+    if function.capture_count != 0 {
+        return Err(VerificationError::new(
+            Some(function_id),
+            None,
+            VerificationErrorKind::FunctionMetadataMismatch {
+                field: "capture_count",
             },
         ));
     }
@@ -627,6 +724,21 @@ impl fmt::Display for VerificationError {
             } => write!(
                 f,
                 "call arguments starting at {args_start} with count {arg_count} exceed {register_count} registers"
+            ),
+            VerificationErrorKind::ClosureCapturesOutOfRange {
+                captures_start,
+                capture_count,
+                register_count,
+            } => write!(
+                f,
+                "closure captures starting at {captures_start} with count {capture_count} exceed {register_count} registers"
+            ),
+            VerificationErrorKind::InvalidCapture {
+                capture,
+                capture_count,
+            } => write!(
+                f,
+                "invalid capture {capture}; function has {capture_count} captures"
             ),
             VerificationErrorKind::ArrayElementsOutOfRange {
                 elements_start,
