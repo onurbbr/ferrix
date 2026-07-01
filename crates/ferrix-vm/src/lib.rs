@@ -18,5 +18,5 @@ pub use limits::RuntimeLimits;
 pub use native::{
     HostCapability, HostCapabilityParseError, NativeContext, NullOutput, OutputWriter,
 };
-pub use runtime::{CallFrame, Vm, VmGcStats};
+pub use runtime::{CallFrame, Vm, VmExecutionStats, VmGcStats};
 pub use trace::TraceWriter;
