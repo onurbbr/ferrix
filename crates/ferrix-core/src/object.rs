@@ -28,6 +28,8 @@ pub enum Obj {
     Array(Vec<Value>),
     /// Mutable map represented as insertion-ordered key/value pairs.
     Map(Vec<(Value, Value)>),
+    /// Mutable record with insertion-ordered named fields.
+    Record(Vec<(String, Value)>),
     /// Shared mutable cell used by closures to capture variables by reference.
     Upvalue(Value),
     /// Function object placeholder for callable object growth.
