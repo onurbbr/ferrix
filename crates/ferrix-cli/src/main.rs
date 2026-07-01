@@ -264,6 +264,21 @@ fn compile_file(
             .expect("stderr write failed");
             return Err(66);
         }
+        Err(LoadError::ReadImport {
+            importer,
+            module,
+            path,
+            error,
+        }) => {
+            writeln!(
+                stderr,
+                "error: could not resolve import `{module}` from `{}` as `{}`: {error}",
+                importer.display(),
+                path.display()
+            )
+            .expect("stderr write failed");
+            return Err(66);
+        }
         Err(LoadError::Compile(error)) => {
             write!(
                 stderr,
@@ -306,6 +321,13 @@ struct LoadedGraph {
 enum LoadError {
     /// A source file could not be read from disk.
     Read { path: PathBuf, error: io::Error },
+    /// An imported source file could not be resolved relative to its importer.
+    ReadImport {
+        importer: PathBuf,
+        module: String,
+        path: PathBuf,
+        error: io::Error,
+    },
     /// Lexing/parsing one source file failed.
     Compile(CompileError),
     /// Recursive imports reached a file already on the active load stack.
@@ -362,9 +384,22 @@ fn load_module(
 
     for module in module_imports(&ast) {
         let import_path = resolve_import(path, module);
-        if let Some(module_ast) =
-            load_module(&import_path, read_file, sources, loaded, visiting, modules)?
-        {
+        let loaded_module =
+            load_module(&import_path, read_file, sources, loaded, visiting, modules).map_err(
+                |error| match error {
+                    LoadError::Read {
+                        path: missing_path,
+                        error,
+                    } => LoadError::ReadImport {
+                        importer: path.to_path_buf(),
+                        module: module.to_string(),
+                        path: missing_path,
+                        error,
+                    },
+                    error => error,
+                },
+            )?;
+        if let Some(module_ast) = loaded_module {
             modules.push(ImportedModuleAst {
                 name: module.to_string(),
                 ast: module_ast,
