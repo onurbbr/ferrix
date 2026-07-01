@@ -267,6 +267,33 @@ fn runtime_protocol_info_reports_compatible_features() {
 }
 
 #[test]
+fn runtime_protocol_handshake_and_mismatch_are_golden_tested() {
+    let info = RuntimeProtocolInfo::current();
+
+    assert_eq!(
+        info.encode(),
+        format!(
+            "{}\t1.0\t1.0\t1.0\truntime.lifecycle,process.history,bytecode.container,request.identity,middleware.basic",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+
+    let mismatch = ferrix_runtime::RuntimeError::new(
+        70,
+        ferrix_runtime::RuntimeErrorKind::ProtocolMismatch {
+            cli_supported: "1.0-1.0".to_string(),
+            daemon_protocol: "2.0".to_string(),
+        },
+    );
+
+    assert_eq!(
+        mismatch.render(),
+        "Ferrix runtime protocol mismatch.\nCLI supports protocol 1.0-1.0, daemon speaks protocol 2.0.\n"
+    );
+    assert_eq!(mismatch.category(), "protocol_mismatch");
+}
+
+#[test]
 fn middleware_injects_request_identity_and_rate_limits() {
     let mut middleware = RuntimeMiddlewareChain::new(30_000, 1);
     let first = middleware
