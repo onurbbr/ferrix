@@ -57,6 +57,7 @@ impl RuntimeController {
             RuntimeMode::Embedded => Ok(RuntimeConnection::Local(self.daemon.clone())),
             RuntimeMode::Required => {
                 if self.daemon.ping()? {
+                    self.daemon.check_protocol_compatibility()?;
                     Ok(RuntimeConnection::Socket(self.daemon.clone()))
                 } else {
                     Err(RuntimeError::new(
@@ -69,6 +70,7 @@ impl RuntimeController {
             }
             RuntimeMode::Managed => {
                 if self.daemon.ping()? {
+                    self.daemon.check_protocol_compatibility()?;
                     Ok(RuntimeConnection::Socket(self.daemon.clone()))
                 } else {
                     self.daemon.ensure_started()?;
