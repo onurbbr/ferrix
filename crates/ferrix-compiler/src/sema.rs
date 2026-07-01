@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{BinaryOp, Expr, Literal, ProgramAst, Stmt},
+    ast::{BinaryOp, Expr, Literal, ProgramAst, Stmt, TypeAnnotation, TypeAnnotationKind},
     error::{CompileError, CompileErrorKind},
 };
 
@@ -15,6 +15,7 @@ const BUILTIN_FUNCTIONS: &[(&str, usize)] = &[("print", 1), ("len", 1), ("type_o
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceType {
+    Any,
     Unknown,
     Nil,
     Bool,
@@ -29,6 +30,7 @@ enum SourceType {
 impl SourceType {
     fn name(self) -> &'static str {
         match self {
+            Self::Any => "any",
             Self::Unknown => "unknown",
             Self::Nil => "nil",
             Self::Bool => "bool",
@@ -42,13 +44,14 @@ impl SourceType {
     }
 
     fn is_known(self) -> bool {
-        !matches!(self, Self::Unknown | Self::Nil)
+        !matches!(self, Self::Any | Self::Unknown | Self::Nil)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FunctionSignature {
     arity: usize,
+    param_types: Vec<SourceType>,
     return_type: SourceType,
 }
 
@@ -126,18 +129,27 @@ pub fn analyze_with_function_aliases(
 
     for stmt in &program.statements {
         if !matches!(stmt, Stmt::Function { .. }) {
-            check_stmt(stmt, &mut scopes, &functions)?;
+            check_stmt(stmt, &mut scopes, &functions, SourceType::Unknown)?;
         }
     }
 
     for stmt in &program.statements {
         if let Stmt::Function {
-            params, body, span, ..
+            name,
+            params,
+            param_types,
+            body,
+            span,
+            ..
         } = stmt
         {
+            let return_type = functions
+                .get(name)
+                .map(|signature| signature.return_type)
+                .unwrap_or(SourceType::Unknown);
             let mut function_scopes = ScopeStack::new();
-            declare_parameters(params, *span, &mut function_scopes)?;
-            check_scoped_statements(body, &mut function_scopes, &functions)?;
+            declare_parameters(params, param_types, *span, &mut function_scopes)?;
+            check_scoped_statements(body, &mut function_scopes, &functions, return_type)?;
         }
     }
 
@@ -155,6 +167,7 @@ fn collect_functions(
                 (*name).to_string(),
                 FunctionSignature {
                     arity: *arity,
+                    param_types: vec![SourceType::Unknown; *arity],
                     return_type: builtin_return_type(name),
                 },
             )
@@ -163,14 +176,23 @@ fn collect_functions(
 
     for stmt in &program.statements {
         if let Stmt::Function {
-            name, params, span, ..
+            name,
+            params,
+            param_types,
+            return_type,
+            span,
+            ..
         } = stmt
             && functions
                 .insert(
                     name.clone(),
                     FunctionSignature {
                         arity: params.len(),
-                        return_type: SourceType::Unknown,
+                        param_types: param_types.iter().map(annotation_type_or_unknown).collect(),
+                        return_type: return_type
+                            .as_ref()
+                            .map(source_type_from_annotation)
+                            .unwrap_or(SourceType::Unknown),
                     },
                 )
                 .is_some()
@@ -183,7 +205,7 @@ fn collect_functions(
     }
 
     for (alias, target) in aliases {
-        if let Some(signature) = functions.get(target).copied() {
+        if let Some(signature) = functions.get(target).cloned() {
             functions.entry(alias.clone()).or_insert(signature);
         }
     }
@@ -204,9 +226,10 @@ fn check_scoped_statements(
     stmts: &[Stmt],
     scopes: &mut ScopeStack,
     functions: &HashMap<String, FunctionSignature>,
+    return_type: SourceType,
 ) -> Result<(), CompileError> {
     scopes.push_scope();
-    let result = check_statements(stmts, scopes, functions);
+    let result = check_statements(stmts, scopes, functions, return_type);
     scopes.pop_scope();
     result
 }
@@ -215,9 +238,10 @@ fn check_statements(
     stmts: &[Stmt],
     scopes: &mut ScopeStack,
     functions: &HashMap<String, FunctionSignature>,
+    return_type: SourceType,
 ) -> Result<(), CompileError> {
     for stmt in stmts {
-        check_stmt(stmt, scopes, functions)?;
+        check_stmt(stmt, scopes, functions, return_type)?;
     }
 
     Ok(())
@@ -227,15 +251,24 @@ fn check_stmt(
     stmt: &Stmt,
     scopes: &mut ScopeStack,
     functions: &HashMap<String, FunctionSignature>,
+    return_type: SourceType,
 ) -> Result<(), CompileError> {
     match stmt {
         Stmt::Import { .. } | Stmt::Function { .. } => Ok(()),
         Stmt::Let {
             name,
+            type_annotation,
             initializer,
             span,
             ..
-        } => check_let(name, initializer, *span, scopes, functions),
+        } => check_let(
+            name,
+            type_annotation.as_ref(),
+            initializer,
+            *span,
+            scopes,
+            functions,
+        ),
         Stmt::Assign { name, value, span } => {
             if !scopes.contains(name) {
                 return Err(undefined_name_error(name, *span, NameUse::Variable));
@@ -269,7 +302,11 @@ fn check_stmt(
             check_expr(value, scopes, functions)?;
             Ok(())
         }
-        Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
+        Stmt::Return { value, .. } => {
+            let found = check_expr(value, scopes, functions)?;
+            expect_assignable(return_type, found, value.span())
+        }
+        Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
             check_expr(value, scopes, functions).map(|_| ())
         }
         Stmt::TryCatch {
@@ -278,10 +315,10 @@ fn check_stmt(
             catch_branch,
             ..
         } => {
-            check_scoped_statements(try_branch, scopes, functions)?;
+            check_scoped_statements(try_branch, scopes, functions, return_type)?;
             scopes.push_scope();
             scopes.declare(catch_name.clone(), SourceType::Unknown);
-            let result = check_statements(catch_branch, scopes, functions);
+            let result = check_statements(catch_branch, scopes, functions, return_type);
             scopes.pop_scope();
             result
         }
@@ -293,22 +330,25 @@ fn check_stmt(
         } => {
             let condition_type = check_expr(condition, scopes, functions)?;
             expect_type(SourceType::Bool, condition_type, condition.span())?;
-            check_scoped_statements(then_branch, scopes, functions)?;
-            check_scoped_statements(else_branch, scopes, functions)
+            check_scoped_statements(then_branch, scopes, functions, return_type)?;
+            check_scoped_statements(else_branch, scopes, functions, return_type)
         }
         Stmt::While {
             condition, body, ..
         } => {
             let condition_type = check_expr(condition, scopes, functions)?;
             expect_type(SourceType::Bool, condition_type, condition.span())?;
-            check_scoped_statements(body, scopes, functions)
+            check_scoped_statements(body, scopes, functions, return_type)
         }
-        Stmt::Block { statements, .. } => check_scoped_statements(statements, scopes, functions),
+        Stmt::Block { statements, .. } => {
+            check_scoped_statements(statements, scopes, functions, return_type)
+        }
     }
 }
 
 fn check_let(
     name: &str,
+    type_annotation: Option<&TypeAnnotation>,
     initializer: &Expr,
     span: ferrix_core::diagnostics::SourceSpan,
     scopes: &mut ScopeStack,
@@ -323,18 +363,27 @@ fn check_let(
         ));
     }
 
+    let annotated_type = type_annotation.map(source_type_from_annotation);
     if matches!(initializer, Expr::Function { .. }) {
-        scopes.declare(name.to_string(), SourceType::Function);
-        check_expr(initializer, scopes, functions).map(|_| ())
+        let declared_type = annotated_type.unwrap_or(SourceType::Function);
+        scopes.declare(name.to_string(), declared_type);
+        let found = check_expr(initializer, scopes, functions)?;
+        expect_assignable(declared_type, found, initializer.span())
     } else {
         let source_type = check_expr(initializer, scopes, functions)?;
-        scopes.declare(name.to_string(), source_type);
+        if let Some(expected) = annotated_type {
+            expect_assignable(expected, source_type, initializer.span())?;
+            scopes.declare(name.to_string(), expected);
+        } else {
+            scopes.declare(name.to_string(), source_type);
+        }
         Ok(())
     }
 }
 
 fn declare_parameters(
     params: &[String],
+    param_types: &[Option<TypeAnnotation>],
     span: ferrix_core::diagnostics::SourceSpan,
     scopes: &mut ScopeStack,
 ) -> Result<(), CompileError> {
@@ -347,7 +396,7 @@ fn declare_parameters(
         ));
     }
 
-    for param in params {
+    for (index, param) in params.iter().enumerate() {
         if scopes.contains_current(param) {
             return Err(CompileError::new(
                 CompileErrorKind::DuplicateParameter {
@@ -356,7 +405,12 @@ fn declare_parameters(
                 Some(span),
             ));
         }
-        scopes.declare(param.clone(), SourceType::Unknown);
+        let source_type = param_types
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(source_type_from_annotation)
+            .unwrap_or(SourceType::Unknown);
+        scopes.declare(param.clone(), source_type);
     }
 
     Ok(())
@@ -466,7 +520,7 @@ fn check_expr(
 
             let signature = functions
                 .get(callee)
-                .copied()
+                .cloned()
                 .ok_or_else(|| undefined_name_error(callee, *span, NameUse::Function))?;
             if signature.arity != args.len() {
                 return Err(CompileError::new(
@@ -479,16 +533,29 @@ fn check_expr(
                 ));
             }
 
-            for arg in args {
-                check_expr(arg, scopes, functions)?;
+            for (index, arg) in args.iter().enumerate() {
+                let found = check_expr(arg, scopes, functions)?;
+                if let Some(expected) = signature.param_types.get(index).copied() {
+                    expect_assignable(expected, found, arg.span())?;
+                }
             }
             Ok(signature.return_type)
         }
-        Expr::Function { params, body, span } => {
+        Expr::Function {
+            params,
+            param_types,
+            return_type,
+            body,
+            span,
+        } => {
             let mut function_scopes = scopes.clone();
             function_scopes.push_scope();
-            declare_parameters(params, *span, &mut function_scopes)?;
-            check_scoped_statements(body, &mut function_scopes, functions)?;
+            declare_parameters(params, param_types, *span, &mut function_scopes)?;
+            let return_type = return_type
+                .as_ref()
+                .map(source_type_from_annotation)
+                .unwrap_or(SourceType::Unknown);
+            check_scoped_statements(body, &mut function_scopes, functions, return_type)?;
             Ok(SourceType::Function)
         }
         Expr::Grouping { expr, .. } => check_expr(expr, scopes, functions),
@@ -501,6 +568,27 @@ fn literal_type(value: &Literal) -> SourceType {
         Literal::Bool(_) => SourceType::Bool,
         Literal::String(_) => SourceType::String,
         Literal::Nil => SourceType::Nil,
+    }
+}
+
+fn annotation_type_or_unknown(annotation: &Option<TypeAnnotation>) -> SourceType {
+    annotation
+        .as_ref()
+        .map(source_type_from_annotation)
+        .unwrap_or(SourceType::Unknown)
+}
+
+fn source_type_from_annotation(annotation: &TypeAnnotation) -> SourceType {
+    match annotation.kind {
+        TypeAnnotationKind::Any => SourceType::Any,
+        TypeAnnotationKind::Nil => SourceType::Nil,
+        TypeAnnotationKind::Bool => SourceType::Bool,
+        TypeAnnotationKind::Int => SourceType::Int,
+        TypeAnnotationKind::String => SourceType::String,
+        TypeAnnotationKind::Array => SourceType::Array,
+        TypeAnnotationKind::Map => SourceType::Map,
+        TypeAnnotationKind::Record => SourceType::Record,
+        TypeAnnotationKind::Function => SourceType::Function,
     }
 }
 
@@ -581,7 +669,7 @@ fn expect_type(
 }
 
 fn merge_assignment_type(previous: SourceType, assigned: SourceType) -> SourceType {
-    if previous.is_known() && assigned == SourceType::Nil {
+    if previous == SourceType::Any || (previous.is_known() && assigned == SourceType::Nil) {
         previous
     } else {
         assigned
