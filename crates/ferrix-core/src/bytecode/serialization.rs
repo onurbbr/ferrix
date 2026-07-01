@@ -307,6 +307,19 @@ impl Encoder {
                 self.reg(*entries_start);
                 self.u8(*entry_count);
             }
+            Instruction::RecordNew {
+                dst,
+                fields_start,
+                fields,
+            } => {
+                self.u8(36);
+                self.reg(*dst);
+                self.reg(*fields_start);
+                self.u8(fields.len().try_into().unwrap_or(u8::MAX));
+                for field in fields {
+                    self.u16(field.0);
+                }
+            }
             Instruction::IndexGet { dst, target, index } => {
                 self.three_reg(20, *dst, *target, *index)
             }
@@ -321,6 +334,22 @@ impl Encoder {
                 index,
                 value,
             } => self.three_reg(23, *array, *index, *value),
+            Instruction::FieldGet { dst, target, field } => {
+                self.u8(37);
+                self.reg(*dst);
+                self.reg(*target);
+                self.u16(field.0);
+            }
+            Instruction::FieldSet {
+                target,
+                field,
+                value,
+            } => {
+                self.u8(38);
+                self.reg(*target);
+                self.u16(field.0);
+                self.reg(*value);
+            }
             Instruction::PushHandler { error, target } => {
                 self.u8(33);
                 self.reg(*error);
@@ -602,6 +631,20 @@ impl Decoder<'_> {
                 entries_start: self.reg()?,
                 entry_count: self.u8()?,
             },
+            36 => {
+                let dst = self.reg()?;
+                let fields_start = self.reg()?;
+                let field_count = self.u8()?;
+                let mut fields = Vec::with_capacity(usize::from(field_count));
+                for _ in 0..field_count {
+                    fields.push(crate::bytecode::StringId(self.u16()?));
+                }
+                Instruction::RecordNew {
+                    dst,
+                    fields_start,
+                    fields,
+                }
+            }
             20 => {
                 self.three_reg(|dst, target, index| Instruction::IndexGet { dst, target, index })?
             }
@@ -631,6 +674,16 @@ impl Decoder<'_> {
                     value,
                 }
             }
+            37 => Instruction::FieldGet {
+                dst: self.reg()?,
+                target: self.reg()?,
+                field: crate::bytecode::StringId(self.u16()?),
+            },
+            38 => Instruction::FieldSet {
+                target: self.reg()?,
+                field: crate::bytecode::StringId(self.u16()?),
+                value: self.reg()?,
+            },
             33 => Instruction::PushHandler {
                 error: self.reg()?,
                 target: JumpTarget(self.u32()?),
