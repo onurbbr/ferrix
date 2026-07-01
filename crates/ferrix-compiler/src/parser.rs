@@ -6,7 +6,7 @@
 use ferrix_core::diagnostics::SourceSpan;
 
 use crate::{
-    ast::{BinaryOp, Expr, Literal, ProgramAst, Stmt},
+    ast::{BinaryOp, Expr, Literal, ProgramAst, Stmt, TypeAnnotation, TypeAnnotationKind},
     error::{CompileError, CompileErrorKind},
     lexer::{Token, TokenKind},
 };
@@ -119,21 +119,12 @@ impl Parser {
 
         self.consume(&TokenKind::LeftParen, "`(`")?;
         let mut params = Vec::new();
+        let mut param_types = Vec::new();
         if !self.check(&TokenKind::RightParen) {
             loop {
-                let param_token = self.advance().clone();
-                match param_token.kind {
-                    TokenKind::Identifier(param) => params.push(param),
-                    found => {
-                        return Err(self.error(
-                            CompileErrorKind::UnexpectedToken {
-                                expected: "parameter name".to_string(),
-                                found: found.describe(),
-                            },
-                            param_token.span,
-                        ));
-                    }
-                }
+                let (param, annotation) = self.parameter()?;
+                params.push(param);
+                param_types.push(annotation);
 
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
@@ -141,11 +132,18 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RightParen, "`)`")?;
+        let return_type = if self.match_kind(&TokenKind::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         let (body, end) = self.block()?;
 
         Ok(Stmt::Function {
             name,
             params,
+            param_types,
+            return_type,
             body,
             exported,
             span: join(start, end),
@@ -167,12 +165,18 @@ impl Parser {
             }
         };
 
+        let type_annotation = if self.match_kind(&TokenKind::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         self.consume(&TokenKind::Equal, "`=`")?;
         let initializer = self.expression()?;
         let end = self.consume(&TokenKind::Semicolon, "`;`")?.span;
 
         Ok(Stmt::Let {
             name,
+            type_annotation,
             initializer,
             exported,
             span: join(start, end),
@@ -543,21 +547,12 @@ impl Parser {
     fn function_literal(&mut self, start: SourceSpan) -> Result<Expr, CompileError> {
         self.consume(&TokenKind::LeftParen, "`(`")?;
         let mut params = Vec::new();
+        let mut param_types = Vec::new();
         if !self.check(&TokenKind::RightParen) {
             loop {
-                let param_token = self.advance().clone();
-                match param_token.kind {
-                    TokenKind::Identifier(param) => params.push(param),
-                    found => {
-                        return Err(self.error(
-                            CompileErrorKind::UnexpectedToken {
-                                expected: "parameter name".to_string(),
-                                found: found.describe(),
-                            },
-                            param_token.span,
-                        ));
-                    }
-                }
+                let (param, annotation) = self.parameter()?;
+                params.push(param);
+                param_types.push(annotation);
 
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
@@ -565,12 +560,74 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RightParen, "`)`")?;
+        let return_type = if self.match_kind(&TokenKind::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         let (body, end) = self.block()?;
 
         Ok(Expr::Function {
             params,
+            param_types,
+            return_type,
             body,
             span: join(start, end),
+        })
+    }
+
+    fn parameter(&mut self) -> Result<(String, Option<TypeAnnotation>), CompileError> {
+        let param_token = self.advance().clone();
+        let TokenKind::Identifier(param) = param_token.kind else {
+            return Err(self.error(
+                CompileErrorKind::UnexpectedToken {
+                    expected: "parameter name".to_string(),
+                    found: param_token.kind.describe(),
+                },
+                param_token.span,
+            ));
+        };
+
+        let annotation = if self.match_kind(&TokenKind::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
+        Ok((param, annotation))
+    }
+
+    fn type_annotation(&mut self) -> Result<TypeAnnotation, CompileError> {
+        let token = self.advance().clone();
+        let kind = match token.kind {
+            TokenKind::Identifier(name) => match name.as_str() {
+                "any" => TypeAnnotationKind::Any,
+                "nil" => TypeAnnotationKind::Nil,
+                "bool" => TypeAnnotationKind::Bool,
+                "int" => TypeAnnotationKind::Int,
+                "string" => TypeAnnotationKind::String,
+                "array" => TypeAnnotationKind::Array,
+                "map" => TypeAnnotationKind::Map,
+                "record" => TypeAnnotationKind::Record,
+                "function" => TypeAnnotationKind::Function,
+                _ => {
+                    return Err(self.error(CompileErrorKind::UnknownType { name }, token.span));
+                }
+            },
+            TokenKind::Fn => TypeAnnotationKind::Function,
+            found => {
+                return Err(self.error(
+                    CompileErrorKind::UnexpectedToken {
+                        expected: "type name".to_string(),
+                        found: found.describe(),
+                    },
+                    token.span,
+                ));
+            }
+        };
+
+        Ok(TypeAnnotation {
+            kind,
+            span: token.span,
         })
     }
 
