@@ -63,6 +63,11 @@ pub enum VmErrorKind {
         function: FunctionId,
         function_count: usize,
     },
+    /// Tried to load a capture outside the current closure environment.
+    InvalidCapture {
+        capture: ferrix_core::bytecode::CaptureId,
+        capture_count: usize,
+    },
     /// Program declared a native function that was not registered in the VM.
     MissingNativeFunction { function: FunctionId },
     /// Call stack exceeded [`RuntimeLimits`](crate::RuntimeLimits).
@@ -206,6 +211,13 @@ impl fmt::Display for VmError {
             } => write!(
                 f,
                 "invalid function {function}; program has {function_count} functions"
+            ),
+            VmErrorKind::InvalidCapture {
+                capture,
+                capture_count,
+            } => write!(
+                f,
+                "invalid capture {capture}; frame has {capture_count} captures"
             ),
             VmErrorKind::MissingNativeFunction { function } => {
                 write!(f, "missing native implementation for {function}")
