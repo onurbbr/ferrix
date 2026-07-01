@@ -14,10 +14,11 @@ use ferrix_core::{
 };
 use ferrix_runtime::{
     CustomExtension, CustomExtensionMetadata, ExtensionCostClass, HostCapability,
-    RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus, RuntimeEventKind,
-    RuntimeEventMetadata, RuntimeEventSeverity, RuntimeExtensionRegistry, RuntimeGateway,
-    RuntimeMode, RuntimePolicy, RuntimeProcessKind, RuntimeProcessStatus, RuntimeProfile,
-    RuntimeService, RuntimeSessionId,
+    RunBytecodeRequest, RunSourceRequest, RuntimeConfig, RuntimeDaemon, RuntimeEventBus,
+    RuntimeEventKind, RuntimeEventMetadata, RuntimeEventSeverity, RuntimeExtensionRegistry,
+    RuntimeGateway, RuntimeLogLevel, RuntimeMiddlewareChain, RuntimeMode, RuntimePolicy,
+    RuntimeProcessKind, RuntimeProcessStatus, RuntimeProfile, RuntimeProtocolInfo,
+    RuntimeProtocolVersion, RuntimeService, RuntimeSessionId,
 };
 
 #[test]
@@ -213,6 +214,98 @@ fn runtime_mode_parses_configuration_names() {
         RuntimeMode::Managed
     );
     assert!("daemon".parse::<RuntimeMode>().is_err());
+}
+
+#[test]
+fn runtime_config_loads_local_file_without_environment_values() {
+    let dir = temp_dir();
+    let config_path = write_file(
+        &dir,
+        "config.toml",
+        "\
+[runtime]
+mode = \"managed\"
+home = \"services/custom-runtime\"
+auto_start = false
+default_profile = \"server\"
+log_level = \"debug\"
+audit_enabled = true
+stats_enabled = true
+request_timeout_ms = 5000
+max_concurrent_processes = 3
+rate_limit_per_second = 9
+",
+    );
+
+    let config = RuntimeConfig::load(&config_path).unwrap();
+
+    assert_eq!(config.mode, RuntimeMode::Managed);
+    assert_eq!(
+        config.resolved_home(&dir),
+        dir.join("services/custom-runtime")
+    );
+    assert!(!config.auto_start);
+    assert_eq!(config.default_profile, RuntimeProfile::Server);
+    assert_eq!(config.log_level, RuntimeLogLevel::Debug);
+    assert!(config.audit_enabled);
+    assert!(config.stats_enabled);
+    assert_eq!(config.request_timeout_ms, 5000);
+    assert_eq!(config.max_concurrent_runtime_processes, 3);
+    assert_eq!(config.rate_limit_per_second, 9);
+}
+
+#[test]
+fn runtime_protocol_info_reports_compatible_features() {
+    let info = RuntimeProtocolInfo::current();
+
+    assert!(info.is_compatible_with_current());
+    assert_eq!(info.protocol_version, RuntimeProtocolVersion::new(1, 0));
+    assert!(info.features.contains(&"request.identity".to_string()));
+
+    let decoded = RuntimeProtocolInfo::decode(&info.encode()).unwrap();
+    assert_eq!(decoded, info);
+}
+
+#[test]
+fn middleware_injects_request_identity_and_rate_limits() {
+    let mut middleware = RuntimeMiddlewareChain::new(30_000, 1);
+    let first = middleware
+        .begin("RUN_SOURCE", RuntimeProtocolVersion::new(1, 0))
+        .unwrap();
+    middleware.finish(&first, "ok").unwrap();
+
+    let denied = middleware
+        .begin("RUN_SOURCE", RuntimeProtocolVersion::new(1, 0))
+        .unwrap_err();
+
+    assert_eq!(first.request_id.0, first.correlation_id.0);
+    assert!(denied.render().contains("rate limit exceeded"));
+    assert_eq!(middleware.logs().len(), 1);
+    assert_eq!(middleware.logs()[0].command, "RUN_SOURCE");
+}
+
+#[test]
+fn daemon_records_request_identity_and_protocol_status() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 42;\n");
+    let mut daemon = RuntimeDaemon::with_home(dir.join("runtime"));
+    daemon.start().unwrap();
+
+    let status = daemon.status().unwrap();
+    assert_eq!(status.protocol_version, RuntimeProtocolVersion::new(1, 0));
+    assert!(
+        status
+            .protocol_features
+            .contains(&"middleware.basic".to_string())
+    );
+
+    let result = daemon.run_source(RunSourceRequest::new(&file)).unwrap();
+    assert_eq!(result.value_display.as_deref(), Some("42"));
+
+    let history = daemon.list_history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].request_id.0, history[0].id.0);
+    assert_eq!(history[0].correlation_id.0, history[0].session_id.0);
 }
 
 #[test]
