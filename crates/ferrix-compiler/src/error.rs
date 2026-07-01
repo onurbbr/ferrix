@@ -62,6 +62,9 @@ pub enum CompileErrorKind {
         expected: String,
         found: String,
     },
+    UnknownType {
+        name: String,
+    },
     TooManyParameters {
         max: usize,
     },
@@ -149,6 +152,7 @@ impl fmt::Display for CompileError {
             CompileErrorKind::TypeMismatch { expected, found } => {
                 write!(f, "type mismatch; expected {expected}, got {found}")
             }
+            CompileErrorKind::UnknownType { name } => write!(f, "unknown type `{name}`"),
             CompileErrorKind::TooManyParameters { max } => {
                 write!(f, "too many function parameters; maximum is {max}")
             }
