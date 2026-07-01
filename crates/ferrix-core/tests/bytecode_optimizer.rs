@@ -42,6 +42,71 @@ fn folds_constant_integer_arithmetic() {
 }
 
 #[test]
+fn folds_specialized_constant_integer_arithmetic() {
+    let mut chunk = Chunk::new("fold-specialized", 3);
+    let forty = chunk.add_constant(Value::Int(40)).unwrap();
+    let two = chunk.add_constant(Value::Int(2)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: forty,
+    });
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(1),
+        constant: two,
+    });
+    chunk.push_instruction(Instruction::AddInt {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+
+    let optimized = optimize_chunk(chunk);
+
+    let Instruction::LoadConst { constant, .. } = optimized.instructions[2] else {
+        panic!("specialized arithmetic should fold to a constant load");
+    };
+    assert_eq!(optimized.constants[usize::from(constant.0)], Value::Int(42));
+    StructuralVerifier::verify(optimized).unwrap();
+}
+
+#[test]
+fn specializes_unfolded_integer_dispatch_opcodes() {
+    let mut chunk = Chunk::new("specialize", 3);
+    chunk.push_instruction(Instruction::Add {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::Less {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+
+    let optimized = optimize_chunk(chunk);
+
+    assert!(matches!(
+        optimized.instructions[0],
+        Instruction::AddInt {
+            dst: Register(2),
+            lhs: Register(0),
+            rhs: Register(1),
+        }
+    ));
+    assert!(matches!(
+        optimized.instructions[1],
+        Instruction::LessInt {
+            dst: Register(2),
+            lhs: Register(0),
+            rhs: Register(1),
+        }
+    ));
+    StructuralVerifier::verify(optimized).unwrap();
+}
+
+#[test]
 fn removes_redundant_moves_and_unreachable_instructions() {
     let mut chunk = Chunk::new("compact", 1);
     let value = chunk.add_constant(Value::Int(42)).unwrap();
