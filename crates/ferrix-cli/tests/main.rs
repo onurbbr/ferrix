@@ -42,6 +42,57 @@ fn run_file_prints_non_nil_result() {
 }
 
 #[test]
+fn run_file_requires_runtime_when_mode_is_required() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
+
+    let output = run_with_env(
+        ["run", file.to_str().unwrap()],
+        [("FERRIX_RUNTIME_MODE", "required")],
+    );
+
+    assert_eq!(output.status.code(), Some(69));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(
+        stderr(&output),
+        "Ferrix runtime is not running.\nStart it with: ferrix runtime start\n"
+    );
+}
+
+#[test]
+fn check_file_does_not_require_runtime_service_state() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "print(42);\nreturn 99;\n");
+
+    let output = run_with_env(
+        ["check", file.to_str().unwrap()],
+        [("FERRIX_RUNTIME_MODE", "required")],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn invalid_runtime_mode_is_reported_for_execution_commands() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 42;\n");
+
+    let output = run_with_env(
+        ["run", file.to_str().unwrap()],
+        [("FERRIX_RUNTIME_MODE", "daemon")],
+    );
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(stdout(&output).is_empty());
+    assert!(
+        stderr(&output)
+            .contains("invalid runtime mode `daemon`; expected embedded, required, or managed")
+    );
+}
+
+#[test]
 fn compile_and_run_bytecode_file() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
@@ -455,6 +506,24 @@ fn debug_file_steps_and_prints_registers() {
 }
 
 #[test]
+fn debug_file_requires_runtime_when_mode_is_required() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 42;\n");
+
+    let output = run_with_env(
+        ["debug", file.to_str().unwrap()],
+        [("FERRIX_RUNTIME_MODE", "required")],
+    );
+
+    assert_eq!(output.status.code(), Some(69));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(
+        stderr(&output),
+        "Ferrix runtime is not running.\nStart it with: ferrix runtime start\n"
+    );
+}
+
+#[test]
 fn debug_file_supports_instruction_breakpoints() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "let x = 1;\nlet y = 41;\nreturn x + y;\n");
@@ -673,6 +742,19 @@ fn missing_file_is_reported() {
 fn run<const N: usize>(args: [&str; N]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ferrix-cli"))
         .args(args)
+        .env_remove("FERRIX_RUNTIME_MODE")
+        .output()
+        .expect("failed to run ferrix-cli")
+}
+
+fn run_with_env<const N: usize, const M: usize>(
+    args: [&str; N],
+    envs: [(&str, &str); M],
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ferrix-cli"))
+        .args(args)
+        .env_remove("FERRIX_RUNTIME_MODE")
+        .envs(envs)
         .output()
         .expect("failed to run ferrix-cli")
 }
@@ -683,6 +765,7 @@ fn run_with_input<const N: usize>(args: [&str; N], input: &str) -> std::process:
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferrix-cli"))
         .args(args)
+        .env_remove("FERRIX_RUNTIME_MODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
