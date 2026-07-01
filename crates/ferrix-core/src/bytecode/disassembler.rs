@@ -372,6 +372,23 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 entry_count
             )
         }
+        Instruction::RecordNew {
+            dst,
+            fields_start,
+            fields,
+        } => {
+            format!(
+                "{:<11} {}, {}, [{}]",
+                "RecordNew",
+                register(*dst),
+                register(*fields_start),
+                fields
+                    .iter()
+                    .map(|field| string_id(*field))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
         Instruction::IndexGet { dst, target, index } => {
             format!(
                 "{:<11} {}, {}, {}",
@@ -391,6 +408,28 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 "IndexSet",
                 register(*target),
                 register(*index),
+                register(*value)
+            )
+        }
+        Instruction::FieldGet { dst, target, field } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "FieldGet",
+                register(*dst),
+                register(*target),
+                string_id(*field)
+            )
+        }
+        Instruction::FieldSet {
+            target,
+            field,
+            value,
+        } => {
+            format!(
+                "{:<11} {}, {}, {}",
+                "FieldSet",
+                register(*target),
+                string_id(*field),
                 register(*value)
             )
         }
