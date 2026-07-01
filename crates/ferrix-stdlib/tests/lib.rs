@@ -6,8 +6,8 @@ use ferrix_core::{
     Obj, Value,
     bytecode::{Chunk, Function, FunctionId, Instruction, Program, Register, VerifiedProgram},
 };
-use ferrix_stdlib::install;
-use ferrix_vm::{OutputWriter, Vm, VmError, VmErrorKind};
+use ferrix_stdlib::{InstallReport, install as install_stdlib};
+use ferrix_vm::{HostCapability, OutputWriter, Vm, VmError, VmErrorKind};
 
 #[derive(Clone, Debug, Default)]
 struct SharedOutput(Rc<RefCell<Vec<String>>>);
@@ -23,6 +23,31 @@ impl OutputWriter for SharedOutput {
         self.0.borrow_mut().push(line.to_string());
         Ok(())
     }
+}
+
+fn install(vm: &mut Vm, program: &Program) -> InstallReport {
+    vm.set_capabilities([HostCapability::NativeCall, HostCapability::IoOutput]);
+    install_stdlib(vm, program)
+}
+
+#[test]
+fn native_registry_declares_contract_metadata() {
+    ferrix_stdlib::validate_registry().unwrap();
+    let print = ferrix_stdlib::find_binding("print", 1).unwrap();
+
+    assert_eq!(print.qualified_name, "io.print");
+    assert_eq!(print.parameters.len(), usize::from(print.arity));
+    assert!(
+        print
+            .required_capabilities
+            .contains(&HostCapability::NativeCall)
+    );
+    assert!(
+        print
+            .required_capabilities
+            .contains(&HostCapability::IoOutput)
+    );
+    assert!(print.available_profiles.contains(&"cli"));
 }
 
 #[test]
