@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt, path::PathBuf};
 
+use ferrix_compiler::CompileReport;
 use ferrix_core::Value;
 
 use crate::RuntimeMode;
@@ -58,6 +59,7 @@ pub struct RuntimeStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileResult {
     pub diagnostics: Vec<String>,
+    pub report: Option<CompileReport>,
 }
 
 /// Placeholder bytecode inspection result.
