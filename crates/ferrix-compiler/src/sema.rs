@@ -22,6 +22,7 @@ enum SourceType {
     String,
     Array,
     Map,
+    Record,
     Function,
 }
 
@@ -35,6 +36,7 @@ impl SourceType {
             Self::String => "string",
             Self::Array => "array",
             Self::Map => "map",
+            Self::Record => "record",
             Self::Function => "function",
         }
     }
@@ -256,6 +258,17 @@ fn check_stmt(
             check_expr(value, scopes, functions)?;
             Ok(())
         }
+        Stmt::FieldAssign {
+            target,
+            field: _,
+            value,
+            ..
+        } => {
+            let target_type = check_expr(target, scopes, functions)?;
+            check_field_access(target_type, target.span())?;
+            check_expr(value, scopes, functions)?;
+            Ok(())
+        }
         Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
             check_expr(value, scopes, functions).map(|_| ())
         }
@@ -400,10 +413,37 @@ fn check_expr(
             }
             Ok(SourceType::Map)
         }
+        Expr::Record { fields, .. } => {
+            if fields.len() > u8::MAX as usize {
+                return Err(CompileError::new(
+                    CompileErrorKind::TooManyRecordFields {
+                        max: u8::MAX as usize,
+                    },
+                    Some(expr.span()),
+                ));
+            }
+
+            for (_, value) in fields {
+                check_expr(value, scopes, functions)?;
+            }
+            Ok(SourceType::Record)
+        }
         Expr::Index { target, index, .. } => {
             let target_type = check_expr(target, scopes, functions)?;
             let index_type = check_expr(index, scopes, functions)?;
             check_index_access(target_type, index_type, target.span(), index.span())?;
+            Ok(SourceType::Unknown)
+        }
+        Expr::Field {
+            target,
+            field,
+            span,
+        } => {
+            if let Some(source_type) = namespaced_field_type(target, field, scopes) {
+                return Ok(source_type);
+            }
+            let target_type = check_expr(target, scopes, functions)?;
+            check_field_access(target_type, *span)?;
             Ok(SourceType::Unknown)
         }
         Expr::Call { callee, args, span } => {
@@ -497,6 +537,23 @@ fn check_index_access(
         SourceType::Map | SourceType::Unknown | SourceType::Nil => Ok(()),
         found => Err(type_error("array or map", found, target_span)),
     }
+}
+
+fn check_field_access(
+    target_type: SourceType,
+    target_span: ferrix_core::diagnostics::SourceSpan,
+) -> Result<(), CompileError> {
+    match target_type {
+        SourceType::Record | SourceType::Unknown | SourceType::Nil => Ok(()),
+        found => Err(type_error("record", found, target_span)),
+    }
+}
+
+fn namespaced_field_type(target: &Expr, field: &str, scopes: &ScopeStack) -> Option<SourceType> {
+    let Expr::Variable { name, .. } = target else {
+        return None;
+    };
+    scopes.resolve(&format!("{name}.{field}"))
 }
 
 fn expect_assignable(
