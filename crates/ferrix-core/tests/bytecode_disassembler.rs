@@ -4,7 +4,7 @@ use ferrix_core::{
     Value,
     bytecode::{
         CaptureId, Chunk, Disassembler, Function, FunctionId, Instruction, JumpTarget, Program,
-        Register,
+        Register, StringId,
     },
 };
 
@@ -128,6 +128,34 @@ fn disassembles_map_and_index_instructions() {
     assert!(output.contains("0000 MapNew      r0, r1, 1\n"));
     assert!(output.contains("0001 IndexGet    r3, r0, r1\n"));
     assert!(output.contains("0002 IndexSet    r0, r1, r2\n"));
+}
+
+#[test]
+fn disassembles_record_and_field_instructions() {
+    let mut chunk = Chunk::new("records", 4);
+    let name = chunk.add_string("name").unwrap();
+    chunk.push_instruction(Instruction::RecordNew {
+        dst: Register(0),
+        fields_start: Register(1),
+        fields: vec![name],
+    });
+    chunk.push_instruction(Instruction::FieldGet {
+        dst: Register(2),
+        target: Register(0),
+        field: name,
+    });
+    chunk.push_instruction(Instruction::FieldSet {
+        target: Register(0),
+        field: StringId(0),
+        value: Register(3),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+
+    let output = Disassembler::disassemble_chunk(&chunk);
+
+    assert!(output.contains("0000 RecordNew   r0, r1, [str#0]\n"));
+    assert!(output.contains("0001 FieldGet    r2, r0, str#0\n"));
+    assert!(output.contains("0002 FieldSet    r0, str#0, r3\n"));
 }
 
 #[test]
