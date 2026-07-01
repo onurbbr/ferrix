@@ -6,7 +6,12 @@
 use std::{
     collections::HashSet,
     env, fs, io,
+    io::Write as _,
+    os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 use ferrix_compiler::{
@@ -20,8 +25,8 @@ use ferrix_core::{
     diagnostics::{SourceLocation, SourceManager},
 };
 use ferrix_runtime::{
-    DebugRequest, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeGateway,
-    RuntimeHealth, RuntimeMode, RuntimeProcessId, RuntimeProcessRecord,
+    DebugRequest, RecordProcessRequest, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon,
+    RuntimeGateway, RuntimeMode, RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord,
 };
 use ferrix_vm::{CallFrame, DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
 
@@ -29,6 +34,7 @@ const USAGE: &str = "\
 Ferrix
 
 Usage:
+  ferrix [--runtime-mode <mode>] [--runtime-home <dir>] <command>
   ferrix run <file|package>
   ferrix check <file|package>
   ferrix compile <file|package> <output>
@@ -36,14 +42,15 @@ Usage:
   ferrix debug <file|package>
   ferrix runtime start|stop|status|restart
   ferrix ps
-  ferrix logs <pid>
+  ferrix info <pid>
+  ferrix logs
   ferrix kill <pid>
   ferrix --help
   ferrix --version
 ";
 
 const MANIFEST_FILES: &[&str] = &["Ferrix.toml", "ferrix.toml"];
-const RUNTIME_MODE_ENV: &str = "FERRIX_RUNTIME_MODE";
+const RUNTIME_LAUNCH_DIR: &str = "/tmp/ferrix-runtime-launch";
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -69,7 +76,11 @@ fn run_cli(
     stderr: &mut impl io::Write,
 ) -> i32 {
     // Keep command dispatch small and testable by injecting I/O handles.
-    match args {
+    let (config, args) = match parse_runtime_options(args, stderr) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    match args.as_slice() {
         [] => {
             write!(stdout, "{USAGE}").expect("stdout write failed");
             0
@@ -82,17 +93,26 @@ fn run_cli(
             writeln!(stdout, "ferrix {}", env!("CARGO_PKG_VERSION")).expect("stdout write failed");
             0
         }
-        [command, path] if command == "run" => run_file(path, stdout, stderr),
-        [command, path] if command == "check" => check_file(path, &mut read_file, stderr),
+        [command, path] if command == "run" => run_file(path, &config, stdout, stderr),
+        [command, path] if command == "check" => check_file(path, &config, &mut read_file, stderr),
         [command, path, output] if command == "compile" => {
-            compile_bytecode(path, output, &mut read_file, stderr)
+            compile_bytecode(path, output, &config, &mut read_file, stderr)
         }
-        [command, path] if command == "run-bytecode" => run_bytecode(path, stdout, stderr),
-        [command, path] if command == "debug" => debug_file(path, stdin, stdout, stderr),
-        [command, action] if command == "runtime" => runtime_command(action, stdout, stderr),
-        [command] if command == "ps" => list_processes(stdout, stderr),
-        [command, pid] if command == "logs" => show_logs(pid, stdout, stderr),
-        [command, pid] if command == "kill" => kill_process(pid, stdout, stderr),
+        [command, path] if command == "run-bytecode" => run_bytecode(path, &config, stdout, stderr),
+        [command, path] if command == "debug" => debug_file(path, &config, stdin, stdout, stderr),
+        [command, action] if command == "runtime" && action == "serve" => runtime_serve(stderr),
+        [command, action, ..] if command == "runtime" && action == "serve" => {
+            writeln!(stderr, "error: runtime serve is an internal command")
+                .expect("stderr write failed");
+            64
+        }
+        [command, action] if command == "runtime" => {
+            runtime_command(action, &config, stdout, stderr)
+        }
+        [command] if command == "ps" => list_processes(&config, stdout, stderr),
+        [command] if command == "logs" => list_logs(&config, stdout, stderr),
+        [command, pid] if command == "info" => show_process_info(pid, &config, stdout, stderr),
+        [command, pid] if command == "kill" => kill_process(pid, &config, stdout, stderr),
         [command, ..] if command == "run" => {
             writeln!(stderr, "error: expected a file or package path\n")
                 .expect("stderr write failed");
@@ -132,9 +152,18 @@ fn run_cli(
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
         }
-        [command, ..] if command == "logs" => {
+        [command, ..] if command == "info" => {
             writeln!(stderr, "error: expected a runtime process id\n")
                 .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
+        }
+        [command, ..] if command == "logs" => {
+            writeln!(
+                stderr,
+                "error: logs does not accept a process id; use info <pid>\n"
+            )
+            .expect("stderr write failed");
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
         }
@@ -152,30 +181,344 @@ fn run_cli(
     }
 }
 
-fn runtime_command(action: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
-    let mut daemon = RuntimeDaemon::new();
-    let result = match action {
-        "start" => daemon.start(),
-        "stop" => daemon.stop(),
-        "status" => daemon.status(),
-        "restart" => daemon.restart(),
+#[derive(Clone, Debug)]
+struct CliConfig {
+    runtime_mode: RuntimeMode,
+    runtime_home: PathBuf,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            runtime_mode: RuntimeMode::Embedded,
+            runtime_home: ferrix_runtime::default_runtime_home(),
+        }
+    }
+}
+
+fn parse_runtime_options(
+    args: &[String],
+    stderr: &mut impl io::Write,
+) -> Result<(CliConfig, Vec<String>), i32> {
+    if let Err(error) = ferrix_runtime::ensure_default_layout() {
+        write!(stderr, "{}", error.render()).expect("stderr write failed");
+        return Err(error.exit_code);
+    }
+
+    let mut config = CliConfig::default();
+    let mut rest = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--runtime-mode" => {
+                let Some(value) = args.get(index + 1) else {
+                    writeln!(stderr, "error: expected value after --runtime-mode")
+                        .expect("stderr write failed");
+                    return Err(64);
+                };
+                config.runtime_mode = match value.parse::<RuntimeMode>() {
+                    Ok(mode) => mode,
+                    Err(error) => {
+                        writeln!(stderr, "error: {error}").expect("stderr write failed");
+                        return Err(64);
+                    }
+                };
+                index += 2;
+            }
+            "--runtime-home" => {
+                let Some(value) = args.get(index + 1) else {
+                    writeln!(stderr, "error: expected value after --runtime-home")
+                        .expect("stderr write failed");
+                    return Err(64);
+                };
+                config.runtime_home = PathBuf::from(value);
+                index += 2;
+            }
+            _ => {
+                rest.extend_from_slice(&args[index..]);
+                break;
+            }
+        }
+    }
+
+    Ok((config, rest))
+}
+
+fn runtime_command(
+    action: &str,
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    match action {
+        "start" => match start_runtime_process(config, stderr) {
+            Ok(_) => 0,
+            Err(error) => write_runtime_error(error, stderr),
+        },
+        "stop" => match stop_runtime_process(config) {
+            Ok(_) => 0,
+            Err(error) => write_runtime_error(error, stderr),
+        },
+        "status" => match runtime_daemon(config).checked_status() {
+            Ok(status) => {
+                write_status(stdout, &status);
+                0
+            }
+            Err(error) => write_runtime_error(error, stderr),
+        },
+        "restart" => {
+            let _ = stop_runtime_process(config);
+            match start_runtime_process(config, stderr) {
+                Ok(_) => 0,
+                Err(error) => write_runtime_error(error, stderr),
+            }
+        }
         _ => {
             writeln!(stderr, "error: unknown runtime action `{action}`")
                 .expect("stderr write failed");
-            return 64;
+            64
         }
+    }
+}
+
+fn write_runtime_error(error: ferrix_runtime::RuntimeError, stderr: &mut impl io::Write) -> i32 {
+    write!(stderr, "{}", error.render()).expect("stderr write failed");
+    error.exit_code
+}
+
+fn runtime_serve(stderr: &mut impl io::Write) -> i32 {
+    let Some(config) = consume_runtime_launch_config() else {
+        writeln!(stderr, "error: runtime serve is an internal command")
+            .expect("stderr write failed");
+        return 64;
     };
 
-    match result {
-        Ok(status) => {
-            write_status(stdout, &status);
-            0
-        }
+    let mut daemon = runtime_daemon(&config);
+    match daemon.serve_forever() {
+        Ok(()) => 0,
         Err(error) => {
             write!(stderr, "{}", error.render()).expect("stderr write failed");
             error.exit_code
         }
     }
+}
+
+fn consume_runtime_launch_config() -> Option<CliConfig> {
+    let actual_parent = current_parent_pid()?;
+    if !is_runtime_start_parent(actual_parent) {
+        return None;
+    }
+
+    let path = runtime_launch_path(actual_parent);
+    let source = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+
+    let mut parent_pid = None;
+    let mut runtime_home = None;
+    for line in source.lines() {
+        if let Some(value) = line.strip_prefix("parent_pid=") {
+            parent_pid = value.parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix("runtime_home=") {
+            runtime_home = Some(PathBuf::from(value));
+        }
+    }
+
+    if parent_pid? != actual_parent {
+        return None;
+    }
+
+    Some(CliConfig {
+        runtime_mode: RuntimeMode::Required,
+        runtime_home: runtime_home?,
+    })
+}
+
+fn is_runtime_start_parent(parent_pid: u32) -> bool {
+    let cmdline_path = format!("/proc/{parent_pid}/cmdline");
+    let Ok(cmdline) = fs::read(cmdline_path) else {
+        return false;
+    };
+    parent_cmdline_allows_runtime_serve(&cmdline)
+}
+
+fn current_parent_pid() -> Option<u32> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    let mut fields = after_name.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+fn parent_cmdline_allows_runtime_serve(cmdline: &[u8]) -> bool {
+    let args = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>();
+    let Some(executable) = args.first() else {
+        return false;
+    };
+    let executable_name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if executable_name != "ferrix-cli" && executable_name != "ferrix" {
+        return false;
+    }
+
+    let mut runtime_mode = RuntimeMode::Embedded;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--runtime-mode" => {
+                let Some(value) = args.get(index + 1) else {
+                    return false;
+                };
+                let Ok(mode) = value.parse::<RuntimeMode>() else {
+                    return false;
+                };
+                runtime_mode = mode;
+                index += 2;
+            }
+            "--runtime-home" => {
+                if args.get(index + 1).is_none() {
+                    return false;
+                }
+                index += 2;
+            }
+            _ => break,
+        }
+    }
+
+    match args.get(index).map(String::as_str) {
+        Some("runtime") => matches!(
+            args.get(index + 1).map(String::as_str),
+            Some("start" | "restart")
+        ),
+        Some("run" | "run-bytecode" | "debug") => runtime_mode == RuntimeMode::Managed,
+        _ => false,
+    }
+}
+
+fn write_runtime_launch_config(
+    config: &CliConfig,
+) -> Result<PathBuf, ferrix_runtime::RuntimeError> {
+    let dir = PathBuf::from(RUNTIME_LAUNCH_DIR);
+    fs::create_dir_all(&dir).map_err(runtime_state_error)?;
+    let parent_pid = std::process::id();
+    let path = runtime_launch_path(parent_pid);
+    let _ = fs::remove_file(&path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(runtime_state_error)?;
+    writeln!(file, "parent_pid={parent_pid}").map_err(runtime_state_error)?;
+    writeln!(file, "runtime_home={}", config.runtime_home.display())
+        .map_err(runtime_state_error)?;
+    Ok(path)
+}
+
+fn runtime_launch_path(parent_pid: u32) -> PathBuf {
+    PathBuf::from(RUNTIME_LAUNCH_DIR).join(format!("{parent_pid}.launch"))
+}
+
+fn runtime_state_error(error: io::Error) -> ferrix_runtime::RuntimeError {
+    ferrix_runtime::RuntimeError::new(
+        66,
+        ferrix_runtime::RuntimeErrorKind::DaemonState {
+            message: error.to_string(),
+        },
+    )
+}
+
+fn start_runtime_process(
+    config: &CliConfig,
+    stderr: &mut impl io::Write,
+) -> Result<ferrix_runtime::RuntimeStatusReport, ferrix_runtime::RuntimeError> {
+    let daemon = runtime_daemon(config);
+    if daemon.ping()? {
+        return Err(ferrix_runtime::RuntimeError::new(
+            70,
+            ferrix_runtime::RuntimeErrorKind::ServiceAlreadyRunning,
+        ));
+    }
+
+    fs::create_dir_all(daemon.home()).map_err(runtime_state_error)?;
+    let log_path = daemon.home().join("daemon.log");
+    let stdout_log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(runtime_state_error)?;
+    let stderr_log = stdout_log.try_clone().map_err(runtime_state_error)?;
+
+    let launch_path = write_runtime_launch_config(config)?;
+    let exe = env::current_exe().map_err(runtime_state_error)?;
+    let spawn_result = Command::new(exe)
+        .arg("runtime")
+        .arg("serve")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
+        .spawn();
+    if let Err(error) = spawn_result {
+        let _ = fs::remove_file(launch_path);
+        return Err(runtime_state_error(error));
+    }
+
+    if let Err(error) = wait_for_runtime(&daemon, stderr) {
+        let _ = fs::remove_file(launch_path);
+        return Err(error);
+    }
+    daemon.status()
+}
+
+fn stop_runtime_process(
+    config: &CliConfig,
+) -> Result<ferrix_runtime::RuntimeStatusReport, ferrix_runtime::RuntimeError> {
+    let mut daemon = runtime_daemon(config);
+    if !daemon.ping()? {
+        let _ = daemon.checked_status();
+        return Err(ferrix_runtime::RuntimeError::new(
+            70,
+            ferrix_runtime::RuntimeErrorKind::ServiceNotRunning,
+        ));
+    }
+
+    daemon.stop_process()?;
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(25));
+        if !daemon.ping()? {
+            break;
+        }
+    }
+    daemon.stop()
+}
+
+fn runtime_daemon(config: &CliConfig) -> RuntimeDaemon {
+    RuntimeDaemon::with_home(config.runtime_home.clone())
+}
+
+fn wait_for_runtime(
+    daemon: &RuntimeDaemon,
+    _stderr: &mut impl io::Write,
+) -> Result<(), ferrix_runtime::RuntimeError> {
+    for _ in 0..80 {
+        if daemon.ping()? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(ferrix_runtime::RuntimeError::new(
+        69,
+        ferrix_runtime::RuntimeErrorKind::RuntimeUnavailable {
+            mode: RuntimeMode::Required,
+        },
+    ))
 }
 
 fn write_status(stdout: &mut impl io::Write, status: &ferrix_runtime::RuntimeStatusReport) {
@@ -188,14 +531,15 @@ fn write_status(stdout: &mut impl io::Write, status: &ferrix_runtime::RuntimeSta
     writeln!(stdout, "active: {}", status.active_process_count).expect("stdout write failed");
     writeln!(stdout, "completed: {}", status.completed_process_count).expect("stdout write failed");
     writeln!(stdout, "failed: {}", status.failed_process_count).expect("stdout write failed");
-    if status.health == RuntimeHealth::Stopped {
-        writeln!(stdout, "hint: ferrix runtime start").expect("stdout write failed");
-    }
 }
 
-fn list_processes(stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
-    let daemon = RuntimeDaemon::new();
-    match daemon.list_processes() {
+fn list_processes(
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    let runtime = runtime_request_gateway(config);
+    match runtime.list_processes() {
         Ok(processes) => {
             writeln!(stdout, "pid\tsession\tstatus\tkind\tpath").expect("stdout write failed");
             for process in processes {
@@ -223,29 +567,95 @@ fn write_process_row(stdout: &mut impl io::Write, process: &RuntimeProcessRecord
     .expect("stdout write failed");
 }
 
-fn show_logs(pid: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
-    let Some(process_id) = parse_process_id(pid, stderr) else {
-        return 64;
-    };
-    let daemon = RuntimeDaemon::new();
-    match daemon.logs(process_id) {
-        Ok(logs) => {
-            write!(stdout, "{logs}").expect("stdout write failed");
+fn list_logs(config: &CliConfig, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+    let runtime = runtime_request_gateway(config);
+    match runtime.list_logs() {
+        Ok(processes) => {
+            writeln!(stdout, "pid\tkind\tstatus\texit\tpath").expect("stdout write failed");
+            for process in processes {
+                writeln!(
+                    stdout,
+                    "{}\t{}\t{}\t{}\t{}",
+                    process.id,
+                    process.kind.as_str(),
+                    process.status.as_str(),
+                    process
+                        .exit_code
+                        .map_or_else(|| "-".to_string(), |code| code.to_string()),
+                    process.path.display()
+                )
+                .expect("stdout write failed");
+            }
             0
         }
-        Err(error) => {
-            write!(stderr, "{}", error.render()).expect("stderr write failed");
-            error.exit_code
-        }
+        Err(error) => write_runtime_error(error, stderr),
     }
 }
 
-fn kill_process(pid: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+fn show_process_info(
+    pid: &str,
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
     let Some(process_id) = parse_process_id(pid, stderr) else {
         return 64;
     };
-    let mut daemon = RuntimeDaemon::new();
-    match daemon.kill_process(process_id) {
+    let runtime = runtime_request_gateway(config);
+    match runtime.process_info(process_id) {
+        Ok(process) => {
+            let Some(process) = process else {
+                writeln!(stderr, "error: unknown runtime process {process_id}")
+                    .expect("stderr write failed");
+                return 66;
+            };
+            write_process_info(stdout, &process);
+            if let Ok(logs) = runtime.process_output(process_id)
+                && !logs.is_empty()
+            {
+                writeln!(stdout, "output:").expect("stdout write failed");
+                write!(stdout, "{logs}").expect("stdout write failed");
+            }
+            0
+        }
+        Err(error) => write_runtime_error(error, stderr),
+    }
+}
+
+fn write_process_info(stdout: &mut impl io::Write, process: &RuntimeProcessRecord) {
+    writeln!(stdout, "pid: {}", process.id).expect("stdout write failed");
+    writeln!(stdout, "session: {}", process.session_id).expect("stdout write failed");
+    writeln!(stdout, "status: {}", process.status.as_str()).expect("stdout write failed");
+    writeln!(stdout, "kind: {}", process.kind.as_str()).expect("stdout write failed");
+    writeln!(stdout, "path: {}", process.path.display()).expect("stdout write failed");
+    writeln!(
+        stdout,
+        "exit: {}",
+        process
+            .exit_code
+            .map_or_else(|| "-".to_string(), |code| code.to_string())
+    )
+    .expect("stdout write failed");
+    writeln!(stdout, "started_at_ms: {}", process.started_at_ms).expect("stdout write failed");
+    if let Some(ended_at_ms) = process.ended_at_ms {
+        writeln!(stdout, "ended_at_ms: {ended_at_ms}").expect("stdout write failed");
+    }
+    if let Some(error) = &process.last_error {
+        writeln!(stdout, "error: {}", error.trim_end()).expect("stdout write failed");
+    }
+}
+
+fn kill_process(
+    pid: &str,
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    let Some(process_id) = parse_process_id(pid, stderr) else {
+        return 64;
+    };
+    let runtime = runtime_request_gateway(config);
+    match runtime.kill_process(process_id) {
         Ok(process) => {
             writeln!(stdout, "killed process {}", process.id).expect("stdout write failed");
             0
@@ -255,6 +665,15 @@ fn kill_process(pid: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Wr
             error.exit_code
         }
     }
+}
+
+fn runtime_request_gateway(config: &CliConfig) -> RuntimeGateway {
+    let mode = if config.runtime_mode == RuntimeMode::Embedded {
+        RuntimeMode::Required
+    } else {
+        config.runtime_mode
+    };
+    RuntimeGateway::with_home(mode, config.runtime_home.clone())
 }
 
 fn parse_process_id(pid: &str, stderr: &mut impl io::Write) -> Option<RuntimeProcessId> {
@@ -268,20 +687,47 @@ fn parse_process_id(pid: &str, stderr: &mut impl io::Write) -> Option<RuntimePro
     }
 }
 
+fn record_cli_history(
+    config: &CliConfig,
+    kind: RuntimeProcessKind,
+    path: &str,
+    exit_code: i32,
+    output: &str,
+    last_error: Option<&str>,
+) {
+    let mut request = RecordProcessRequest::new(kind, path, exit_code).with_output(output);
+    if let Some(error) = last_error {
+        request = request.with_last_error(error);
+    }
+    let _ = RuntimeGateway::with_home(config.runtime_mode, config.runtime_home.clone())
+        .record_process(request);
+}
+
 fn check_file(
     path: &str,
+    config: &CliConfig,
     read_file: &mut impl FnMut(&str) -> io::Result<String>,
     stderr: &mut impl io::Write,
 ) -> i32 {
-    match compile_file(path, read_file, stderr) {
+    let code = match compile_file(path, read_file, stderr) {
         Ok(_) => 0,
         Err(code) => code,
-    }
+    };
+    record_cli_history(
+        config,
+        RuntimeProcessKind::Check,
+        path,
+        code,
+        "",
+        (code != 0).then_some("check failed"),
+    );
+    code
 }
 
 fn compile_bytecode(
     path: &str,
     output: &str,
+    config: &CliConfig,
     read_file: &mut impl FnMut(&str) -> io::Result<String>,
     stderr: &mut impl io::Write,
 ) -> i32 {
@@ -289,49 +735,88 @@ fn compile_bytecode(
     // still point at the original source file before serialization happens.
     let (_, program) = match compile_file(path, read_file, stderr) {
         Ok(compiled) => compiled,
-        Err(code) => return code,
+        Err(code) => {
+            record_cli_history(
+                config,
+                RuntimeProcessKind::Compile,
+                path,
+                code,
+                "",
+                Some("compile failed"),
+            );
+            return code;
+        }
     };
     let bytes = match encode_program(program.as_program()) {
         Ok(bytes) => bytes,
         Err(error) => {
             writeln!(stderr, "error: could not encode bytecode: {error}")
                 .expect("stderr write failed");
+            record_cli_history(
+                config,
+                RuntimeProcessKind::Compile,
+                path,
+                65,
+                "",
+                Some("bytecode encoding failed"),
+            );
             return 65;
         }
     };
     if let Err(error) = fs::write(output, bytes) {
         writeln!(stderr, "error: could not write `{output}`: {error}")
             .expect("stderr write failed");
+        record_cli_history(
+            config,
+            RuntimeProcessKind::Compile,
+            path,
+            66,
+            "",
+            Some("bytecode write failed"),
+        );
         return 66;
     }
+    record_cli_history(config, RuntimeProcessKind::Compile, path, 0, output, None);
     0
 }
 
-fn run_bytecode(path: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
-    let runtime = match runtime_gateway(stderr) {
+fn run_bytecode(
+    path: &str,
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    let runtime = match runtime_gateway(config, stderr) {
         Ok(runtime) => runtime,
         Err(code) => return code,
     };
     match runtime.run_bytecode(RunBytecodeRequest::new(path)) {
         Ok(result) => write_run_result(stdout, result),
         Err(error) => {
-            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            let rendered = error.render();
+            write!(stderr, "{rendered}").expect("stderr write failed");
             error.exit_code
         }
     }
 }
 
-fn run_file(path: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+fn run_file(
+    path: &str,
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
     // Normal source execution is delegated to ferrix-runtime so the CLI remains
     // a thin command surface instead of wiring compiler, stdlib, and VM itself.
-    let runtime = match runtime_gateway(stderr) {
+    let runtime = match runtime_gateway(config, stderr) {
         Ok(runtime) => runtime,
         Err(code) => return code,
     };
     match runtime.run_source(RunSourceRequest::new(path)) {
         Ok(result) => write_run_result(stdout, result),
         Err(error) => {
-            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            let rendered = error.render();
+            write!(stderr, "{rendered}").expect("stderr write failed");
             error.exit_code
         }
     }
@@ -347,20 +832,30 @@ fn write_run_result(stdout: &mut impl io::Write, result: ferrix_runtime::RunResu
 
 fn debug_file(
     path: &str,
+    config: &CliConfig,
     stdin: &mut impl io::BufRead,
     stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> i32 {
     // Debugger source preparation goes through ferrix-runtime so package and
     // import resolution stay aligned with normal execution.
-    let runtime = match runtime_gateway(stderr) {
+    let runtime = match runtime_gateway(config, stderr) {
         Ok(runtime) => runtime,
         Err(code) => return code,
     };
     let compiled = match runtime.prepare_debug(DebugRequest::new(path)) {
         Ok(compiled) => compiled,
         Err(error) => {
-            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            let rendered = error.render();
+            record_cli_history(
+                config,
+                RuntimeProcessKind::Debug,
+                path,
+                error.exit_code,
+                "",
+                Some(&rendered),
+            );
+            write!(stderr, "{rendered}").expect("stderr write failed");
             return error.exit_code;
         }
     };
@@ -378,37 +873,59 @@ fn debug_file(
         Ok(DebugOutcome::Completed(value)) => {
             if value == Value::Nil {
                 writeln!(stdout, "debug: finished").expect("stdout write failed");
+                record_cli_history(
+                    config,
+                    RuntimeProcessKind::Debug,
+                    path,
+                    0,
+                    "debug: finished\n",
+                    None,
+                );
             } else {
-                writeln!(stdout, "debug: finished with {}", display_value(&vm, value))
-                    .expect("stdout write failed");
+                let output = format!("debug: finished with {}\n", display_value(&vm, value));
+                write!(stdout, "{output}").expect("stdout write failed");
+                record_cli_history(config, RuntimeProcessKind::Debug, path, 0, &output, None);
             }
             0
         }
         Ok(DebugOutcome::Quit) => {
             writeln!(stdout, "debug: quit").expect("stdout write failed");
+            record_cli_history(
+                config,
+                RuntimeProcessKind::Debug,
+                path,
+                0,
+                "debug: quit\n",
+                None,
+            );
             0
         }
         Err(error) => {
             let diagnostic = error.to_diagnostic_with_program(program.as_program());
-            write!(stderr, "{}", sources.render_diagnostic(&diagnostic))
-                .expect("stderr write failed");
+            let rendered = sources.render_diagnostic(&diagnostic);
+            record_cli_history(
+                config,
+                RuntimeProcessKind::Debug,
+                path,
+                70,
+                "",
+                Some(&rendered),
+            );
+            write!(stderr, "{rendered}").expect("stderr write failed");
             70
         }
     }
 }
 
-fn runtime_gateway(stderr: &mut impl io::Write) -> Result<RuntimeGateway, i32> {
-    let mode = match env::var(RUNTIME_MODE_ENV) {
-        Ok(value) if !value.trim().is_empty() => match value.parse::<RuntimeMode>() {
-            Ok(mode) => mode,
-            Err(error) => {
-                writeln!(stderr, "error: {error}").expect("stderr write failed");
-                return Err(64);
-            }
-        },
-        _ => RuntimeMode::Embedded,
-    };
-    Ok(RuntimeGateway::new(mode))
+fn runtime_gateway(config: &CliConfig, stderr: &mut impl io::Write) -> Result<RuntimeGateway, i32> {
+    let mode = config.runtime_mode;
+    if mode == RuntimeMode::Managed
+        && let Err(error) = start_runtime_process(config, stderr)
+    {
+        write!(stderr, "{}", error.render()).expect("stderr write failed");
+        return Err(error.exit_code);
+    }
+    Ok(RuntimeGateway::with_home(mode, config.runtime_home.clone()))
 }
 
 fn compile_file(
