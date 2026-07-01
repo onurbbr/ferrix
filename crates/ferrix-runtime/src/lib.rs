@@ -20,7 +20,10 @@ pub use daemon::{
     RuntimeCheckpoint, RuntimeDaemon, RuntimeHealth, RuntimeStateStore, RuntimeStatusReport,
     default_config_path, default_ferrix_home, default_runtime_home, ensure_default_layout,
 };
-pub use event::{RuntimeEvent, RuntimeEventBus, RuntimeEventKind};
+pub use event::{
+    RuntimeEvent, RuntimeEventBus, RuntimeEventBusStats, RuntimeEventKind, RuntimeEventMetadata,
+    RuntimeEventSeverity,
+};
 pub use ferrix_vm::{HostCapability, HostCapabilityParseError};
 pub use mode::{
     RuntimeConnection, RuntimeController, RuntimeGateway, RuntimeMode, RuntimeModeParseError,
