@@ -281,3 +281,46 @@ fn non_function_call_type_mismatch_is_compile_error() {
         }
     );
 }
+
+#[test]
+fn missing_receiver_method_is_compile_error() {
+    let err = compile_source_with_file_id(
+        "\
+let user = { age: 42 };
+return user.missing();
+",
+        FileId(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::UndefinedMethod {
+            name: "missing".to_string(),
+        }
+    );
+}
+
+#[test]
+fn receiver_type_mismatch_is_compile_error() {
+    let err = compile_source_with_file_id(
+        "\
+fn age(user: record): int {
+    return 42;
+}
+
+let value = 1;
+return value.age();
+",
+        FileId(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::TypeMismatch {
+            expected: "record".to_string(),
+            found: "int".to_string(),
+        }
+    );
+}
