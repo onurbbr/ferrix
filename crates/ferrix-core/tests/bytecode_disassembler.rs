@@ -2,7 +2,9 @@
 
 use ferrix_core::{
     Value,
-    bytecode::{Chunk, Disassembler, Function, FunctionId, Instruction, Program, Register},
+    bytecode::{
+        CaptureId, Chunk, Disassembler, Function, FunctionId, Instruction, Program, Register,
+    },
 };
 
 #[test]
@@ -125,6 +127,40 @@ fn disassembles_map_and_index_instructions() {
     assert!(output.contains("0000 MapNew      r0, r1, 1\n"));
     assert!(output.contains("0001 IndexGet    r3, r0, r1\n"));
     assert!(output.contains("0002 IndexSet    r0, r1, r2\n"));
+}
+
+#[test]
+fn disassembles_upvalue_and_closure_instructions() {
+    let mut chunk = Chunk::new("closures", 4).with_capture_count(1);
+    chunk.push_instruction(Instruction::MakeUpvalue {
+        dst: Register(0),
+        src: Register(1),
+    });
+    chunk.push_instruction(Instruction::LoadUpvalue {
+        dst: Register(2),
+        upvalue: Register(0),
+    });
+    chunk.push_instruction(Instruction::StoreUpvalue {
+        upvalue: Register(0),
+        src: Register(2),
+    });
+    chunk.push_instruction(Instruction::LoadCaptureCell {
+        dst: Register(3),
+        capture: CaptureId(0),
+    });
+    chunk.push_instruction(Instruction::StoreCapture {
+        capture: CaptureId(0),
+        src: Register(2),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+
+    let output = Disassembler::disassemble_chunk(&chunk);
+
+    assert!(output.contains("0000 MakeUpvalue r0, r1\n"));
+    assert!(output.contains("0001 LoadUpvalue r2, r0\n"));
+    assert!(output.contains("0002 StoreUpvalue r0, r2\n"));
+    assert!(output.contains("0003 LoadCaptureCell r3, cap#0\n"));
+    assert!(output.contains("0004 StoreCapture cap#0, r2\n"));
 }
 
 #[test]
