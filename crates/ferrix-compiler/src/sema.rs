@@ -152,13 +152,11 @@ fn check_stmt(
             name,
             initializer,
             span,
+            ..
         } => check_let(name, initializer, *span, scopes, functions),
         Stmt::Assign { name, value, span } => {
             if !scopes.contains(name) {
-                return Err(CompileError::new(
-                    CompileErrorKind::UndefinedVariable { name: name.clone() },
-                    Some(*span),
-                ));
+                return Err(undefined_name_error(name, *span, NameUse::Variable));
             }
             check_expr(value, scopes, functions)
         }
@@ -261,10 +259,7 @@ fn check_expr(
             if scopes.contains(name) {
                 Ok(())
             } else {
-                Err(CompileError::new(
-                    CompileErrorKind::UndefinedVariable { name: name.clone() },
-                    Some(*span),
-                ))
+                Err(undefined_name_error(name, *span, NameUse::Variable))
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
@@ -335,12 +330,7 @@ fn check_expr(
                     ));
                 }
             } else {
-                return Err(CompileError::new(
-                    CompileErrorKind::UndefinedFunction {
-                        name: callee.clone(),
-                    },
-                    Some(*span),
-                ));
+                return Err(undefined_name_error(callee, *span, NameUse::Function));
             }
 
             for arg in args {
@@ -355,5 +345,36 @@ fn check_expr(
             check_scoped_statements(body, &mut function_scopes, functions)
         }
         Expr::Grouping { expr, .. } => check_expr(expr, scopes, functions),
+    }
+}
+
+enum NameUse {
+    Variable,
+    Function,
+}
+
+fn undefined_name_error(
+    name: &str,
+    span: ferrix_core::diagnostics::SourceSpan,
+    name_use: NameUse,
+) -> CompileError {
+    if let Some((module, export)) = name.split_once('.') {
+        CompileError::new(
+            CompileErrorKind::UndefinedModuleExport {
+                module: module.to_string(),
+                name: export.to_string(),
+            },
+            Some(span),
+        )
+    } else {
+        let kind = match name_use {
+            NameUse::Variable => CompileErrorKind::UndefinedVariable {
+                name: name.to_string(),
+            },
+            NameUse::Function => CompileErrorKind::UndefinedFunction {
+                name: name.to_string(),
+            },
+        };
+        CompileError::new(kind, Some(span))
     }
 }
