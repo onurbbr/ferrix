@@ -9,7 +9,7 @@ use ferrix_core::{
     bytecode::{FunctionKind, Instruction},
     diagnostics::FileId,
 };
-use ferrix_vm::Vm;
+use ferrix_vm::{HostCapability, Vm};
 
 #[test]
 fn compiles_and_runs_let_return_arithmetic() {
@@ -225,6 +225,7 @@ fn compiles_empty_array_literal_to_heap_array() {
 fn compiles_source_calls_to_stdlib_natives() {
     let program = compile_source("return len([1, 2, 3]);").unwrap();
     let mut vm = Vm::new();
+    vm.set_capabilities([HostCapability::NativeCall]);
     ferrix_stdlib::install(&mut vm, program.as_program());
 
     let result = vm.run_program(&program).unwrap();
