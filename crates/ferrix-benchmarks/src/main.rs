@@ -1,6 +1,6 @@
 //! Lightweight benchmark runner for Ferrix.
 //!
-//! This binary measures a few stable compiler/runtime scenarios without adding
+//! This binary measures stable compiler/runtime scenarios without adding
 //! Criterion or other benchmark dependencies to the main workspace.
 
 use std::time::{Duration, Instant};
@@ -50,6 +50,30 @@ let user = { \"name\": \"Ferrix\", \"values\": values };
 return len(user[\"values\"]);
 ",
     },
+    BenchCase {
+        name: "records",
+        iterations: 10_000,
+        source: "\
+let user = { name: \"Ferrix\", score: 1 };
+let i = 0;
+while (i < 50) {
+    user.score = user.score + 1;
+    i = i + 1;
+}
+return user.score;
+",
+    },
+    BenchCase {
+        name: "closures",
+        iterations: 10_000,
+        source: "\
+let base = 40;
+let add = fn(value) {
+    return base + value;
+};
+return add(2);
+",
+    },
 ];
 
 struct BenchCase {
@@ -62,16 +86,24 @@ struct BenchCase {
 }
 
 fn main() {
+    println!(
+        "{:<12} {:>12} {:>12} {:>12} {:>12} {:>10}",
+        "case", "compile_ms", "verify_ms", "run_total_ms", "run_avg_us", "iters"
+    );
     for case in CASES {
         run_case(case);
     }
 }
 
 fn run_case(case: &BenchCase) {
-    // Compile once so the benchmark separates frontend cost from repeated VM cost.
     let compile_start = Instant::now();
     let program = compile_source(case.source).expect("benchmark source should compile");
     let compile_elapsed = compile_start.elapsed();
+
+    let verify_elapsed = timed(case.iterations, || {
+        ferrix_core::bytecode::VerifiedProgram::new(program.as_program().clone())
+            .expect("benchmark bytecode should verify");
+    });
 
     let run_elapsed = timed(case.iterations, || {
         let mut vm = Vm::new();
@@ -81,9 +113,10 @@ fn run_case(case: &BenchCase) {
     });
 
     println!(
-        "{:<12} compile={:>8.3}ms run_total={:>8.3}ms run_avg={:>8.3}us iterations={}",
+        "{:<12} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>10}",
         case.name,
         millis(compile_elapsed),
+        micros(verify_elapsed) / case.iterations as f64 / 1_000.0,
         millis(run_elapsed),
         micros(run_elapsed) / case.iterations as f64,
         case.iterations
