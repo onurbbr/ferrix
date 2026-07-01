@@ -739,6 +739,85 @@ return len();
 }
 
 #[test]
+fn catches_thrown_source_values() {
+    let program = compile_source(
+        "\
+try {
+    throw \"boom\";
+} catch (err) {
+    return err;
+}
+return \"miss\";
+",
+    )
+    .unwrap();
+    let mut vm = Vm::new();
+
+    let result = vm.run_program(&program).unwrap();
+    let reference = result.as_obj_ref().unwrap();
+
+    assert_eq!(
+        vm.heap_object(reference).unwrap(),
+        &Obj::String("boom".to_string())
+    );
+}
+
+#[test]
+fn catches_throw_across_function_calls() {
+    let program = compile_source(
+        "\
+fn fail() {
+    throw 41;
+}
+
+try {
+    return fail();
+} catch (err) {
+    return err + 1;
+}
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn try_without_throw_runs_normal_path() {
+    let program = compile_source(
+        "\
+let value = 0;
+try {
+    value = 42;
+} catch (err) {
+    value = 1;
+}
+return value;
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn uncaught_throw_is_runtime_error() {
+    let program = compile_source("throw 42;").unwrap();
+    let err = Vm::new().run_program(&program).unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        ferrix_vm::VmErrorKind::UncaughtThrow {
+            value: Value::Int(42),
+        }
+    );
+}
+
+#[test]
 fn assignment_to_undefined_variable_is_compile_error() {
     let err = compile_source("missing = 1; return missing;").unwrap_err();
 
