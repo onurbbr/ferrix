@@ -268,6 +268,16 @@ impl Assembler {
         })
     }
 
+    /// Emits a custom extension call using an extension id from the string table.
+    pub fn call_extension(self, dst: u8, extension: u16, args_start: u8, arg_count: u8) -> Self {
+        self.push(Instruction::CallExtension {
+            dst: Register(dst),
+            extension: ferrix_core::bytecode::StringId(extension),
+            args_start: Register(args_start),
+            arg_count,
+        })
+    }
+
     /// Emits array allocation from a contiguous element register range.
     pub fn array_new(self, dst: u8, elements_start: u8, element_count: u8) -> Self {
         self.push(Instruction::ArrayNew {
