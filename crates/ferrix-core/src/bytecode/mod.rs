@@ -16,7 +16,9 @@ pub use disassembler::{Disassembler, format_instruction};
 pub use format::{
     BYTECODE_MAGIC, BytecodeFormat, BytecodeLimits, CURRENT_BYTECODE_VERSION, NO_FEATURE_FLAGS,
 };
-pub use instruction::{ConstId, FunctionId, Instruction, JumpTarget, Register, StringId};
+pub use instruction::{
+    CaptureId, ConstId, FunctionId, Instruction, JumpTarget, Register, StringId,
+};
 pub use program::{Function, FunctionKind, Program, ProgramBuildError};
 pub use serialization::{BytecodeDecodeError, BytecodeEncodeError, decode_program, encode_program};
 pub use verifier::{
