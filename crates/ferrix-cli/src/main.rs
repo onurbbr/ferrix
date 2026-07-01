@@ -39,20 +39,114 @@ Ferrix
 
 Usage:
   ferrix [--runtime-mode <mode>] [--runtime-home <dir>] [--format human|json] <command>
+  ferrix help [command]
   ferrix run <file|package> [--stats] [--audit] [--watch]
+  ferrix run --type bytecode <bytecode> [--stats] [--audit] [--watch]
   ferrix check <file|package> [--watch]
   ferrix compile <file|package> <output> [--explain-optimizations]
-  ferrix run-bytecode <file> [--stats] [--audit]
   ferrix debug <file|package>
   ferrix runtime start|stop|status|restart|metrics|events|config
-  ferrix ps
-  ferrix info <pid>
+  ferrix ps list
+  ferrix ps info <pid>
+  ferrix ps kill <pid>
   ferrix logs
   ferrix inspect <bytecode>
   ferrix explain <source|package>
-  ferrix kill <pid>
-  ferrix --help
   ferrix --version
+";
+
+const HELP_RUN: &str = "\
+Usage:
+  ferrix run <file|package> [--stats] [--audit] [--watch]
+  ferrix run --type bytecode <bytecode> [--stats] [--audit] [--watch]
+
+Runs a Ferrix program through ferrix-runtime.
+
+Types:
+  normal    Compile and run a source file, package directory, or Ferrix.toml manifest.
+  bytecode  Run a serialized .fxb bytecode container.
+
+Options:
+  --type <kind>      Select input kind. Omit it for normal source/package execution.
+  --stats           Print VM/runtime counters after execution.
+  --audit           Print runtime audit events.
+  --watch           Re-run when the input path changes.
+
+Examples:
+  ferrix run app.fx
+  ferrix run --type normal app.fx --stats
+  ferrix run --type bytecode app.fxb
+";
+
+const HELP_CHECK: &str = "\
+Usage:
+  ferrix check <file|package> [--watch]
+
+Compiles a source file or package without executing it.
+
+Options:
+  --watch           Re-check when the input path changes.
+
+Examples:
+  ferrix check app.fx
+  ferrix check . --watch
+";
+
+const HELP_LOGS: &str = "\
+Usage:
+  ferrix logs
+
+Lists completed CLI/runtime file operations recorded by the running runtime.
+
+Use `ferrix ps info <pid>` to inspect one process and read its captured output.
+";
+
+const HELP_PS: &str = "\
+Usage:
+  ferrix ps list
+  ferrix ps info <pid>
+  ferrix ps kill <pid>
+
+Inspects and controls runtime process records through ferrix-runtime.
+
+Subcommands:
+  list             List active runtime processes.
+  info <pid>       Show one process record and captured output.
+  kill <pid>       Mark an active process as killed.
+";
+
+const HELP_INSPECT: &str = "\
+Usage:
+  ferrix inspect <bytecode>
+
+Reads a serialized Ferrix bytecode container and prints metadata without
+executing it. Use `--format json` before the command for machine-readable output.
+";
+
+const HELP_EXPLAIN: &str = "\
+Usage:
+  ferrix explain <source|package>
+
+Compiles a source file or package and prints analysis information such as
+required features, capabilities, module dependencies, native dependencies, and
+optimizer activity. Use `--format json` before the command for machine-readable
+output.
+";
+
+const HELP_RUNTIME: &str = "\
+Usage:
+  ferrix runtime start|stop|status|restart|metrics|events|config
+
+Controls or inspects the local ferrix-runtime service.
+
+Subcommands:
+  start            Start the runtime daemon.
+  stop             Stop the runtime daemon.
+  restart          Restart the runtime daemon.
+  status           Print daemon health and counters.
+  metrics          Print aggregate runtime counters.
+  events           Print retained runtime events.
+  config           Print active runtime configuration.
 ";
 
 const MANIFEST_FILES: &[&str] = &["Ferrix.toml", "ferrix.toml"];
@@ -91,19 +185,29 @@ fn run_cli(
             write!(stdout, "{USAGE}").expect("stdout write failed");
             0
         }
-        [flag] if flag == "--help" || flag == "-h" => {
+        [command] if command == "help" => {
             write!(stdout, "{USAGE}").expect("stdout write failed");
             0
+        }
+        [command, topic] if command == "help" => help_command(topic, stdout, stderr),
+        [flag] if flag == "--help" || flag == "-h" => {
+            writeln!(
+                stderr,
+                "error: use `ferrix help` or `ferrix help <command>`\n"
+            )
+            .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
         }
         [flag] if flag == "--version" || flag == "-V" => {
             writeln!(stdout, "ferrix {}", env!("CARGO_PKG_VERSION")).expect("stdout write failed");
             0
         }
-        [command, path, options @ ..] if command == "run" => {
-            let Some(options) = parse_run_display_options(options, stderr) else {
+        [command, args @ ..] if command == "run" => {
+            let Some((path, options)) = parse_run_invocation(args, stderr) else {
                 return 64;
             };
-            run_file(path, &config, options, stdout, stderr)
+            run_selected(&path, &config, options, stdout, stderr)
         }
         [command, path, options @ ..] if command == "check" => {
             let Some(options) = parse_check_display_options(options, stderr) else {
@@ -126,9 +230,10 @@ fn run_cli(
             )
         }
         [command, path, options @ ..] if command == "run-bytecode" => {
-            let Some(options) = parse_run_display_options(options, stderr) else {
+            let Some(mut options) = parse_run_display_options(options, stderr) else {
                 return 64;
             };
+            options.input_type = RunInputType::Bytecode;
             run_bytecode(path, &config, options, stdout, stderr)
         }
         [command, path] if command == "debug" => debug_file(path, &config, stdin, stdout, stderr),
@@ -141,19 +246,12 @@ fn run_cli(
         [command, action] if command == "runtime" => {
             runtime_command(action, &config, stdout, stderr)
         }
-        [command] if command == "ps" => list_processes(&config, stdout, stderr),
+        [command] if command == "ps" => process_command(&[], &config, stdout, stderr),
+        [command, args @ ..] if command == "ps" => process_command(args, &config, stdout, stderr),
         [command] if command == "logs" => list_logs(&config, stdout, stderr),
-        [command, pid] if command == "info" => show_process_info(pid, &config, stdout, stderr),
-        [command, pid] if command == "kill" => kill_process(pid, &config, stdout, stderr),
         [command, path] if command == "inspect" => inspect_bytecode(path, &config, stdout, stderr),
         [command, path] if command == "explain" => {
             explain_source(path, &config, &mut read_file, stdout, stderr)
-        }
-        [command, ..] if command == "run" => {
-            writeln!(stderr, "error: expected a file or package path\n")
-                .expect("stderr write failed");
-            write!(stderr, "{USAGE}").expect("stderr write failed");
-            64
         }
         [command, ..] if command == "check" => {
             writeln!(stderr, "error: expected a file or package path\n")
@@ -189,24 +287,22 @@ fn run_cli(
             64
         }
         [command, ..] if command == "info" => {
-            writeln!(stderr, "error: expected a runtime process id\n")
-                .expect("stderr write failed");
-            write!(stderr, "{USAGE}").expect("stderr write failed");
+            writeln!(stderr, "error: use `ferrix ps info <pid>`\n").expect("stderr write failed");
+            write!(stderr, "{HELP_PS}").expect("stderr write failed");
             64
         }
         [command, ..] if command == "logs" => {
             writeln!(
                 stderr,
-                "error: logs does not accept a process id; use info <pid>\n"
+                "error: logs does not accept a process id; use ps info <pid>\n"
             )
             .expect("stderr write failed");
-            write!(stderr, "{USAGE}").expect("stderr write failed");
+            write!(stderr, "{HELP_LOGS}").expect("stderr write failed");
             64
         }
         [command, ..] if command == "kill" => {
-            writeln!(stderr, "error: expected a runtime process id\n")
-                .expect("stderr write failed");
-            write!(stderr, "{USAGE}").expect("stderr write failed");
+            writeln!(stderr, "error: use `ferrix ps kill <pid>`\n").expect("stderr write failed");
+            write!(stderr, "{HELP_PS}").expect("stderr write failed");
             64
         }
         [command, ..] if command == "inspect" => {
@@ -249,6 +345,14 @@ struct RunDisplayOptions {
     stats: bool,
     audit: bool,
     watch: WatchOptions,
+    input_type: RunInputType,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RunInputType {
+    #[default]
+    Normal,
+    Bytecode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -358,6 +462,99 @@ fn parse_runtime_options(
     }
 
     Ok((config, rest))
+}
+
+fn help_command(topic: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+    let help = match topic {
+        "run" => HELP_RUN,
+        "check" => HELP_CHECK,
+        "logs" => HELP_LOGS,
+        "ps" | "process" => HELP_PS,
+        "inspect" => HELP_INSPECT,
+        "explain" => HELP_EXPLAIN,
+        "runtime" => HELP_RUNTIME,
+        _ => {
+            writeln!(stderr, "error: unknown help topic `{topic}`\n").expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            return 64;
+        }
+    };
+    write!(stdout, "{help}").expect("stdout write failed");
+    0
+}
+
+fn parse_run_invocation(
+    args: &[String],
+    stderr: &mut impl io::Write,
+) -> Option<(String, RunDisplayOptions)> {
+    let mut options = RunDisplayOptions::default();
+    let mut path = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--stats" => options.stats = true,
+            "--audit" => options.audit = true,
+            "--watch" => options.watch.enabled = true,
+            "--watch-once" => {
+                options.watch.enabled = true;
+                options.watch.once = true;
+            }
+            "--type" => {
+                let Some(value) = args.get(index + 1) else {
+                    writeln!(stderr, "error: expected value after --type")
+                        .expect("stderr write failed");
+                    return None;
+                };
+                options.input_type = parse_run_input_type(value, stderr)?;
+                index += 1;
+            }
+            _ if arg.starts_with("--type=") => {
+                let value = arg.trim_start_matches("--type=");
+                options.input_type = parse_run_input_type(value, stderr)?;
+            }
+            _ if arg.starts_with('-') => {
+                writeln!(stderr, "error: unknown run option `{arg}`").expect("stderr write failed");
+                return None;
+            }
+            _ => {
+                if path.is_some() {
+                    writeln!(stderr, "error: run accepts exactly one input path")
+                        .expect("stderr write failed");
+                    return None;
+                }
+                path = Some(arg.clone());
+            }
+        }
+        index += 1;
+    }
+
+    let Some(path) = path else {
+        writeln!(
+            stderr,
+            "error: expected a file, package, or bytecode path\n"
+        )
+        .expect("stderr write failed");
+        write!(stderr, "{HELP_RUN}").expect("stderr write failed");
+        return None;
+    };
+    Some((path, options))
+}
+
+fn parse_run_input_type(value: &str, stderr: &mut impl io::Write) -> Option<RunInputType> {
+    match value {
+        "normal" | "source" => Some(RunInputType::Normal),
+        "bytecode" | "bc" => Some(RunInputType::Bytecode),
+        _ => {
+            writeln!(
+                stderr,
+                "error: invalid run type `{value}`; expected normal or bytecode"
+            )
+            .expect("stderr write failed");
+            None
+        }
+    }
 }
 
 fn parse_run_display_options(
@@ -1005,6 +1202,25 @@ fn json_escape(value: &str) -> String {
     escaped
 }
 
+fn process_command(
+    args: &[String],
+    config: &CliConfig,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    match args {
+        [] => list_processes(config, stdout, stderr),
+        [action] if action == "list" => list_processes(config, stdout, stderr),
+        [action, pid] if action == "info" => show_process_info(pid, config, stdout, stderr),
+        [action, pid] if action == "kill" => kill_process(pid, config, stdout, stderr),
+        [action, ..] => {
+            writeln!(stderr, "error: unknown ps action `{action}`\n").expect("stderr write failed");
+            write!(stderr, "{HELP_PS}").expect("stderr write failed");
+            64
+        }
+    }
+}
+
 fn list_processes(
     config: &CliConfig,
     stdout: &mut impl io::Write,
@@ -1513,6 +1729,19 @@ fn run_bytecode(
     stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> i32 {
+    if options.watch.enabled {
+        return watch_run_selected(path, config, options, stdout, stderr);
+    }
+    run_bytecode_once(path, config, options, stdout, stderr)
+}
+
+fn run_bytecode_once(
+    path: &str,
+    config: &CliConfig,
+    options: RunDisplayOptions,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
     let runtime = match runtime_gateway(config, stderr) {
         Ok(runtime) => runtime,
         Err(code) => return code,
@@ -1530,7 +1759,7 @@ fn run_bytecode(
     }
 }
 
-fn run_file(
+fn run_selected(
     path: &str,
     config: &CliConfig,
     options: RunDisplayOptions,
@@ -1538,9 +1767,22 @@ fn run_file(
     stderr: &mut impl io::Write,
 ) -> i32 {
     if options.watch.enabled {
-        return watch_run_file(path, config, options, stdout, stderr);
+        return watch_run_selected(path, config, options, stdout, stderr);
     }
-    run_file_once(path, config, options, stdout, stderr)
+    run_selected_once(path, config, options, stdout, stderr)
+}
+
+fn run_selected_once(
+    path: &str,
+    config: &CliConfig,
+    options: RunDisplayOptions,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    match options.input_type {
+        RunInputType::Normal => run_file_once(path, config, options, stdout, stderr),
+        RunInputType::Bytecode => run_bytecode_once(path, config, options, stdout, stderr),
+    }
 }
 
 fn run_file_once(
@@ -1569,7 +1811,7 @@ fn run_file_once(
     }
 }
 
-fn watch_run_file(
+fn watch_run_selected(
     path: &str,
     config: &CliConfig,
     mut options: RunDisplayOptions,
@@ -1582,7 +1824,7 @@ fn watch_run_file(
         let stamp = watched_path_stamp(Path::new(path));
         if last_stamp != Some(stamp) {
             writeln!(stdout, "watch: running {path}").expect("stdout write failed");
-            let code = run_file_once(path, config, options, stdout, stderr);
+            let code = run_selected_once(path, config, options, stdout, stderr);
             if options.watch.once {
                 return code;
             }
