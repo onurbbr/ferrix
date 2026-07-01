@@ -321,6 +321,18 @@ impl Encoder {
                 index,
                 value,
             } => self.three_reg(23, *array, *index, *value),
+            Instruction::PushHandler { error, target } => {
+                self.u8(33);
+                self.reg(*error);
+                self.u32(target.0);
+            }
+            Instruction::PopHandler => {
+                self.u8(34);
+            }
+            Instruction::Throw { src } => {
+                self.u8(35);
+                self.reg(*src);
+            }
             Instruction::Return { src } => {
                 self.u8(24);
                 self.reg(*src);
@@ -619,6 +631,12 @@ impl Decoder<'_> {
                     value,
                 }
             }
+            33 => Instruction::PushHandler {
+                error: self.reg()?,
+                target: JumpTarget(self.u32()?),
+            },
+            34 => Instruction::PopHandler,
+            35 => Instruction::Throw { src: self.reg()? },
             24 => Instruction::Return { src: self.reg()? },
             opcode => return Err(BytecodeDecodeError::InvalidInstructionOpcode { opcode }),
         })
