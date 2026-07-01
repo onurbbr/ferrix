@@ -1,7 +1,7 @@
 //! Custom extension registry for host-provided runtime operations.
 //!
-//! Extensions are deliberately runtime-owned instead of bytecode-owned. A
-//! future bytecode instruction can reference a stable extension id, while this
+//! Extensions are deliberately runtime-owned instead of bytecode-owned.
+//! `CallExtension` bytecode references a stable extension id, while this
 //! registry validates policy and resolves the host handler.
 
 use std::{collections::BTreeMap, sync::Arc};
