@@ -178,6 +178,14 @@ pub enum Instruction {
         index: Register,
         value: Register,
     },
+    PushHandler {
+        error: Register,
+        target: JumpTarget,
+    },
+    PopHandler,
+    Throw {
+        src: Register,
+    },
     Return {
         src: Register,
     },
@@ -246,6 +254,9 @@ impl Instruction {
                 index,
                 value,
             } => vec![*array, *index, *value],
+            Self::PushHandler { error, .. } => vec![*error],
+            Self::PopHandler => vec![],
+            Self::Throw { src } => vec![*src],
             Self::Return { src } => vec![*src],
         }
     }
@@ -271,7 +282,8 @@ impl Instruction {
         match self {
             Self::Jump { target }
             | Self::JumpIfFalse { target, .. }
-            | Self::JumpIfTrue { target, .. } => Some(*target),
+            | Self::JumpIfTrue { target, .. }
+            | Self::PushHandler { target, .. } => Some(*target),
             _ => None,
         }
     }
