@@ -68,6 +68,8 @@ pub struct RunBytecodeRequest {
     pub profile: RuntimeProfile,
     /// Whether runtime stats should be populated.
     pub collect_stats: bool,
+    /// Whether audit collection is requested.
+    pub collect_audit: bool,
     /// Output behavior for native functions.
     pub output: OutputMode,
     /// Extra host capabilities granted for this request.
@@ -81,6 +83,7 @@ impl RunBytecodeRequest {
             path: path.into(),
             profile: RuntimeProfile::Cli,
             collect_stats: false,
+            collect_audit: false,
             output: OutputMode::Capture,
             capabilities: Vec::new(),
         }
