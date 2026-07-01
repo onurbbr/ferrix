@@ -3,7 +3,8 @@
 use ferrix_core::{
     Value,
     bytecode::{
-        CaptureId, Chunk, Disassembler, Function, FunctionId, Instruction, Program, Register,
+        CaptureId, Chunk, Disassembler, Function, FunctionId, Instruction, JumpTarget, Program,
+        Register,
     },
 };
 
@@ -161,6 +162,24 @@ fn disassembles_upvalue_and_closure_instructions() {
     assert!(output.contains("0002 StoreUpvalue r0, r2\n"));
     assert!(output.contains("0003 LoadCaptureCell r3, cap#0\n"));
     assert!(output.contains("0004 StoreCapture cap#0, r2\n"));
+}
+
+#[test]
+fn disassembles_error_handling_instructions() {
+    let mut chunk = Chunk::new("errors", 2);
+    chunk.push_instruction(Instruction::PushHandler {
+        error: Register(0),
+        target: JumpTarget(3),
+    });
+    chunk.push_instruction(Instruction::Throw { src: Register(1) });
+    chunk.push_instruction(Instruction::PopHandler);
+    chunk.push_instruction(Instruction::Return { src: Register(0) });
+
+    let output = Disassembler::disassemble_chunk(&chunk);
+
+    assert!(output.contains("0000 PushHandler r0, @3\n"));
+    assert!(output.contains("0001 Throw       r1\n"));
+    assert!(output.contains("0002 PopHandler\n"));
 }
 
 #[test]
