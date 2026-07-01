@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use ferrix_vm::HostCapability;
+
 use crate::{RuntimeProcessKind, RuntimeProfile};
 
 /// How VM/native output should be handled.
@@ -31,6 +33,8 @@ pub struct RunSourceRequest {
     pub trace: bool,
     /// Output behavior for native functions.
     pub output: OutputMode,
+    /// Extra host capabilities granted for this request.
+    pub capabilities: Vec<HostCapability>,
 }
 
 impl RunSourceRequest {
@@ -44,7 +48,14 @@ impl RunSourceRequest {
             collect_audit: false,
             trace: false,
             output: OutputMode::Capture,
+            capabilities: Vec::new(),
         }
+    }
+
+    /// Adds one explicit host capability grant.
+    pub fn with_capability(mut self, capability: HostCapability) -> Self {
+        self.capabilities.push(capability);
+        self
     }
 }
 
@@ -59,6 +70,8 @@ pub struct RunBytecodeRequest {
     pub collect_stats: bool,
     /// Output behavior for native functions.
     pub output: OutputMode,
+    /// Extra host capabilities granted for this request.
+    pub capabilities: Vec<HostCapability>,
 }
 
 impl RunBytecodeRequest {
@@ -69,7 +82,14 @@ impl RunBytecodeRequest {
             profile: RuntimeProfile::Cli,
             collect_stats: false,
             output: OutputMode::Capture,
+            capabilities: Vec::new(),
         }
+    }
+
+    /// Adds one explicit host capability grant.
+    pub fn with_capability(mut self, capability: HostCapability) -> Self {
+        self.capabilities.push(capability);
+        self
     }
 }
 
