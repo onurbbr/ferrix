@@ -15,6 +15,7 @@ Implemented:
 - Native stdlib MVP: `print`, `len`, `type_of`, callable from source when referenced.
 - Source diagnostics with caret rendering and runtime stack traces.
 - CLI runner, bytecode compiler/runner, and instruction-level debugger for source files and same-directory static imports.
+- Runtime daemon modes, inspection commands, protocol metadata, process history, and event/metrics reporting.
 
 ## CLI
 
@@ -78,6 +79,11 @@ cargo run -p ferrix-cli -- --version
 cargo run -p ferrix-benchmarks --release
 ```
 
+Runtime architecture and compatibility notes live in:
+
+- `docs/runtime-architecture.md`
+- `docs/compatibility.md`
+
 Fuzz targets are available through `cargo-fuzz`:
 
 ```sh
@@ -93,5 +99,6 @@ Release-quality checks used for the current milestone:
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check
 cargo run -p ferrix-benchmarks --release
 ```
