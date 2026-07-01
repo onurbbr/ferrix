@@ -4,11 +4,11 @@
 //! layer gives CLI and future tooling a stable place to route daemon-backed
 //! execution without rewriting command dispatch.
 
-use std::{error::Error, fmt, str::FromStr};
+use std::{error::Error, fmt, path::PathBuf, str::FromStr};
 
 use crate::{
-    CompiledProgram, DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError,
-    RuntimeErrorKind, RuntimeService,
+    CompiledProgram, DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeDaemon,
+    RuntimeError, RuntimeService,
 };
 
 /// Runtime service mode requested by a caller.
@@ -81,15 +81,24 @@ impl fmt::Display for RuntimeModeParseError {
 impl Error for RuntimeModeParseError {}
 
 /// Mode-aware runtime gateway used by CLI execution commands.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RuntimeGateway {
     mode: RuntimeMode,
+    home: Option<PathBuf>,
 }
 
 impl RuntimeGateway {
     /// Creates a gateway with the selected runtime mode.
     pub fn new(mode: RuntimeMode) -> Self {
-        Self { mode }
+        Self { mode, home: None }
+    }
+
+    /// Creates a gateway with an explicit daemon home.
+    pub fn with_home(mode: RuntimeMode, home: impl Into<PathBuf>) -> Self {
+        Self {
+            mode,
+            home: Some(home.into()),
+        }
     }
 
     /// Creates a gateway using the default embedded runtime mode.
@@ -104,26 +113,48 @@ impl RuntimeGateway {
 
     /// Runs a source request through the selected runtime connection.
     pub fn run_source(&self, request: RunSourceRequest) -> Result<RunResult, RuntimeError> {
-        self.service()?.run_source(request)
+        match self.mode {
+            RuntimeMode::Embedded => RuntimeService::new().run_source(request),
+            RuntimeMode::Required => self.daemon().run_source(request),
+            RuntimeMode::Managed => {
+                let mut daemon = self.daemon();
+                daemon.ensure_started()?;
+                daemon.run_source(request)
+            }
+        }
     }
 
     /// Runs a bytecode request through the selected runtime connection.
     pub fn run_bytecode(&self, request: RunBytecodeRequest) -> Result<RunResult, RuntimeError> {
-        self.service()?.run_bytecode(request)
+        match self.mode {
+            RuntimeMode::Embedded => RuntimeService::new().run_bytecode(request),
+            RuntimeMode::Required => self.daemon().run_bytecode(request),
+            RuntimeMode::Managed => {
+                let mut daemon = self.daemon();
+                daemon.ensure_started()?;
+                daemon.run_bytecode(request)
+            }
+        }
     }
 
     /// Prepares a source program for the interactive debugger.
     pub fn prepare_debug(&self, request: DebugRequest) -> Result<CompiledProgram, RuntimeError> {
-        self.service()?.prepare_debug(request)
+        match self.mode {
+            RuntimeMode::Embedded => RuntimeService::new().prepare_debug(request),
+            RuntimeMode::Required => self.daemon().prepare_debug(request),
+            RuntimeMode::Managed => {
+                let mut daemon = self.daemon();
+                daemon.ensure_started()?;
+                daemon.prepare_debug(request)
+            }
+        }
     }
 
-    fn service(&self) -> Result<RuntimeService, RuntimeError> {
-        match self.mode {
-            RuntimeMode::Embedded => Ok(RuntimeService::new()),
-            RuntimeMode::Required | RuntimeMode::Managed => Err(RuntimeError::new(
-                69,
-                RuntimeErrorKind::RuntimeUnavailable { mode: self.mode },
-            )),
+    fn daemon(&self) -> RuntimeDaemon {
+        if let Some(home) = &self.home {
+            RuntimeDaemon::with_home(home.clone())
+        } else {
+            RuntimeDaemon::new()
         }
     }
 }
