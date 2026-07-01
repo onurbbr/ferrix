@@ -539,6 +539,78 @@ fn runs_arithmetic_program() {
 }
 
 #[test]
+fn runs_specialized_integer_arithmetic_program() {
+    let mut chunk = Chunk::new("main", 6);
+    let ten = chunk.add_constant(Value::Int(10)).unwrap();
+    let thirty_two = chunk.add_constant(Value::Int(32)).unwrap();
+    let two = chunk.add_constant(Value::Int(2)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: ten,
+    });
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(1),
+        constant: thirty_two,
+    });
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(2),
+        constant: two,
+    });
+    chunk.push_instruction(Instruction::AddInt {
+        dst: Register(3),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::SubInt {
+        dst: Register(3),
+        lhs: Register(3),
+        rhs: Register(2),
+    });
+    chunk.push_instruction(Instruction::MulInt {
+        dst: Register(4),
+        lhs: Register(3),
+        rhs: Register(2),
+    });
+    chunk.push_instruction(Instruction::DivInt {
+        dst: Register(5),
+        lhs: Register(4),
+        rhs: Register(2),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(5) });
+    let chunk = VerifiedChunk::new(chunk).unwrap();
+
+    let result = Vm::new().run(&chunk).unwrap();
+
+    assert_eq!(result, Value::Int(40));
+}
+
+#[test]
+fn runs_specialized_integer_comparison_program() {
+    let mut chunk = Chunk::new("main", 3);
+    let forty = chunk.add_constant(Value::Int(40)).unwrap();
+    let forty_two = chunk.add_constant(Value::Int(42)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: forty,
+    });
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(1),
+        constant: forty_two,
+    });
+    chunk.push_instruction(Instruction::LessEqualInt {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+    let chunk = VerifiedChunk::new(chunk).unwrap();
+
+    let result = Vm::new().run(&chunk).unwrap();
+
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
 fn move_copies_register_value() {
     let mut chunk = Chunk::new("main", 2);
     let value = chunk.add_constant(Value::Int(7)).unwrap();
