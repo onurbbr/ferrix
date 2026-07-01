@@ -491,6 +491,121 @@ return sum;
 }
 
 #[test]
+fn block_local_does_not_leak_after_scope_exit() {
+    let err = compile_source(
+        "\
+{
+    let x = 1;
+}
+return x;
+",
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::UndefinedVariable {
+            name: "x".to_string(),
+        }
+    );
+}
+
+#[test]
+fn block_local_can_shadow_outer_variable() {
+    let program = compile_source(
+        "\
+let x = 1;
+{
+    let x = 41;
+    x = x + 1;
+}
+return x;
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(1));
+}
+
+#[test]
+fn branch_local_does_not_escape_conditional_block() {
+    let err = compile_source(
+        "\
+if (true) {
+    let branch = 42;
+}
+return branch;
+",
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.kind,
+        CompileErrorKind::UndefinedVariable {
+            name: "branch".to_string(),
+        }
+    );
+}
+
+#[test]
+fn closure_captures_nearest_block_binding() {
+    let program = compile_source(
+        "\
+let x = 1;
+{
+    let x = 40;
+    let add = fn(y) {
+        return x + y;
+    };
+    return add(2);
+}
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn function_body_can_shadow_parameter() {
+    let program = compile_source(
+        "\
+let id = fn(x) {
+    let x = x + 1;
+    return x;
+};
+return id(41);
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn local_closure_can_shadow_builtin_function_name() {
+    let program = compile_source(
+        "\
+let len = fn() {
+    return 42;
+};
+return len();
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
 fn assignment_to_undefined_variable_is_compile_error() {
     let err = compile_source("missing = 1; return missing;").unwrap_err();
 
