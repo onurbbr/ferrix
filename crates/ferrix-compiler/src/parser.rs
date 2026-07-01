@@ -66,8 +66,18 @@ impl Parser {
 
     fn import_declaration(&mut self) -> Result<Stmt, CompileError> {
         let start = self.previous().span;
+        let module = self.consume_module_name()?;
+        let end = self.consume(&TokenKind::Semicolon, "`;`")?.span;
+
+        Ok(Stmt::Import {
+            module,
+            span: join(start, end),
+        })
+    }
+
+    fn consume_module_name(&mut self) -> Result<String, CompileError> {
         let module_token = self.advance().clone();
-        let TokenKind::Identifier(module) = module_token.kind else {
+        let TokenKind::Identifier(mut module) = module_token.kind else {
             return Err(self.error(
                 CompileErrorKind::UnexpectedToken {
                     expected: "module name".to_string(),
@@ -76,12 +86,23 @@ impl Parser {
                 module_token.span,
             ));
         };
-        let end = self.consume(&TokenKind::Semicolon, "`;`")?.span;
 
-        Ok(Stmt::Import {
-            module,
-            span: join(start, end),
-        })
+        while self.match_kind(&TokenKind::Dot) {
+            let segment_token = self.advance().clone();
+            let TokenKind::Identifier(segment) = segment_token.kind else {
+                return Err(self.error(
+                    CompileErrorKind::UnexpectedToken {
+                        expected: "module path segment".to_string(),
+                        found: segment_token.kind.describe(),
+                    },
+                    segment_token.span,
+                ));
+            };
+            module.push('.');
+            module.push_str(&segment);
+        }
+
+        Ok(module)
     }
 
     fn statement(&mut self) -> Result<Stmt, CompileError> {
