@@ -9,13 +9,15 @@ use std::collections::{HashMap, HashSet};
 use ferrix_core::{
     Value,
     bytecode::{
-        CaptureId, Chunk, ChunkBuildError, Function, FunctionId, Instruction, JumpTarget, Program,
-        ProgramBuildError, Register, VerifiedProgram, optimize_chunk,
+        CaptureId, Chunk, ChunkBuildError, Function, FunctionId, Instruction, JumpTarget,
+        OptimizationReport, Program, ProgramBuildError, Register, VerifiedProgram,
+        optimize_chunk_with_report,
     },
     diagnostics::FileId,
 };
 
 use crate::{
+    analysis::{CompileReport, build_compile_report, collect_module_dependencies},
     ast::{BinaryOp, Expr, Literal, ProgramAst, Stmt},
     error::{CompileError, CompileErrorKind},
     lexer::lex,
@@ -34,9 +36,23 @@ pub struct ImportedModuleAst {
     pub ast: ProgramAst,
 }
 
+/// Verified program plus compiler analysis and optimization metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompileOutput {
+    /// Verified bytecode program ready for runtime execution.
+    pub program: VerifiedProgram,
+    /// Analysis and optimization report for developer/runtime insight.
+    pub report: CompileReport,
+}
+
 /// Parses, analyzes, compiles, and verifies a source string using file id `0`.
 pub fn compile_source(source: &str) -> Result<VerifiedProgram, CompileError> {
-    compile_source_with_file_id(source, FileId(0))
+    compile_source_with_report(source).map(|output| output.program)
+}
+
+/// Parses, analyzes, compiles, verifies, and reports on a source string.
+pub fn compile_source_with_report(source: &str) -> Result<CompileOutput, CompileError> {
+    compile_source_with_file_id_report(source, FileId(0))
 }
 
 /// Parses, analyzes, compiles, and verifies a source string with a source file id.
@@ -44,8 +60,16 @@ pub fn compile_source_with_file_id(
     source: &str,
     file_id: FileId,
 ) -> Result<VerifiedProgram, CompileError> {
+    compile_source_with_file_id_report(source, file_id).map(|output| output.program)
+}
+
+/// Parses, analyzes, compiles, verifies, and reports on a source string.
+pub fn compile_source_with_file_id_report(
+    source: &str,
+    file_id: FileId,
+) -> Result<CompileOutput, CompileError> {
     let ast = parse_source_with_file_id(source, file_id)?;
-    compile_program_ast(ast)
+    compile_program_ast_with_report(ast)
 }
 
 /// Lexes and parses a source string into an AST with stable source spans.
@@ -59,8 +83,16 @@ pub fn parse_source_with_file_id(
 
 /// Analyzes, compiles, and verifies one AST without external modules.
 pub fn compile_program_ast(program_ast: ProgramAst) -> Result<VerifiedProgram, CompileError> {
+    compile_program_ast_with_report(program_ast).map(|output| output.program)
+}
+
+/// Analyzes, compiles, verifies, and reports on one AST without external modules.
+pub fn compile_program_ast_with_report(
+    program_ast: ProgramAst,
+) -> Result<CompileOutput, CompileError> {
+    let module_dependencies = collect_module_dependencies(&[&program_ast]);
     analyze(&program_ast)?;
-    Codegen::compile_program(program_ast, &[])
+    Codegen::compile_program(program_ast, &[], module_dependencies)
 }
 
 /// Compiles an entry AST with anonymous module ASTs linked before codegen.
@@ -68,8 +100,20 @@ pub fn compile_program_ast_with_modules(
     entry: ProgramAst,
     modules: Vec<ProgramAst>,
 ) -> Result<VerifiedProgram, CompileError> {
+    compile_program_ast_with_modules_report(entry, modules).map(|output| output.program)
+}
+
+/// Compiles an entry AST with anonymous modules and returns report metadata.
+pub fn compile_program_ast_with_modules_report(
+    entry: ProgramAst,
+    modules: Vec<ProgramAst>,
+) -> Result<CompileOutput, CompileError> {
+    let mut asts = Vec::with_capacity(modules.len() + 1);
+    asts.push(&entry);
+    asts.extend(modules.iter());
+    let module_dependencies = collect_module_dependencies(&asts);
     let (linked, aliases) = link_modules(entry, modules);
-    compile_program_ast_with_aliases(linked, aliases)
+    compile_program_ast_with_aliases_report(linked, aliases, module_dependencies)
 }
 
 /// Compiles an entry AST with modules exposed through namespace aliases.
@@ -77,16 +121,40 @@ pub fn compile_program_ast_with_named_modules(
     entry: ProgramAst,
     modules: Vec<ImportedModuleAst>,
 ) -> Result<VerifiedProgram, CompileError> {
-    let (linked, aliases) = link_named_modules(entry, modules);
-    compile_program_ast_with_aliases(linked, aliases)
+    compile_program_ast_with_named_modules_report(entry, modules).map(|output| output.program)
 }
 
-fn compile_program_ast_with_aliases(
+/// Compiles a named-module entry AST and returns report metadata.
+pub fn compile_program_ast_with_named_modules_report(
+    entry: ProgramAst,
+    modules: Vec<ImportedModuleAst>,
+) -> Result<CompileOutput, CompileError> {
+    let mut asts = Vec::with_capacity(modules.len() + 1);
+    asts.push(&entry);
+    asts.extend(modules.iter().map(|module| &module.ast));
+    let module_dependencies = collect_module_dependencies(&asts);
+    let (linked, aliases) = link_named_modules(entry, modules);
+    compile_program_ast_with_aliases_report(linked, aliases, module_dependencies)
+}
+
+fn compile_program_ast_with_aliases_report(
     program_ast: ProgramAst,
     aliases: Vec<(String, String)>,
-) -> Result<VerifiedProgram, CompileError> {
+    module_dependencies: Vec<String>,
+) -> Result<CompileOutput, CompileError> {
     analyze_with_function_aliases(&program_ast, &aliases)?;
-    Codegen::compile_program(program_ast, &aliases)
+    Codegen::compile_program(program_ast, &aliases, module_dependencies)
+}
+
+struct GeneratedFunction {
+    id: FunctionId,
+    function: Function,
+    optimization_report: OptimizationReport,
+}
+
+struct FinishedChunk {
+    chunk: Chunk,
+    optimization_report: OptimizationReport,
 }
 
 struct Codegen {
@@ -99,7 +167,7 @@ struct Codegen {
     next_register: u16,
     free_registers: Vec<Register>,
     next_function_id: u16,
-    generated_functions: Vec<(FunctionId, Function)>,
+    generated_functions: Vec<GeneratedFunction>,
 }
 
 impl Codegen {
@@ -187,9 +255,11 @@ impl Codegen {
     fn compile_program(
         program_ast: ProgramAst,
         aliases: &[(String, String)],
-    ) -> Result<VerifiedProgram, CompileError> {
+        module_dependencies: Vec<String>,
+    ) -> Result<CompileOutput, CompileError> {
         let referenced_builtins = referenced_builtins(&program_ast);
         let function_ids = function_ids(&program_ast, &referenced_builtins, aliases)?;
+        let mut optimization_reports = Vec::new();
         let main_function_index = program_ast
             .statements
             .iter()
@@ -249,9 +319,14 @@ impl Codegen {
                 )?;
                 compiler.compile_function_body(body)?;
                 let generated_functions = std::mem::take(&mut compiler.generated_functions);
-                program.functions[usize::from(function_id.0)] =
-                    Function::bytecode(compiler.finish_chunk()?);
-                append_generated_functions(&mut program, generated_functions)?;
+                let finished = compiler.finish_chunk()?;
+                program.functions[usize::from(function_id.0)] = Function::bytecode(finished.chunk);
+                optimization_reports.push(finished.optimization_report);
+                append_generated_functions(
+                    &mut program,
+                    &mut optimization_reports,
+                    generated_functions,
+                )?;
             }
         }
 
@@ -273,23 +348,36 @@ impl Codegen {
             }
         }
         let generated_functions = std::mem::take(&mut main_compiler.generated_functions);
-        append_generated_functions(&mut program, generated_functions)?;
+        append_generated_functions(&mut program, &mut optimization_reports, generated_functions)?;
+        let finished = main_compiler.finish_chunk()?;
         let main_id = program
-            .add_function(Function::bytecode(main_compiler.finish_chunk()?))
+            .add_function(Function::bytecode(finished.chunk))
             .map_err(map_program_error)?;
+        optimization_reports.push(finished.optimization_report);
         program.entry = main_id;
 
-        VerifiedProgram::new(program)
-            .map_err(|error| CompileError::new(CompileErrorKind::BytecodeVerification(error), None))
+        let program = VerifiedProgram::new(program).map_err(|error| {
+            CompileError::new(CompileErrorKind::BytecodeVerification(error), None)
+        })?;
+        let report = build_compile_report(
+            program.as_program(),
+            module_dependencies,
+            optimization_reports,
+        );
+        Ok(CompileOutput { program, report })
     }
 
-    fn finish_chunk(mut self) -> Result<Chunk, CompileError> {
+    fn finish_chunk(mut self) -> Result<FinishedChunk, CompileError> {
         self.chunk.register_count = self
             .next_register
             .try_into()
             .map_err(|_| CompileError::new(CompileErrorKind::TooManyRegisters, None))?;
 
-        Ok(optimize_chunk(self.chunk))
+        let optimized = optimize_chunk_with_report(self.chunk);
+        Ok(FinishedChunk {
+            chunk: optimized.chunk,
+            optimization_report: optimized.report,
+        })
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
@@ -1023,8 +1111,12 @@ impl Codegen {
         self.next_function_id = compiler.next_function_id;
         self.generated_functions
             .extend(std::mem::take(&mut compiler.generated_functions));
-        self.generated_functions
-            .push((function_id, Function::bytecode(compiler.finish_chunk()?)));
+        let finished = compiler.finish_chunk()?;
+        self.generated_functions.push(GeneratedFunction {
+            id: function_id,
+            function: Function::bytecode(finished.chunk),
+            optimization_report: finished.optimization_report,
+        });
 
         let captures_start = if captures.is_empty() {
             Register(0)
@@ -1839,11 +1931,12 @@ fn map_program_error(error: ProgramBuildError) -> CompileError {
 
 fn append_generated_functions(
     program: &mut Program,
-    mut functions: Vec<(FunctionId, Function)>,
+    optimization_reports: &mut Vec<OptimizationReport>,
+    mut functions: Vec<GeneratedFunction>,
 ) -> Result<(), CompileError> {
-    functions.sort_by_key(|(id, _)| id.0);
-    for (function_id, function) in functions {
-        if usize::from(function_id.0) != program.functions.len() {
+    functions.sort_by_key(|function| function.id.0);
+    for generated in functions {
+        if usize::from(generated.id.0) != program.functions.len() {
             return Err(CompileError::new(
                 CompileErrorKind::TooManyFunctions {
                     max: u16::MAX as usize,
@@ -1851,7 +1944,10 @@ fn append_generated_functions(
                 None,
             ));
         }
-        program.add_function(function).map_err(map_program_error)?;
+        program
+            .add_function(generated.function)
+            .map_err(map_program_error)?;
+        optimization_reports.push(generated.optimization_report);
     }
     Ok(())
 }
