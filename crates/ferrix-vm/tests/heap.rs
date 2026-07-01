@@ -26,6 +26,7 @@ fn heap_object_limit_is_typed_error() {
         max_instruction_count: 1,
         max_call_depth: 1,
         max_heap_objects: 1,
+        gc_allocation_threshold: 0,
     };
     heap.allocate(Obj::String("one".to_string()), limits)
         .unwrap();
