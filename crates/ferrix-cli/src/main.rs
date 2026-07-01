@@ -27,6 +27,7 @@ use ferrix_core::{
 use ferrix_runtime::{
     DebugRequest, RecordProcessRequest, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon,
     RuntimeGateway, RuntimeMode, RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord,
+    RuntimeProfile,
 };
 use ferrix_vm::{CallFrame, DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
 
@@ -863,6 +864,7 @@ fn debug_file(
     let program = compiled.program;
 
     let mut vm = Vm::new();
+    vm.set_capabilities(RuntimeProfile::Cli.default_capabilities().iter().copied());
     ferrix_stdlib::install(&mut vm, program.as_program());
     let outcome = {
         let mut debugger = CliDebugger::new(stdin, stdout, &sources);
