@@ -5,6 +5,7 @@
 
 use std::{error::Error, fmt, str::FromStr};
 
+use ferrix_vm::HostCapability;
 use ferrix_vm::RuntimeLimits;
 
 /// Named runtime behavior profile.
@@ -38,10 +39,65 @@ impl RuntimeProfile {
     /// Returns VM limits for this profile.
     pub fn limits(self) -> RuntimeLimits {
         match self {
-            Self::Development | Self::Cli | Self::Safe | Self::Server | Self::Trusted => {
-                RuntimeLimits::default()
-            }
+            Self::Development | Self::Cli | Self::Trusted => RuntimeLimits::default(),
+            Self::Safe => RuntimeLimits {
+                max_instruction_count: 100_000,
+                max_call_depth: 128,
+                max_heap_objects: 100_000,
+                gc_allocation_threshold: 1_024,
+                gc_incremental_step_budget: 32,
+            },
+            Self::Server => RuntimeLimits {
+                max_instruction_count: 500_000,
+                max_call_depth: 256,
+                max_heap_objects: 250_000,
+                gc_allocation_threshold: 2_048,
+                gc_incremental_step_budget: 64,
+            },
         }
+    }
+
+    /// Returns default host capabilities granted by this profile.
+    pub fn default_capabilities(self) -> &'static [HostCapability] {
+        match self {
+            Self::Development => &[
+                HostCapability::NativeCall,
+                HostCapability::IoOutput,
+                HostCapability::FsRead,
+                HostCapability::FsWrite,
+                HostCapability::EnvRead,
+                HostCapability::TimeRead,
+                HostCapability::ModuleLoad,
+                HostCapability::ExtensionCall,
+            ],
+            Self::Safe => &[],
+            Self::Cli => &[
+                HostCapability::NativeCall,
+                HostCapability::IoOutput,
+                HostCapability::ModuleLoad,
+                HostCapability::TimeRead,
+            ],
+            Self::Server => &[
+                HostCapability::NativeCall,
+                HostCapability::ModuleLoad,
+                HostCapability::TimeRead,
+            ],
+            Self::Trusted => &[
+                HostCapability::NativeCall,
+                HostCapability::IoOutput,
+                HostCapability::FsRead,
+                HostCapability::FsWrite,
+                HostCapability::EnvRead,
+                HostCapability::TimeRead,
+                HostCapability::ModuleLoad,
+                HostCapability::ExtensionCall,
+            ],
+        }
+    }
+
+    /// Returns true when audit collection should be on by default.
+    pub fn audit_enabled(self) -> bool {
+        matches!(self, Self::Safe | Self::Server)
     }
 }
 
