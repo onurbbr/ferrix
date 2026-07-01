@@ -22,6 +22,7 @@ pub enum Stmt {
     Let {
         name: String,
         initializer: Expr,
+        exported: bool,
         span: SourceSpan,
     },
     /// Top-level function declaration.
@@ -29,6 +30,7 @@ pub enum Stmt {
         name: String,
         params: Vec<String>,
         body: Vec<Stmt>,
+        exported: bool,
         span: SourceSpan,
     },
     /// Assignment to an existing local variable.
