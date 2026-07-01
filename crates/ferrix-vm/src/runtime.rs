@@ -11,7 +11,7 @@ use ferrix_core::{
     Obj, ObjRef, Value,
     bytecode::{
         Chunk, ConstId, FunctionId, FunctionKind, Instruction, JumpTarget, Program, Register,
-        VerifiedChunk, VerifiedProgram, format_instruction,
+        StringId, VerifiedChunk, VerifiedProgram, format_instruction,
     },
 };
 
@@ -484,6 +484,15 @@ impl Vm {
                     let reference = self.allocate_object(Obj::Map(entries))?;
                     self.write_register(ip, *dst, Value::Obj(reference))?;
                 }
+                Instruction::RecordNew {
+                    dst,
+                    fields_start,
+                    fields,
+                } => {
+                    let fields = self.read_record_fields(ip, *fields_start, fields, chunk)?;
+                    let reference = self.allocate_object(Obj::Record(fields))?;
+                    self.write_register(ip, *dst, Value::Obj(reference))?;
+                }
                 Instruction::IndexGet { dst, target, index } => {
                     let value = self.index_get(ip, *target, *index)?;
                     self.write_register(ip, *dst, value)?;
@@ -505,6 +514,17 @@ impl Vm {
                     value,
                 } => {
                     self.array_set(ip, *array, *index, *value)?;
+                }
+                Instruction::FieldGet { dst, target, field } => {
+                    let value = self.field_get(ip, *target, *field, chunk)?;
+                    self.write_register(ip, *dst, value)?;
+                }
+                Instruction::FieldSet {
+                    target,
+                    field,
+                    value,
+                } => {
+                    self.field_set(ip, *target, *field, *value, chunk)?;
                 }
                 Instruction::PushHandler { error, target } => {
                     self.push_exception_handler_for_chunk(
@@ -775,6 +795,15 @@ impl Vm {
                     let reference = self.allocate_object(Obj::Map(entries))?;
                     self.write_register(ip, dst, Value::Obj(reference))?;
                 }
+                Instruction::RecordNew {
+                    dst,
+                    fields_start,
+                    fields,
+                } => {
+                    let fields = self.read_record_fields(ip, fields_start, &fields, chunk)?;
+                    let reference = self.allocate_object(Obj::Record(fields))?;
+                    self.write_register(ip, dst, Value::Obj(reference))?;
+                }
                 Instruction::IndexGet { dst, target, index } => {
                     let value = self.index_get(ip, target, index)?;
                     self.write_register(ip, dst, value)?;
@@ -796,6 +825,17 @@ impl Vm {
                     value,
                 } => {
                     self.array_set(ip, array, index, value)?;
+                }
+                Instruction::FieldGet { dst, target, field } => {
+                    let value = self.field_get(ip, target, field, chunk)?;
+                    self.write_register(ip, dst, value)?;
+                }
+                Instruction::FieldSet {
+                    target,
+                    field,
+                    value,
+                } => {
+                    self.field_set(ip, target, field, value, chunk)?;
                 }
                 Instruction::PushHandler { error, target } => {
                     self.push_exception_handler(ip, error, target, chunk.instructions.len())?;
@@ -1498,6 +1538,93 @@ impl Vm {
         Ok(entries)
     }
 
+    fn read_record_fields(
+        &self,
+        ip: usize,
+        fields_start: Register,
+        field_ids: &[StringId],
+        chunk: &Chunk,
+    ) -> Result<Vec<(String, Value)>, VmError> {
+        let mut fields = Vec::with_capacity(field_ids.len());
+        for (offset, field_id) in field_ids.iter().enumerate() {
+            let register = fields_start
+                .0
+                .checked_add(offset.try_into().unwrap_or(u8::MAX))
+                .ok_or_else(|| {
+                    VmError::new(
+                        Some(ip),
+                        VmErrorKind::InvalidRegister {
+                            register: Register(u8::MAX),
+                            register_count: self.register_count(),
+                        },
+                    )
+                })?;
+            let field = self.read_field_name(ip, *field_id, chunk)?;
+            let value = self.read_register(ip, Register(register))?;
+            if let Some(index) = record_field_index(&fields, &field) {
+                fields[index].1 = value;
+            } else {
+                fields.push((field, value));
+            }
+        }
+        Ok(fields)
+    }
+
+    fn field_get(
+        &self,
+        ip: usize,
+        target_register: Register,
+        field: StringId,
+        chunk: &Chunk,
+    ) -> Result<Value, VmError> {
+        let target = self.read_record_ref(ip, target_register)?;
+        let field = self.read_field_name(ip, field, chunk)?;
+        let Obj::Record(fields) = self.heap.get(target)? else {
+            let found = self.read_register(ip, target_register)?;
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "record",
+                    found,
+                },
+            ));
+        };
+        Ok(record_field_index(fields, &field)
+            .map(|index| fields[index].1)
+            .unwrap_or(Value::Nil))
+    }
+
+    fn field_set(
+        &mut self,
+        ip: usize,
+        target_register: Register,
+        field: StringId,
+        value_register: Register,
+        chunk: &Chunk,
+    ) -> Result<(), VmError> {
+        let target = self.read_record_ref(ip, target_register)?;
+        let field = self.read_field_name(ip, field, chunk)?;
+        let value = self.read_register(ip, value_register)?;
+        let found = self.read_register(ip, target_register)?;
+
+        let Obj::Record(fields) = self.heap.get_mut(target)? else {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "record",
+                    found,
+                },
+            ));
+        };
+
+        if let Some(index) = record_field_index(fields, &field) {
+            fields[index].1 = value;
+        } else {
+            fields.push((field, value));
+        }
+        Ok(())
+    }
+
     fn map_entry_index(
         &self,
         entries: &[(Value, Value)],
@@ -1523,6 +1650,40 @@ impl Vm {
             (Obj::String(lhs), Obj::String(rhs)) => Ok(lhs == rhs),
             _ => Ok(false),
         }
+    }
+
+    fn read_record_ref(&self, ip: usize, register: Register) -> Result<ObjRef, VmError> {
+        match self.read_register(ip, register)? {
+            Value::Obj(reference) => Ok(reference),
+            found => Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "record",
+                    found,
+                },
+            )),
+        }
+    }
+
+    fn read_field_name(
+        &self,
+        ip: usize,
+        field: StringId,
+        chunk: &Chunk,
+    ) -> Result<String, VmError> {
+        chunk
+            .strings
+            .get(usize::from(field.0))
+            .cloned()
+            .ok_or_else(|| {
+                VmError::new(
+                    Some(ip),
+                    VmErrorKind::InvalidString {
+                        string: field,
+                        string_count: chunk.strings.len(),
+                    },
+                )
+            })
     }
 
     fn write_binary_int(
@@ -1723,6 +1884,12 @@ fn array_index(index: i64, len: usize, ip: usize) -> Result<usize, VmError> {
     Ok(index)
 }
 
+fn record_field_index(fields: &[(String, Value)], field: &str) -> Option<usize> {
+    fields
+        .iter()
+        .position(|(existing_field, _)| existing_field == field)
+}
+
 fn program_constant_roots(program: &Program) -> Vec<ObjRef> {
     let mut roots = RootSet::new();
     roots.insert_program_constants(program);
@@ -1742,6 +1909,10 @@ fn object_references(object: &Obj) -> Vec<ObjRef> {
             .iter()
             .flat_map(|(key, value)| [key.as_obj_ref(), value.as_obj_ref()])
             .flatten()
+            .collect(),
+        Obj::Record(fields) => fields
+            .iter()
+            .filter_map(|(_, value)| value.as_obj_ref())
             .collect(),
         Obj::Upvalue(value) => value.as_obj_ref().into_iter().collect(),
         Obj::Closure { captures, .. } => captures.iter().filter_map(Value::as_obj_ref).collect(),
