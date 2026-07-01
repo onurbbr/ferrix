@@ -17,18 +17,20 @@ pub mod service;
 
 pub use daemon::{
     RuntimeCheckpoint, RuntimeDaemon, RuntimeHealth, RuntimeStateStore, RuntimeStatusReport,
-    default_runtime_home,
+    default_config_path, default_ferrix_home, default_runtime_home, ensure_default_layout,
 };
 pub use event::{RuntimeEvent, RuntimeEventBus, RuntimeEventKind};
-pub use mode::{RuntimeGateway, RuntimeMode, RuntimeModeParseError};
+pub use mode::{
+    RuntimeConnection, RuntimeController, RuntimeGateway, RuntimeMode, RuntimeModeParseError,
+};
 pub use process::{
     RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord, RuntimeProcessStatus,
     RuntimeProcessTable, RuntimeSessionId,
 };
 pub use profile::{RuntimeProfile, RuntimeProfileParseError};
 pub use request::{
-    CompileRequest, DebugRequest, InspectBytecodeRequest, OutputMode, RunBytecodeRequest,
-    RunSourceRequest,
+    CompileRequest, DebugRequest, InspectBytecodeRequest, OutputMode, RecordProcessRequest,
+    RunBytecodeRequest, RunSourceRequest,
 };
 pub use result::{
     CompileResult, DebugSessionResult, InspectResult, RunResult, RuntimeError, RuntimeErrorKind,
