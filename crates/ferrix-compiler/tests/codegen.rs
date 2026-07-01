@@ -270,6 +270,50 @@ return user.age;
 }
 
 #[test]
+fn compiles_record_receiver_method_call() {
+    let program = compile_source(
+        "\
+fn age(user: record): int {
+    return user.age;
+}
+
+let user = { age: 42 };
+return user.age();
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compiles_receiver_method_call_with_arguments() {
+    let program = compile_source(
+        "\
+fn rename(user: record, name: string): string {
+    user.name = name;
+    return user.name;
+}
+
+let user = { name: \"old\" };
+return user.rename(\"Ferrix\");
+",
+    )
+    .unwrap();
+    let mut vm = Vm::new();
+
+    let result = vm.run_program(&program).unwrap();
+    let reference = result.as_obj_ref().unwrap();
+
+    assert_eq!(
+        vm.heap_object(reference).unwrap(),
+        &Obj::String("Ferrix".to_string())
+    );
+}
+
+#[test]
 fn compiles_record_literal_to_heap_record() {
     let program = compile_source("return { answer: 42 };").unwrap();
     let mut vm = Vm::new();
