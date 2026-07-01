@@ -140,6 +140,11 @@ declares:
 The registry validates existence, arity, `extension.call`, and any additional
 capabilities before invoking the host handler.
 
+Bytecode calls extensions with `CallExtension`, which references the stable
+extension id through the bytecode string pool. The verifier checks the string id
+and argument register range before execution; the VM dispatches the call through
+runtime-installed handlers.
+
 ## Native Function Registry
 
 The standard library installs native functions into the VM. Native callbacks
