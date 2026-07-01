@@ -45,10 +45,14 @@ fn run_file_prints_non_nil_result() {
 fn run_file_requires_runtime_when_mode_is_required() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
+    let runtime_home = dir.join("runtime");
 
     let output = run_with_env(
         ["run", file.to_str().unwrap()],
-        [("FERRIX_RUNTIME_MODE", "required")],
+        [
+            ("FERRIX_RUNTIME_MODE", "required"),
+            ("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap()),
+        ],
     );
 
     assert_eq!(output.status.code(), Some(69));
@@ -60,13 +64,122 @@ fn run_file_requires_runtime_when_mode_is_required() {
 }
 
 #[test]
+fn runtime_lifecycle_commands_report_status() {
+    let dir = temp_dir();
+    let runtime_home = dir.join("runtime");
+
+    let start = run_with_env(
+        ["runtime", "start"],
+        [("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap())],
+    );
+    assert_eq!(start.status.code(), Some(0));
+    assert!(stdout(&start).contains("runtime: serving"));
+    assert!(stderr(&start).is_empty());
+
+    let status = run_with_env(
+        ["runtime", "status"],
+        [("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap())],
+    );
+    assert_eq!(status.status.code(), Some(0));
+    assert!(stdout(&status).contains("runtime: serving"));
+    assert!(stderr(&status).is_empty());
+
+    let stop = run_with_env(
+        ["runtime", "stop"],
+        [("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap())],
+    );
+    assert_eq!(stop.status.code(), Some(0));
+    assert!(stdout(&stop).contains("runtime: stopped"));
+    assert!(stderr(&stop).is_empty());
+}
+
+#[test]
+fn required_runtime_mode_runs_through_started_daemon_and_records_process() {
+    let dir = temp_dir();
+    let runtime_home = dir.join("runtime");
+    let file = write_file(
+        &dir,
+        "main.fx",
+        "\
+print(\"hello\");
+return 42;
+",
+    );
+
+    let start = run_with_env(
+        ["runtime", "start"],
+        [("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap())],
+    );
+    assert_eq!(start.status.code(), Some(0));
+
+    let output = run_with_env(
+        ["run", file.to_str().unwrap()],
+        [
+            ("FERRIX_RUNTIME_MODE", "required"),
+            ("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "hello\n42\n");
+    assert!(stderr(&output).is_empty());
+
+    let ps = run_with_env(
+        ["ps"],
+        [("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap())],
+    );
+    assert_eq!(ps.status.code(), Some(0));
+    assert!(stdout(&ps).contains("pid\tsession\tstatus\tkind\tpath"));
+    assert!(stdout(&ps).contains("completed\tsource"));
+    assert!(stderr(&ps).is_empty());
+
+    let logs = run_with_env(
+        ["logs", "1"],
+        [("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap())],
+    );
+    assert_eq!(logs.status.code(), Some(0));
+    assert_eq!(stdout(&logs), "hello\n42\n");
+    assert!(stderr(&logs).is_empty());
+}
+
+#[test]
+fn managed_runtime_mode_starts_daemon_automatically() {
+    let dir = temp_dir();
+    let runtime_home = dir.join("runtime");
+    let file = write_file(&dir, "main.fx", "return 42;\n");
+
+    let output = run_with_env(
+        ["run", file.to_str().unwrap()],
+        [
+            ("FERRIX_RUNTIME_MODE", "managed"),
+            ("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap()),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "42\n");
+    assert!(stderr(&output).is_empty());
+
+    let status = run_with_env(
+        ["runtime", "status"],
+        [("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap())],
+    );
+    assert_eq!(status.status.code(), Some(0));
+    assert!(stdout(&status).contains("runtime: serving"));
+    assert!(stdout(&status).contains("completed: 1"));
+}
+
+#[test]
 fn check_file_does_not_require_runtime_service_state() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "print(42);\nreturn 99;\n");
+    let runtime_home = dir.join("runtime");
 
     let output = run_with_env(
         ["check", file.to_str().unwrap()],
-        [("FERRIX_RUNTIME_MODE", "required")],
+        [
+            ("FERRIX_RUNTIME_MODE", "required"),
+            ("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap()),
+        ],
     );
 
     assert_eq!(output.status.code(), Some(0));
@@ -509,10 +622,14 @@ fn debug_file_steps_and_prints_registers() {
 fn debug_file_requires_runtime_when_mode_is_required() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "return 42;\n");
+    let runtime_home = dir.join("runtime");
 
     let output = run_with_env(
         ["debug", file.to_str().unwrap()],
-        [("FERRIX_RUNTIME_MODE", "required")],
+        [
+            ("FERRIX_RUNTIME_MODE", "required"),
+            ("FERRIX_RUNTIME_HOME", runtime_home.to_str().unwrap()),
+        ],
     );
 
     assert_eq!(output.status.code(), Some(69));
@@ -743,6 +860,7 @@ fn run<const N: usize>(args: [&str; N]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ferrix-cli"))
         .args(args)
         .env_remove("FERRIX_RUNTIME_MODE")
+        .env_remove("FERRIX_RUNTIME_HOME")
         .output()
         .expect("failed to run ferrix-cli")
 }
@@ -754,6 +872,7 @@ fn run_with_env<const N: usize, const M: usize>(
     Command::new(env!("CARGO_BIN_EXE_ferrix-cli"))
         .args(args)
         .env_remove("FERRIX_RUNTIME_MODE")
+        .env_remove("FERRIX_RUNTIME_HOME")
         .envs(envs)
         .output()
         .expect("failed to run ferrix-cli")
@@ -766,6 +885,7 @@ fn run_with_input<const N: usize>(args: [&str; N], input: &str) -> std::process:
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferrix-cli"))
         .args(args)
         .env_remove("FERRIX_RUNTIME_MODE")
+        .env_remove("FERRIX_RUNTIME_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
