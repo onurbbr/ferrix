@@ -403,8 +403,23 @@ impl Vm {
                         },
                     ));
                 }
+                Instruction::MakeUpvalue { dst, src } => {
+                    let value = self.read_register(ip, *src)?;
+                    let reference = self.allocate_object(Obj::Upvalue(value))?;
+                    self.write_register(ip, *dst, Value::Obj(reference))?;
+                }
+                Instruction::LoadUpvalue { dst, upvalue } => {
+                    let value = self.load_upvalue_from_register(ip, *upvalue)?;
+                    self.write_register(ip, *dst, value)?;
+                }
+                Instruction::StoreUpvalue { upvalue, src } => {
+                    let value = self.read_register(ip, *src)?;
+                    self.store_upvalue_from_register(ip, *upvalue, value)?;
+                }
                 Instruction::MakeClosure { .. }
                 | Instruction::LoadCapture { .. }
+                | Instruction::LoadCaptureCell { .. }
+                | Instruction::StoreCapture { .. }
                 | Instruction::CallValue { .. } => {
                     return Err(VmError::new(
                         Some(ip),
@@ -636,6 +651,19 @@ impl Vm {
                         continue;
                     }
                 }
+                Instruction::MakeUpvalue { dst, src } => {
+                    let value = self.read_register(ip, src)?;
+                    let reference = self.allocate_object(Obj::Upvalue(value))?;
+                    self.write_register(ip, dst, Value::Obj(reference))?;
+                }
+                Instruction::LoadUpvalue { dst, upvalue } => {
+                    let value = self.load_upvalue_from_register(ip, upvalue)?;
+                    self.write_register(ip, dst, value)?;
+                }
+                Instruction::StoreUpvalue { upvalue, src } => {
+                    let value = self.read_register(ip, src)?;
+                    self.store_upvalue_from_register(ip, upvalue, value)?;
+                }
                 Instruction::MakeClosure {
                     dst,
                     function,
@@ -647,20 +675,16 @@ impl Vm {
                     self.write_register(ip, dst, Value::Obj(reference))?;
                 }
                 Instruction::LoadCapture { dst, capture } => {
-                    let value = self.frames[frame_index]
-                        .captures
-                        .get(usize::from(capture.0))
-                        .copied()
-                        .ok_or_else(|| {
-                            VmError::new(
-                                Some(ip),
-                                VmErrorKind::InvalidCapture {
-                                    capture,
-                                    capture_count: self.frames[frame_index].captures.len(),
-                                },
-                            )
-                        })?;
+                    let value = self.load_capture(ip, frame_index, capture)?;
                     self.write_register(ip, dst, value)?;
+                }
+                Instruction::LoadCaptureCell { dst, capture } => {
+                    let value = self.capture_cell(ip, frame_index, capture)?;
+                    self.write_register(ip, dst, value)?;
+                }
+                Instruction::StoreCapture { capture, src } => {
+                    let value = self.read_register(ip, src)?;
+                    self.store_capture(ip, frame_index, capture, value)?;
                 }
                 Instruction::CallValue {
                     dst,
@@ -846,6 +870,105 @@ impl Vm {
             Some(ip),
         )?;
         Ok(true)
+    }
+
+    fn capture_cell(
+        &self,
+        ip: usize,
+        frame_index: usize,
+        capture: ferrix_core::bytecode::CaptureId,
+    ) -> Result<Value, VmError> {
+        self.frames[frame_index]
+            .captures
+            .get(usize::from(capture.0))
+            .copied()
+            .ok_or_else(|| {
+                VmError::new(
+                    Some(ip),
+                    VmErrorKind::InvalidCapture {
+                        capture,
+                        capture_count: self.frames[frame_index].captures.len(),
+                    },
+                )
+            })
+    }
+
+    fn load_capture(
+        &self,
+        ip: usize,
+        frame_index: usize,
+        capture: ferrix_core::bytecode::CaptureId,
+    ) -> Result<Value, VmError> {
+        let cell = self.capture_cell(ip, frame_index, capture)?;
+        self.load_upvalue_value(ip, cell)
+    }
+
+    fn store_capture(
+        &mut self,
+        ip: usize,
+        frame_index: usize,
+        capture: ferrix_core::bytecode::CaptureId,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let cell = self.capture_cell(ip, frame_index, capture)?;
+        self.store_upvalue_value(ip, cell, value)
+    }
+
+    fn load_upvalue_from_register(&self, ip: usize, upvalue: Register) -> Result<Value, VmError> {
+        let cell = self.read_register(ip, upvalue)?;
+        self.load_upvalue_value(ip, cell)
+    }
+
+    fn store_upvalue_from_register(
+        &mut self,
+        ip: usize,
+        upvalue: Register,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let cell = self.read_register(ip, upvalue)?;
+        self.store_upvalue_value(ip, cell, value)
+    }
+
+    fn load_upvalue_value(&self, ip: usize, cell: Value) -> Result<Value, VmError> {
+        let reference = self.upvalue_ref(ip, cell)?;
+        let Obj::Upvalue(value) = self.heap.get(reference)? else {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "upvalue",
+                    found: cell,
+                },
+            ));
+        };
+        Ok(*value)
+    }
+
+    fn store_upvalue_value(&mut self, ip: usize, cell: Value, value: Value) -> Result<(), VmError> {
+        let reference = self.upvalue_ref(ip, cell)?;
+        let Obj::Upvalue(stored) = self.heap.get_mut(reference)? else {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "upvalue",
+                    found: cell,
+                },
+            ));
+        };
+        *stored = value;
+        Ok(())
+    }
+
+    fn upvalue_ref(&self, ip: usize, cell: Value) -> Result<ObjRef, VmError> {
+        let Value::Obj(reference) = cell else {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "upvalue",
+                    found: cell,
+                },
+            ));
+        };
+        Ok(reference)
     }
 
     fn push_frame(
@@ -1407,6 +1530,7 @@ fn object_references(object: &Obj) -> Vec<ObjRef> {
             .flat_map(|(key, value)| [key.as_obj_ref(), value.as_obj_ref()])
             .flatten()
             .collect(),
+        Obj::Upvalue(value) => value.as_obj_ref().into_iter().collect(),
         Obj::Closure { captures, .. } => captures.iter().filter_map(Value::as_obj_ref).collect(),
         Obj::String(_) | Obj::Function(_) | Obj::NativeFunction(_) | Obj::Module(_) => Vec::new(),
     }
