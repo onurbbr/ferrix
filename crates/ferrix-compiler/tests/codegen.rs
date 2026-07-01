@@ -178,6 +178,51 @@ fn compiles_empty_map_literal_to_heap_map() {
 }
 
 #[test]
+fn compiles_record_literal_and_field_read() {
+    let program =
+        compile_source("let user = { name: \"Onur\", age: 30 }; return user.name;").unwrap();
+    let mut vm = Vm::new();
+
+    let result = vm.run_program(&program).unwrap();
+    let reference = result.as_obj_ref().unwrap();
+
+    assert_eq!(
+        vm.heap_object(reference).unwrap(),
+        &Obj::String("Onur".to_string())
+    );
+}
+
+#[test]
+fn compiles_record_field_assignment() {
+    let program = compile_source(
+        "\
+let user = { age: 30 };
+user.age = user.age + 12;
+return user.age;
+",
+    )
+    .unwrap();
+
+    let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn compiles_record_literal_to_heap_record() {
+    let program = compile_source("return { answer: 42 };").unwrap();
+    let mut vm = Vm::new();
+
+    let result = vm.run_program(&program).unwrap();
+    let reference = result.as_obj_ref().unwrap();
+
+    assert_eq!(
+        vm.heap_object(reference).unwrap(),
+        &Obj::Record(vec![("answer".to_string(), Value::Int(42))])
+    );
+}
+
+#[test]
 fn compiles_function_declaration_and_call() {
     let program = compile_source(
         "\
