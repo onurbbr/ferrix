@@ -31,6 +31,7 @@ pub struct Vm {
     frames: Vec<CallFrame>,
     program_roots: Vec<ObjRef>,
     heap: Heap,
+    gc_stats: VmGcStats,
     output: Box<dyn OutputWriter>,
     native_functions: HashMap<FunctionId, Rc<NativeFunction>>,
 }
@@ -53,6 +54,25 @@ pub struct CallFrame {
     pub return_dst: Option<Register>,
 }
 
+/// Cumulative GC and allocation counters for one VM instance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmGcStats {
+    /// Successful heap allocations performed by this VM.
+    pub allocations: u64,
+    /// Successful allocations since the last GC pass.
+    pub allocation_pressure: usize,
+    /// Number of GC passes run manually or automatically.
+    pub collections: u64,
+    /// Total reachable objects marked across all collections.
+    pub total_marked: usize,
+    /// Total unreachable objects swept across all collections.
+    pub total_swept: usize,
+    /// Live object count reported by the latest collection.
+    pub live_after_last_collection: usize,
+    /// Per-pass stats from the latest collection.
+    pub last_collection: GcStats,
+}
+
 impl Vm {
     /// Creates a VM with default runtime limits.
     pub fn new() -> Self {
@@ -70,6 +90,7 @@ impl Vm {
             frames: Vec::new(),
             program_roots: Vec::new(),
             heap: Heap::new(),
+            gc_stats: VmGcStats::default(),
             output: Box::new(NullOutput),
             native_functions: HashMap::new(),
         }
@@ -115,15 +136,23 @@ impl Vm {
         &self.heap
     }
 
-    /// Allocates an object, triggering GC first when the heap limit is reached.
+    /// Returns cumulative allocation and GC counters.
+    pub fn gc_stats(&self) -> VmGcStats {
+        self.gc_stats
+    }
+
+    /// Allocates an object, triggering GC first when pressure or heap limits ask.
     pub fn allocate_object(&mut self, object: Obj) -> Result<ObjRef, VmError> {
         let extra_roots = object_references(&object);
-        if self.heap.len() >= self.limits.max_heap_objects {
-            let roots = self.allocation_roots(&extra_roots);
-            self.heap.collect_garbage(&roots);
+        if self.should_collect_before_allocation()
+            || self.heap.len() >= self.limits.max_heap_objects
+        {
+            self.collect_garbage_with_extra_roots(&extra_roots);
         }
 
-        self.heap.allocate(object, self.limits)
+        let reference = self.heap.allocate(object, self.limits)?;
+        self.record_allocation();
+        Ok(reference)
     }
 
     /// Reads a heap object by reference.
@@ -143,8 +172,7 @@ impl Vm {
 
     /// Runs GC using current registers, frames, and remembered program constants.
     pub fn collect_garbage(&mut self) -> GcStats {
-        let roots = self.allocation_roots(&[]);
-        self.heap.collect_garbage(&roots)
+        self.collect_garbage_with_extra_roots(&[])
     }
 
     /// Runs GC while treating all constants in the supplied program as roots.
@@ -1403,6 +1431,32 @@ impl Vm {
         roots.insert_values(self.program_roots.iter().copied().map(Value::Obj));
         roots.insert_values(extra_roots.iter().copied().map(Value::Obj));
         roots.into_vec()
+    }
+
+    fn should_collect_before_allocation(&self) -> bool {
+        self.limits.gc_allocation_threshold > 0
+            && self.gc_stats.allocation_pressure >= self.limits.gc_allocation_threshold
+    }
+
+    fn collect_garbage_with_extra_roots(&mut self, extra_roots: &[ObjRef]) -> GcStats {
+        let roots = self.allocation_roots(extra_roots);
+        let stats = self.heap.collect_garbage(&roots);
+        self.record_collection(stats);
+        stats
+    }
+
+    fn record_allocation(&mut self) {
+        self.gc_stats.allocations = self.gc_stats.allocations.saturating_add(1);
+        self.gc_stats.allocation_pressure = self.gc_stats.allocation_pressure.saturating_add(1);
+    }
+
+    fn record_collection(&mut self, stats: GcStats) {
+        self.gc_stats.collections = self.gc_stats.collections.saturating_add(1);
+        self.gc_stats.total_marked = self.gc_stats.total_marked.saturating_add(stats.marked);
+        self.gc_stats.total_swept = self.gc_stats.total_swept.saturating_add(stats.swept);
+        self.gc_stats.live_after_last_collection = stats.live;
+        self.gc_stats.last_collection = stats;
+        self.gc_stats.allocation_pressure = 0;
     }
 
     fn attach_stack_trace(&self, error: VmError, program: &Program) -> VmError {
