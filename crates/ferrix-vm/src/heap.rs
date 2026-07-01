@@ -1,4 +1,4 @@
-//! Generational-reference heap with explicit mark/sweep collection.
+//! Generational-reference heap with explicit and incremental mark/sweep collection.
 //!
 //! The VM stores heap values as [`Obj`] slots and gives bytecode stable
 //! [`ObjRef`] handles. During collection, callers provide roots from registers,
@@ -16,6 +16,7 @@ use crate::{RuntimeLimits, VmError, VmErrorKind};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Heap {
     objects: Vec<HeapSlot>,
+    incremental: IncrementalGc,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,11 +43,32 @@ pub struct GcStats {
     pub live: usize,
 }
 
+/// Public phase marker for the heap's incremental collector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IncrementalGcPhase {
+    /// No incremental collection is currently active.
+    #[default]
+    Idle,
+    /// Reachable objects are being marked from a grey-object worklist.
+    Marking,
+    /// Heap slots are being swept in bounded chunks.
+    Sweeping,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct IncrementalGc {
+    phase: IncrementalGcPhase,
+    mark_stack: Vec<ObjRef>,
+    sweep_index: usize,
+    stats: GcStats,
+}
+
 impl Heap {
     /// Creates an empty heap.
     pub fn new() -> Self {
         Self {
             objects: Vec::new(),
+            incremental: IncrementalGc::default(),
         }
     }
 
@@ -70,13 +92,17 @@ impl Heap {
             )
         })?;
 
+        let incremental_phase = self.incremental.phase;
+        let incremental_sweep_index = self.incremental.sweep_index;
+
         if let Some((index, slot)) = self
             .objects
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.object.is_none())
         {
-            let index = u32::try_from(index).map_err(|_| {
+            let slot_index = index;
+            let reference_index = u32::try_from(slot_index).map_err(|_| {
                 VmError::new(
                     None,
                     VmErrorKind::HeapObjectLimitExceeded {
@@ -84,17 +110,25 @@ impl Heap {
                     },
                 )
             })?;
-            slot.marked = false;
+            slot.marked =
+                should_mark_allocated_slot(incremental_phase, incremental_sweep_index, slot_index);
             slot.object = Some(object);
-            return Ok(ObjRef::new(index, slot.generation));
+            let reference = ObjRef::new(reference_index, slot.generation);
+            self.mark_allocated_children(reference);
+            return Ok(reference);
         }
 
         let reference = ObjRef::new(index, 0);
         self.objects.push(HeapSlot {
             generation: reference.generation,
-            marked: false,
+            marked: should_mark_allocated_slot(
+                incremental_phase,
+                incremental_sweep_index,
+                usize::try_from(reference.index).unwrap(),
+            ),
             object: Some(object),
         });
+        self.mark_allocated_children(reference);
         Ok(reference)
     }
 
@@ -120,6 +154,9 @@ impl Heap {
 
     /// Runs mark/sweep collection from the supplied roots.
     pub fn collect_garbage(&mut self, roots: &[ObjRef]) -> GcStats {
+        self.incremental = IncrementalGc::default();
+        self.clear_marks();
+
         let mut marked = 0;
         let mut stack = roots.to_vec();
 
@@ -166,6 +203,95 @@ impl Heap {
         }
     }
 
+    /// Returns the current incremental GC phase.
+    pub fn incremental_phase(&self) -> IncrementalGcPhase {
+        self.incremental.phase
+    }
+
+    /// Returns true when an incremental collection is in progress.
+    pub fn is_incremental_collection_active(&self) -> bool {
+        self.incremental.phase != IncrementalGcPhase::Idle
+    }
+
+    /// Starts an incremental collection from the supplied root snapshot.
+    ///
+    /// Returns `true` when a new collection was started. If a collection is
+    /// already active, callers should keep stepping that collection instead.
+    pub fn start_incremental_collection(&mut self, roots: &[ObjRef]) -> bool {
+        if self.is_incremental_collection_active() {
+            return false;
+        }
+
+        self.clear_marks();
+        self.incremental = IncrementalGc {
+            phase: IncrementalGcPhase::Marking,
+            mark_stack: roots.to_vec(),
+            sweep_index: 0,
+            stats: GcStats::default(),
+        };
+        true
+    }
+
+    /// Advances the active incremental collection by a bounded amount of work.
+    ///
+    /// Returns completed collection stats when the sweep phase finishes.
+    pub fn step_incremental_collection(&mut self, budget: usize) -> Option<GcStats> {
+        if !self.is_incremental_collection_active() {
+            return None;
+        }
+
+        let mut remaining = budget.max(1);
+        while remaining > 0 {
+            match self.incremental.phase {
+                IncrementalGcPhase::Idle => return None,
+                IncrementalGcPhase::Marking => {
+                    if let Some(reference) = self.incremental.mark_stack.pop() {
+                        self.mark_incremental_reference(reference);
+                        remaining -= 1;
+                    } else {
+                        self.incremental.phase = IncrementalGcPhase::Sweeping;
+                    }
+                }
+                IncrementalGcPhase::Sweeping => {
+                    if self.incremental.sweep_index >= self.objects.len() {
+                        return Some(self.complete_incremental_collection());
+                    }
+
+                    self.sweep_incremental_slot();
+                    remaining -= 1;
+                }
+            }
+        }
+
+        if self.incremental.phase == IncrementalGcPhase::Sweeping
+            && self.incremental.sweep_index >= self.objects.len()
+        {
+            return Some(self.complete_incremental_collection());
+        }
+
+        None
+    }
+
+    /// Completes the active incremental collection immediately, if one exists.
+    pub fn finish_incremental_collection(&mut self) -> Option<GcStats> {
+        while self.is_incremental_collection_active() {
+            if let Some(stats) = self.step_incremental_collection(usize::MAX) {
+                return Some(stats);
+            }
+        }
+        None
+    }
+
+    /// Preserves a newly stored object reference during an active collection.
+    pub fn write_barrier_value(&mut self, value: Value) {
+        let Some(reference) = value.as_obj_ref() else {
+            return;
+        };
+        if self.is_incremental_collection_active() {
+            self.mark_incremental_reference(reference);
+        }
+    }
+
     /// Returns the number of occupied heap slots.
     pub fn len(&self) -> usize {
         self.objects
@@ -187,6 +313,77 @@ impl Heap {
             Some(slot)
         } else {
             None
+        }
+    }
+
+    fn mark_allocated_children(&mut self, reference: ObjRef) {
+        if !self.is_incremental_collection_active() {
+            return;
+        }
+
+        let children = self
+            .get(reference)
+            .map(object_references)
+            .unwrap_or_default();
+        for child in children {
+            self.mark_incremental_reference(child);
+        }
+    }
+
+    fn mark_incremental_reference(&mut self, reference: ObjRef) {
+        let children = {
+            let Some(slot) = self.slot_mut(reference) else {
+                return;
+            };
+            if slot.marked {
+                return;
+            }
+            slot.marked = true;
+            slot.object
+                .as_ref()
+                .map(object_references)
+                .unwrap_or_default()
+        };
+
+        self.incremental.stats.marked = self.incremental.stats.marked.saturating_add(1);
+        self.incremental.mark_stack.extend(children);
+        if self.incremental.phase == IncrementalGcPhase::Sweeping {
+            self.incremental.phase = IncrementalGcPhase::Marking;
+        }
+    }
+
+    fn sweep_incremental_slot(&mut self) {
+        let index = self.incremental.sweep_index;
+        self.incremental.sweep_index += 1;
+
+        let Some(slot) = self.objects.get_mut(index) else {
+            return;
+        };
+        if slot.object.is_none() {
+            return;
+        }
+
+        if slot.marked {
+            slot.marked = false;
+        } else {
+            slot.object = None;
+            slot.marked = false;
+            slot.generation = slot.generation.wrapping_add(1);
+            self.incremental.stats.swept = self.incremental.stats.swept.saturating_add(1);
+        }
+    }
+
+    fn complete_incremental_collection(&mut self) -> GcStats {
+        let mut stats = self.incremental.stats;
+        stats.live = self.len();
+        self.clear_marks();
+        self.incremental = IncrementalGc::default();
+        stats
+    }
+
+    fn clear_marks(&mut self) {
+        for slot in &mut self.objects {
+            slot.marked = false;
         }
     }
 }
@@ -259,6 +456,14 @@ fn valid_object_mut(slot: &mut HeapSlot, reference: ObjRef) -> Option<&mut Obj> 
         slot.object.as_mut()
     } else {
         None
+    }
+}
+
+fn should_mark_allocated_slot(phase: IncrementalGcPhase, sweep_index: usize, index: usize) -> bool {
+    match phase {
+        IncrementalGcPhase::Idle => false,
+        IncrementalGcPhase::Marking => true,
+        IncrementalGcPhase::Sweeping => index >= sweep_index,
     }
 }
 
