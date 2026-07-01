@@ -17,9 +17,9 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-ferrix-core = { path = "crates/ferrix-core" }
-ferrix-vm = { path = "crates/ferrix-vm" }
-ferrix-assembler = { path = "crates/ferrix-assembler" }
-ferrix-compiler = { path = "crates/ferrix-compiler" }
-ferrix-runtime = { path = "crates/ferrix-runtime" }
-ferrix-stdlib = { path = "crates/ferrix-stdlib" }
+ferrix-core = { path = "crates/ferrix-core", version = "0.1.0" }
+ferrix-vm = { path = "crates/ferrix-vm", version = "0.1.0" }
+ferrix-assembler = { path = "crates/ferrix-assembler", version = "0.1.0" }
+ferrix-compiler = { path = "crates/ferrix-compiler", version = "0.1.0" }
+ferrix-runtime = { path = "crates/ferrix-runtime", version = "0.1.0" }
+ferrix-stdlib = { path = "crates/ferrix-stdlib", version = "0.1.0" }
