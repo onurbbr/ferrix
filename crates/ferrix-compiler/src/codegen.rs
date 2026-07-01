@@ -720,6 +720,12 @@ impl Codegen {
                 Ok(())
             }
             Expr::Call { callee, args, span } => self.compile_call_into(callee, args, dst, *span),
+            Expr::MethodCall {
+                target,
+                method,
+                args,
+                span,
+            } => self.compile_method_call_into(target, method, args, dst, *span),
             Expr::Function {
                 params, body, span, ..
             } => self.compile_function_literal_into(params, body, dst, *span),
@@ -922,6 +928,65 @@ impl Codegen {
             self.release_register_if_temporary(callee);
         }
         self.release_register_range(args_start, args.len());
+        Ok(())
+    }
+
+    fn compile_method_call_into(
+        &mut self,
+        target: &Expr,
+        method: &str,
+        args: &[Expr],
+        dst: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        if let Some(callee) = namespaced_field_name(target, method)
+            && self.functions.contains_key(&callee)
+        {
+            return self.compile_call_into(&callee, args, dst, span);
+        }
+
+        let total_args = args.len().checked_add(1).ok_or_else(|| {
+            CompileError::new(
+                CompileErrorKind::TooManyArguments {
+                    max: u8::MAX as usize - 1,
+                },
+                Some(span),
+            )
+        })?;
+        if total_args > u8::MAX as usize {
+            return Err(CompileError::new(
+                CompileErrorKind::TooManyArguments {
+                    max: u8::MAX as usize - 1,
+                },
+                Some(span),
+            ));
+        }
+
+        let args_start = self.alloc_register_range(total_args)?;
+        let arg_registers = register_range(args_start, total_args)?;
+        self.compile_expr_into(target, arg_registers[0])?;
+        for (arg, register) in args.iter().zip(arg_registers.iter().skip(1).copied()) {
+            self.compile_expr_into(arg, register)?;
+        }
+
+        let Some(function) = self.functions.get(method).copied() else {
+            return Err(CompileError::new(
+                CompileErrorKind::UndefinedMethod {
+                    name: method.to_string(),
+                },
+                Some(span),
+            ));
+        };
+        self.chunk.push_instruction_with_span(
+            Instruction::CallFunction {
+                dst,
+                function,
+                args_start,
+                arg_count: total_args as u8,
+            },
+            Some(span),
+        );
+        self.release_register_range(args_start, total_args);
         Ok(())
     }
 
@@ -1517,6 +1582,20 @@ fn rewrite_module_expr(function_targets: &HashMap<String, String>, expr: Expr) -
                 .collect(),
             span,
         },
+        Expr::MethodCall {
+            target,
+            method,
+            args,
+            span,
+        } => Expr::MethodCall {
+            target: Box::new(rewrite_module_expr(function_targets, *target)),
+            method,
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_module_expr(function_targets, arg))
+                .collect(),
+            span,
+        },
         Expr::Function {
             params,
             param_types,
@@ -1608,6 +1687,24 @@ fn rewrite_module_value_expr(
         },
         Expr::Call { callee, args, span } => Expr::Call {
             callee: function_targets.get(&callee).cloned().unwrap_or(callee),
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_module_value_expr(function_targets, value_targets, arg))
+                .collect(),
+            span,
+        },
+        Expr::MethodCall {
+            target,
+            method,
+            args,
+            span,
+        } => Expr::MethodCall {
+            target: Box::new(rewrite_module_value_expr(
+                function_targets,
+                value_targets,
+                *target,
+            )),
+            method,
             args: args
                 .into_iter()
                 .map(|arg| rewrite_module_value_expr(function_targets, value_targets, arg))
@@ -1884,6 +1981,16 @@ fn expr_references_call(expr: &Expr, name: &str) -> bool {
         Expr::Call { callee, args, .. } => {
             callee == name || args.iter().any(|arg| expr_references_call(arg, name))
         }
+        Expr::MethodCall {
+            target,
+            method,
+            args,
+            ..
+        } => {
+            method == name
+                || expr_references_call(target, name)
+                || args.iter().any(|arg| expr_references_call(arg, name))
+        }
         Expr::Index { target, index, .. } => {
             expr_references_call(target, name) || expr_references_call(index, name)
         }
@@ -2071,6 +2178,12 @@ fn collect_expr_captured_locals(
                 collect_expr_captured_locals(arg, scopes, functions, captured);
             }
         }
+        Expr::MethodCall { target, args, .. } => {
+            collect_expr_captured_locals(target, scopes, functions, captured);
+            for arg in args {
+                collect_expr_captured_locals(arg, scopes, functions, captured);
+            }
+        }
         Expr::Index { target, index, .. } => {
             collect_expr_captured_locals(target, scopes, functions, captured);
             collect_expr_captured_locals(index, scopes, functions, captured);
@@ -2227,6 +2340,12 @@ fn collect_expr_free_variables(
             {
                 free.push(callee.clone());
             }
+            for arg in args {
+                collect_expr_free_variables(arg, scopes, functions, seen, free);
+            }
+        }
+        Expr::MethodCall { target, args, .. } => {
+            collect_expr_free_variables(target, scopes, functions, seen, free);
             for arg in args {
                 collect_expr_free_variables(arg, scopes, functions, seen, free);
             }
