@@ -32,6 +32,8 @@ impl Disassembler {
         writeln!(&mut output, "registers: {}", chunk.register_count)
             .expect("writing to String cannot fail");
         writeln!(&mut output, "arity: {}", chunk.arity).expect("writing to String cannot fail");
+        writeln!(&mut output, "captures: {}", chunk.capture_count)
+            .expect("writing to String cannot fail");
         write_debug_locals(&mut output, chunk);
         writeln!(&mut output, "constants:").expect("writing to String cannot fail");
 
@@ -97,8 +99,12 @@ impl Disassembler {
             writeln!(&mut output).expect("writing to String cannot fail");
             writeln!(
                 &mut output,
-                "-- fn#{} {} arity={} registers={} --",
-                index, function.name, function.arity, function.register_count
+                "-- fn#{} {} arity={} registers={} captures={} --",
+                index,
+                function.name,
+                function.arity,
+                function.register_count,
+                function.capture_count
             )
             .expect("writing to String cannot fail");
             match &function.kind {
@@ -273,6 +279,39 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 "CallFunction",
                 register(*dst),
                 function_id(*function),
+                register(*args_start),
+                arg_count
+            )
+        }
+        Instruction::MakeClosure {
+            dst,
+            function,
+            captures_start,
+            capture_count,
+        } => {
+            format!(
+                "{:<11} {}, {}, {}, {}",
+                "MakeClosure",
+                register(*dst),
+                function_id(*function),
+                register(*captures_start),
+                capture_count
+            )
+        }
+        Instruction::LoadCapture { dst, capture } => {
+            format!("{:<11} {}, {}", "LoadCapture", register(*dst), capture)
+        }
+        Instruction::CallValue {
+            dst,
+            callee,
+            args_start,
+            arg_count,
+        } => {
+            format!(
+                "{:<11} {}, {}, {}, {}",
+                "CallValue",
+                register(*dst),
+                register(*callee),
                 register(*args_start),
                 arg_count
             )
