@@ -25,6 +25,7 @@ pub enum TokenKind {
     String(String),
     Let,
     Fn,
+    Export,
     Import,
     If,
     Else,
@@ -244,6 +245,7 @@ impl<'a> Lexer<'a> {
         let kind = match text {
             "let" => TokenKind::Let,
             "fn" => TokenKind::Fn,
+            "export" => TokenKind::Export,
             "import" => TokenKind::Import,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
@@ -327,6 +329,7 @@ impl TokenKind {
             Self::String(_) => "string literal".to_string(),
             Self::Let => "`let`".to_string(),
             Self::Fn => "`fn`".to_string(),
+            Self::Export => "`export`".to_string(),
             Self::Import => "`import`".to_string(),
             Self::If => "`if`".to_string(),
             Self::Else => "`else`".to_string(),
