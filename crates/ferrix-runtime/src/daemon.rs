@@ -9,6 +9,8 @@
 use std::{
     collections::BTreeMap,
     env, fs, io,
+    io::{BufRead, BufReader, Write},
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
 };
 
@@ -16,15 +18,22 @@ use crate::{
     DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind,
     RuntimeEventBus, RuntimeEventKind, RuntimeMode, RuntimeProcessId, RuntimeProcessKind,
     RuntimeProcessRecord, RuntimeProcessStatus, RuntimeProcessTable, RuntimeProfile,
-    RuntimeSessionId, RuntimeStats, event::timestamp_ms, service::CompiledProgram,
+    RuntimeSessionId, RuntimeStats, event::timestamp_ms, request::RecordProcessRequest,
+    service::CompiledProgram,
 };
 
-const RUNTIME_HOME_ENV: &str = "FERRIX_RUNTIME_HOME";
 const DAEMON_STATE_FILE: &str = "daemon.state";
 const NEXT_PROCESS_FILE: &str = "next-process-id";
+const PID_FILE: &str = "daemon.pid";
+const SOCKET_FILE: &str = "runtime.sock";
 const PROCESS_DIR: &str = "processes";
 const LOG_DIR: &str = "logs";
 const CHECKPOINT_FILE: &str = "checkpoints.log";
+const LOCAL_HOME_DIR: &str = "ferrix";
+const CONFIG_DIR: &str = "configs";
+const SERVICE_DIR: &str = "services";
+const RUNTIME_SERVICE_DIR: &str = "runtime";
+const CONFIG_FILE: &str = "config.toml";
 
 /// Runtime daemon health state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +187,16 @@ impl RuntimeDaemon {
         &self.home
     }
 
+    /// Returns the Unix socket path used by the daemon process.
+    pub fn socket_path(&self) -> PathBuf {
+        self.home.join(SOCKET_FILE)
+    }
+
+    /// Returns the pid file path used by the daemon process.
+    pub fn pid_path(&self) -> PathBuf {
+        self.home.join(PID_FILE)
+    }
+
     /// Starts the daemon-shaped runtime service.
     pub fn start(&mut self) -> Result<RuntimeStatusReport, RuntimeError> {
         self.ensure_layout()?;
@@ -187,6 +206,8 @@ impl RuntimeDaemon {
                 ("health", RuntimeHealth::Serving.as_str().to_string()),
                 ("version", env!("CARGO_PKG_VERSION").to_string()),
                 ("started_at_ms", timestamp_ms().to_string()),
+                ("pid", std::process::id().to_string()),
+                ("socket", self.socket_path().display().to_string()),
                 ("last_runtime_error", String::new()),
             ],
         )?;
@@ -208,9 +229,13 @@ impl RuntimeDaemon {
                 ("health", RuntimeHealth::Stopped.as_str().to_string()),
                 ("version", env!("CARGO_PKG_VERSION").to_string()),
                 ("started_at_ms", started_at),
+                ("pid", String::new()),
+                ("socket", self.socket_path().display().to_string()),
                 ("last_runtime_error", String::new()),
             ],
         )?;
+        let _ = fs::remove_file(self.pid_path());
+        let _ = fs::remove_file(self.socket_path());
         self.state.set("health", RuntimeHealth::Stopped.as_str());
         self.events
             .publish(RuntimeEventKind::RuntimeStopped, None, None);
@@ -233,6 +258,15 @@ impl RuntimeDaemon {
         }
     }
 
+    /// Returns status after checking whether a serving daemon is actually alive.
+    pub fn checked_status(&mut self) -> Result<RuntimeStatusReport, RuntimeError> {
+        let status = self.status()?;
+        if !status.is_serving() || self.ping()? {
+            return Ok(status);
+        }
+        self.stop()
+    }
+
     /// Returns the current daemon status.
     pub fn status(&self) -> Result<RuntimeStatusReport, RuntimeError> {
         let state = read_key_values(&self.state_path())?;
@@ -242,23 +276,16 @@ impl RuntimeDaemon {
         let started_at_ms = state
             .get("started_at_ms")
             .and_then(|value| value.parse::<u128>().ok());
-        let processes = self.list_processes()?;
-        let active_process_count = processes
+        let history = self.list_history()?;
+        let active_process_count = history
             .iter()
-            .filter(|process| {
-                matches!(
-                    process.status,
-                    RuntimeProcessStatus::Starting
-                        | RuntimeProcessStatus::Running
-                        | RuntimeProcessStatus::Paused
-                )
-            })
+            .filter(|process| process.status.is_active())
             .count();
-        let completed_process_count = processes
+        let completed_process_count = history
             .iter()
             .filter(|process| process.status == RuntimeProcessStatus::Completed)
             .count();
-        let failed_process_count = processes
+        let failed_process_count = history
             .iter()
             .filter(|process| process.status == RuntimeProcessStatus::Failed)
             .count();
@@ -278,7 +305,7 @@ impl RuntimeDaemon {
             active_process_count,
             completed_process_count,
             failed_process_count,
-            process_count: processes.len(),
+            process_count: active_process_count,
             default_mode: RuntimeMode::Required,
             bytecode_cache_size: 0,
             module_cache_size: 0,
@@ -289,12 +316,122 @@ impl RuntimeDaemon {
         })
     }
 
+    /// Serves local Unix socket requests until a stop request is received.
+    pub fn serve_forever(&mut self) -> Result<(), RuntimeError> {
+        self.ensure_layout()?;
+        let _ = fs::remove_file(self.socket_path());
+        let listener = UnixListener::bind(self.socket_path()).map_err(runtime_io_error)?;
+        fs::write(self.pid_path(), std::process::id().to_string()).map_err(runtime_io_error)?;
+        self.start()?;
+
+        for stream in listener.incoming() {
+            let stream = stream.map_err(runtime_io_error)?;
+            if self.handle_stream(stream)? {
+                break;
+            }
+        }
+
+        self.stop()?;
+        Ok(())
+    }
+
+    /// Returns true when a daemon process is answering socket requests.
+    pub fn ping(&self) -> Result<bool, RuntimeError> {
+        match self.request("PING") {
+            Ok(response) => Ok(response == "OK\tPONG"),
+            Err(error) if matches!(error.kind, RuntimeErrorKind::RuntimeUnavailable { .. }) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sends a stop request to the running daemon process.
+    pub fn stop_process(&self) -> Result<(), RuntimeError> {
+        let response = self.request("STOP")?;
+        if response == "OK\tSTOPPED" {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(
+                70,
+                RuntimeErrorKind::DaemonState { message: response },
+            ))
+        }
+    }
+
+    /// Runs source through the daemon socket.
+    pub fn request_run_source(&self, request: RunSourceRequest) -> Result<RunResult, RuntimeError> {
+        self.decode_run_response(&self.request(&format!(
+            "RUN_SOURCE\t{}\t{}",
+            escape(&request.path.display().to_string()),
+            escape(request.profile.as_str())
+        ))?)
+    }
+
+    /// Runs bytecode through the daemon socket.
+    pub fn request_run_bytecode(
+        &self,
+        request: RunBytecodeRequest,
+    ) -> Result<RunResult, RuntimeError> {
+        self.decode_run_response(&self.request(&format!(
+            "RUN_BYTECODE\t{}\t{}",
+            escape(&request.path.display().to_string()),
+            escape(request.profile.as_str())
+        ))?)
+    }
+
+    /// Records a CLI command through the daemon socket.
+    pub fn request_record_process(
+        &self,
+        request: RecordProcessRequest,
+    ) -> Result<RuntimeProcessRecord, RuntimeError> {
+        decode_record_response(&self.request(&format!(
+            "RECORD_PROCESS\t{}\t{}\t{}\t{}\t{}",
+            escape(request.kind.as_str()),
+            escape(&request.path.display().to_string()),
+            request.exit_code,
+            escape(&request.output),
+            request.last_error.as_deref().map_or(String::new(), escape)
+        ))?)
+    }
+
+    /// Lists active process records through the daemon socket.
+    pub fn request_list_processes(&self) -> Result<Vec<RuntimeProcessRecord>, RuntimeError> {
+        decode_records_response(&self.request("LIST_PROCESSES")?)
+    }
+
+    /// Lists process history records through the daemon socket.
+    pub fn request_list_history(&self) -> Result<Vec<RuntimeProcessRecord>, RuntimeError> {
+        decode_records_response(&self.request("LIST_HISTORY")?)
+    }
+
+    /// Returns one process record through the daemon socket.
+    pub fn request_process_info(
+        &self,
+        process_id: RuntimeProcessId,
+    ) -> Result<Option<RuntimeProcessRecord>, RuntimeError> {
+        decode_optional_record_response(&self.request(&format!("PROCESS_INFO\t{process_id}"))?)
+    }
+
+    /// Returns a process output snapshot through the daemon socket.
+    pub fn request_logs(&self, process_id: RuntimeProcessId) -> Result<String, RuntimeError> {
+        decode_text_response(&self.request(&format!("PROCESS_LOG\t{process_id}"))?)
+    }
+
+    /// Kills an active process through the daemon socket.
+    pub fn request_kill_process(
+        &self,
+        process_id: RuntimeProcessId,
+    ) -> Result<RuntimeProcessRecord, RuntimeError> {
+        decode_record_response(&self.request(&format!("KILL_PROCESS\t{process_id}"))?)
+    }
+
     /// Runs source through a serving daemon and records process metadata.
     pub fn run_source(&mut self, mut request: RunSourceRequest) -> Result<RunResult, RuntimeError> {
         self.require_serving()?;
         request.collect_stats = true;
         let record = self.start_process(
-            RuntimeProcessKind::Source,
+            RuntimeProcessKind::Run,
             request.profile,
             request.path.clone(),
             request.args.clone(),
@@ -311,7 +448,7 @@ impl RuntimeDaemon {
         self.require_serving()?;
         request.collect_stats = true;
         let record = self.start_process(
-            RuntimeProcessKind::Bytecode,
+            RuntimeProcessKind::RunBytecode,
             request.profile,
             request.path.clone(),
             Vec::new(),
@@ -331,8 +468,44 @@ impl RuntimeDaemon {
         crate::RuntimeService::new().prepare_debug(request)
     }
 
-    /// Lists persisted process records.
+    /// Records a CLI-level command in the runtime process history.
+    pub fn record_cli_process(
+        &mut self,
+        kind: RuntimeProcessKind,
+        path: impl Into<PathBuf>,
+        exit_code: i32,
+        output: &str,
+        last_error: Option<&str>,
+    ) -> Result<RuntimeProcessRecord, RuntimeError> {
+        let mut record = self.start_process(kind, RuntimeProfile::Cli, path.into(), Vec::new())?;
+        if exit_code == 0 {
+            record.mark_completed(exit_code, RuntimeStats::default());
+        } else {
+            record.mark_failed(
+                exit_code,
+                last_error
+                    .unwrap_or("command failed")
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        write_process_record(&self.process_path(record.id), &record)?;
+        self.write_process_log(&record, output, None)?;
+        self.memory_table.update(record.clone());
+        Ok(record)
+    }
+
+    /// Lists active process records.
     pub fn list_processes(&self) -> Result<Vec<RuntimeProcessRecord>, RuntimeError> {
+        Ok(self
+            .list_history()?
+            .into_iter()
+            .filter(|record| record.status.is_active())
+            .collect())
+    }
+
+    /// Lists persisted process history records.
+    pub fn list_history(&self) -> Result<Vec<RuntimeProcessRecord>, RuntimeError> {
         let dir = self.process_dir();
         if !dir.exists() {
             return Ok(Vec::new());
@@ -348,6 +521,14 @@ impl RuntimeDaemon {
         }
         records.sort_by_key(|record| record.id);
         Ok(records)
+    }
+
+    /// Returns one persisted process history record.
+    pub fn process_info(
+        &self,
+        process_id: RuntimeProcessId,
+    ) -> Result<Option<RuntimeProcessRecord>, RuntimeError> {
+        read_process_record(&self.process_path(process_id))
     }
 
     /// Returns logs captured for one process.
@@ -377,6 +558,14 @@ impl RuntimeDaemon {
                 },
             ));
         };
+        if !record.status.is_active() {
+            return Err(RuntimeError::new(
+                66,
+                RuntimeErrorKind::DaemonState {
+                    message: format!("runtime process {process_id} is not active"),
+                },
+            ));
+        }
         record.mark_killed();
         write_process_record(&path, &record)?;
         self.events.publish(
@@ -417,6 +606,151 @@ impl RuntimeDaemon {
                     mode: RuntimeMode::Required,
                 },
             ))
+        }
+    }
+
+    fn handle_stream(&mut self, mut stream: UnixStream) -> Result<bool, RuntimeError> {
+        let mut line = String::new();
+        {
+            let mut reader = BufReader::new(&mut stream);
+            reader.read_line(&mut line).map_err(runtime_io_error)?;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        let mut parts = line.split('\t');
+        let command = parts.next().unwrap_or_default();
+        let mut should_stop = false;
+        let response = match command {
+            "PING" => "OK\tPONG".to_string(),
+            "STOP" => {
+                should_stop = true;
+                "OK\tSTOPPED".to_string()
+            }
+            "RUN_SOURCE" => {
+                let path = parts.next().map(unescape).unwrap_or_default();
+                let profile = parts
+                    .next()
+                    .map(unescape)
+                    .and_then(|value| value.parse::<RuntimeProfile>().ok())
+                    .unwrap_or(RuntimeProfile::Cli);
+                let mut request = RunSourceRequest::new(path);
+                request.profile = profile;
+                encode_run_response(self.run_source(request))
+            }
+            "RUN_BYTECODE" => {
+                let path = parts.next().map(unescape).unwrap_or_default();
+                let profile = parts
+                    .next()
+                    .map(unescape)
+                    .and_then(|value| value.parse::<RuntimeProfile>().ok())
+                    .unwrap_or(RuntimeProfile::Cli);
+                let mut request = RunBytecodeRequest::new(path);
+                request.profile = profile;
+                encode_run_response(self.run_bytecode(request))
+            }
+            "RECORD_PROCESS" => {
+                let kind = parts
+                    .next()
+                    .map(unescape)
+                    .and_then(|value| parse_process_kind(&value))
+                    .unwrap_or(RuntimeProcessKind::Run);
+                let path = parts.next().map(unescape).unwrap_or_default();
+                let exit_code = parts
+                    .next()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap_or(70);
+                let output = parts.next().map(unescape).unwrap_or_default();
+                let last_error = parts.next().map(unescape).filter(|value| !value.is_empty());
+                encode_record_response(self.record_cli_process(
+                    kind,
+                    path,
+                    exit_code,
+                    &output,
+                    last_error.as_deref(),
+                ))
+            }
+            "LIST_PROCESSES" => encode_records_response(self.list_processes()),
+            "LIST_HISTORY" => encode_records_response(self.list_history()),
+            "PROCESS_INFO" => {
+                let process_id = parts
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(RuntimeProcessId);
+                match process_id {
+                    Some(process_id) => {
+                        encode_optional_record_response(self.process_info(process_id))
+                    }
+                    None => format!("ERR\t64\t{}", escape("invalid runtime process id")),
+                }
+            }
+            "PROCESS_LOG" => {
+                let process_id = parts
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(RuntimeProcessId);
+                match process_id {
+                    Some(process_id) => encode_text_response(self.logs(process_id)),
+                    None => format!("ERR\t64\t{}", escape("invalid runtime process id")),
+                }
+            }
+            "KILL_PROCESS" => {
+                let process_id = parts
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(RuntimeProcessId);
+                match process_id {
+                    Some(process_id) => encode_record_response(self.kill_process(process_id)),
+                    None => format!("ERR\t64\t{}", escape("invalid runtime process id")),
+                }
+            }
+            _ => format!("ERR\t64\t{}", escape("unknown daemon command")),
+        };
+        writeln!(stream, "{response}").map_err(runtime_io_error)?;
+        Ok(should_stop)
+    }
+
+    fn request(&self, request: &str) -> Result<String, RuntimeError> {
+        let mut stream = UnixStream::connect(self.socket_path()).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound
+                || error.kind() == io::ErrorKind::ConnectionRefused
+            {
+                RuntimeError::new(
+                    69,
+                    RuntimeErrorKind::RuntimeUnavailable {
+                        mode: RuntimeMode::Required,
+                    },
+                )
+            } else {
+                runtime_io_error(error)
+            }
+        })?;
+        writeln!(stream, "{request}").map_err(runtime_io_error)?;
+        let mut response = String::new();
+        let mut reader = BufReader::new(stream);
+        reader.read_line(&mut response).map_err(runtime_io_error)?;
+        Ok(response.trim_end_matches(['\r', '\n']).to_string())
+    }
+
+    fn decode_run_response(&self, response: &str) -> Result<RunResult, RuntimeError> {
+        let parts = response.split('\t').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["OK", exit_code, output, value_display] => Ok(RunResult {
+                exit_code: exit_code.parse().unwrap_or(0),
+                value: ferrix_core::Value::Nil,
+                value_display: optional_unescape(value_display),
+                output: unescape(output),
+                stats: RuntimeStats::default(),
+                audit_events: Vec::new(),
+            }),
+            ["ERR", exit_code, message] => Err(RuntimeError::new(
+                exit_code.parse().unwrap_or(70),
+                RuntimeErrorKind::Execution(unescape(message)),
+            )),
+            _ => Err(RuntimeError::new(
+                70,
+                RuntimeErrorKind::DaemonState {
+                    message: format!("invalid daemon response `{response}`"),
+                },
+            )),
         }
     }
 
@@ -580,9 +914,55 @@ impl Default for RuntimeDaemon {
 
 /// Returns the default daemon home directory.
 pub fn default_runtime_home() -> PathBuf {
-    env::var_os(RUNTIME_HOME_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env::temp_dir().join("ferrix-runtime"))
+    default_ferrix_home()
+        .join(SERVICE_DIR)
+        .join(RUNTIME_SERVICE_DIR)
+}
+
+/// Returns the default local Ferrix home next to the running binary.
+pub fn default_ferrix_home() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(LOCAL_HOME_DIR)))
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(LOCAL_HOME_DIR))
+}
+
+/// Returns the default local Ferrix config file path.
+pub fn default_config_path() -> PathBuf {
+    default_ferrix_home().join(CONFIG_DIR).join(CONFIG_FILE)
+}
+
+/// Creates the default local Ferrix directory layout and config file.
+pub fn ensure_default_layout() -> Result<(), RuntimeError> {
+    let home = default_ferrix_home();
+    let config_dir = home.join(CONFIG_DIR);
+    let runtime_home = default_runtime_home();
+
+    fs::create_dir_all(&config_dir).map_err(runtime_io_error)?;
+    fs::create_dir_all(&runtime_home).map_err(runtime_io_error)?;
+
+    let config_path = config_dir.join(CONFIG_FILE);
+    if !config_path.exists() {
+        fs::write(&config_path, default_config_source()).map_err(runtime_io_error)?;
+    }
+
+    Ok(())
+}
+
+fn default_config_source() -> String {
+    [
+        "# Ferrix local configuration.",
+        "# This file is created next to the ferrix binary for local runtime services.",
+        "",
+        "[runtime]",
+        "mode = \"embedded\"",
+        "home = \"services/runtime\"",
+        "",
+        "[services]",
+        "runtime = \"services/runtime\"",
+        "",
+    ]
+    .join("\n")
 }
 
 fn write_process_record(path: &Path, record: &RuntimeProcessRecord) -> Result<(), RuntimeError> {
@@ -648,8 +1028,12 @@ fn read_process_record(path: &Path) -> Result<Option<RuntimeProcessRecord>, Runt
         .and_then(|value| RuntimeProcessStatus::parse(value))
         .unwrap_or(RuntimeProcessStatus::Failed);
     let kind = match values.get("kind").map(String::as_str) {
-        Some("bytecode") => RuntimeProcessKind::Bytecode,
-        _ => RuntimeProcessKind::Source,
+        Some("check") => RuntimeProcessKind::Check,
+        Some("compile") => RuntimeProcessKind::Compile,
+        Some("debug") => RuntimeProcessKind::Debug,
+        Some("run-bytecode" | "bytecode") => RuntimeProcessKind::RunBytecode,
+        Some("run" | "source") => RuntimeProcessKind::Run,
+        _ => RuntimeProcessKind::Run,
     };
     let profile = values
         .get("profile")
@@ -714,6 +1098,244 @@ fn process_output_snapshot(output: &str, value_display: Option<&str>) -> String 
         snapshot.push('\n');
     }
     snapshot
+}
+
+fn parse_process_kind(value: &str) -> Option<RuntimeProcessKind> {
+    match value {
+        "run" | "source" => Some(RuntimeProcessKind::Run),
+        "check" => Some(RuntimeProcessKind::Check),
+        "compile" => Some(RuntimeProcessKind::Compile),
+        "run-bytecode" | "bytecode" => Some(RuntimeProcessKind::RunBytecode),
+        "debug" => Some(RuntimeProcessKind::Debug),
+        _ => None,
+    }
+}
+
+fn encode_run_response(result: Result<RunResult, RuntimeError>) -> String {
+    match result {
+        Ok(result) => format!(
+            "OK\t{}\t{}\t{}",
+            result.exit_code,
+            escape(&result.output),
+            result
+                .value_display
+                .as_deref()
+                .map_or(String::new(), escape)
+        ),
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
+fn encode_record_response(result: Result<RuntimeProcessRecord, RuntimeError>) -> String {
+    match result {
+        Ok(record) => format!("OK\t{}", escape(&format_process_record(&record))),
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
+fn encode_optional_record_response(
+    result: Result<Option<RuntimeProcessRecord>, RuntimeError>,
+) -> String {
+    match result {
+        Ok(Some(record)) => format!("OK\t{}", escape(&format_process_record(&record))),
+        Ok(None) => "OK\t".to_string(),
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
+fn encode_records_response(result: Result<Vec<RuntimeProcessRecord>, RuntimeError>) -> String {
+    match result {
+        Ok(records) => {
+            let payload = records
+                .iter()
+                .map(format_process_record)
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("OK\t{}", escape(&payload))
+        }
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
+fn encode_text_response(result: Result<String, RuntimeError>) -> String {
+    match result {
+        Ok(output) => format!("OK\t{}", escape(&output)),
+        Err(error) => format!("ERR\t{}\t{}", error.exit_code, escape(&error.render())),
+    }
+}
+
+fn decode_record_response(response: &str) -> Result<RuntimeProcessRecord, RuntimeError> {
+    let parts = response.split('\t').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["OK", payload] => parse_process_record_line(&unescape(payload)).ok_or_else(|| {
+            RuntimeError::new(
+                70,
+                RuntimeErrorKind::DaemonState {
+                    message: "invalid process record response".to_string(),
+                },
+            )
+        }),
+        ["ERR", exit_code, message] => Err(RuntimeError::new(
+            exit_code.parse().unwrap_or(70),
+            RuntimeErrorKind::DaemonState {
+                message: unescape(message).trim_end().to_string(),
+            },
+        )),
+        _ => invalid_daemon_response(response),
+    }
+}
+
+fn decode_optional_record_response(
+    response: &str,
+) -> Result<Option<RuntimeProcessRecord>, RuntimeError> {
+    let parts = response.split('\t').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["OK", ""] => Ok(None),
+        ["OK", payload] => parse_process_record_line(&unescape(payload))
+            .map(Some)
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    70,
+                    RuntimeErrorKind::DaemonState {
+                        message: "invalid process record response".to_string(),
+                    },
+                )
+            }),
+        ["ERR", exit_code, message] => Err(RuntimeError::new(
+            exit_code.parse().unwrap_or(70),
+            RuntimeErrorKind::DaemonState {
+                message: unescape(message).trim_end().to_string(),
+            },
+        )),
+        _ => invalid_daemon_response(response),
+    }
+}
+
+fn decode_records_response(response: &str) -> Result<Vec<RuntimeProcessRecord>, RuntimeError> {
+    let parts = response.split('\t').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["OK", ""] => Ok(Vec::new()),
+        ["OK", payload] => Ok(unescape(payload)
+            .lines()
+            .filter_map(parse_process_record_line)
+            .collect()),
+        ["ERR", exit_code, message] => Err(RuntimeError::new(
+            exit_code.parse().unwrap_or(70),
+            RuntimeErrorKind::DaemonState {
+                message: unescape(message).trim_end().to_string(),
+            },
+        )),
+        _ => invalid_daemon_response(response),
+    }
+}
+
+fn decode_text_response(response: &str) -> Result<String, RuntimeError> {
+    let parts = response.split('\t').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["OK", payload] => Ok(unescape(payload)),
+        ["ERR", exit_code, message] => Err(RuntimeError::new(
+            exit_code.parse().unwrap_or(70),
+            RuntimeErrorKind::DaemonState {
+                message: unescape(message).trim_end().to_string(),
+            },
+        )),
+        _ => invalid_daemon_response(response),
+    }
+}
+
+fn invalid_daemon_response<T>(response: &str) -> Result<T, RuntimeError> {
+    Err(RuntimeError::new(
+        70,
+        RuntimeErrorKind::DaemonState {
+            message: format!("invalid daemon response `{response}`"),
+        },
+    ))
+}
+
+fn format_process_record(record: &RuntimeProcessRecord) -> String {
+    [
+        record.id.0.to_string(),
+        record
+            .parent_id
+            .map_or_else(String::new, |parent| parent.0.to_string()),
+        record.session_id.0.to_string(),
+        record.status.as_str().to_string(),
+        record.kind.as_str().to_string(),
+        record.profile.as_str().to_string(),
+        escape(&record.path.display().to_string()),
+        escape(&record.args.join(",")),
+        record.started_at_ms.to_string(),
+        record
+            .ended_at_ms
+            .map_or_else(String::new, |value| value.to_string()),
+        record
+            .exit_code
+            .map_or_else(String::new, |value| value.to_string()),
+        record.stats.executed_instructions.to_string(),
+        record.stats.call_depth.to_string(),
+        record.stats.heap_objects.to_string(),
+        record.stats.gc_collections.to_string(),
+        record.stats.incremental_gc_steps.to_string(),
+        record.last_error.as_deref().map_or(String::new(), escape),
+    ]
+    .join("\t")
+}
+
+fn parse_process_record_line(line: &str) -> Option<RuntimeProcessRecord> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 17 {
+        return None;
+    }
+    let id = RuntimeProcessId(fields[0].parse().ok()?);
+    let parent_id = if fields[1].is_empty() {
+        None
+    } else {
+        Some(RuntimeProcessId(fields[1].parse().ok()?))
+    };
+    let status = RuntimeProcessStatus::parse(fields[3])?;
+    let kind = parse_process_kind(fields[4])?;
+    let profile = fields[5].parse::<RuntimeProfile>().ok()?;
+    let ended_at_ms = if fields[9].is_empty() {
+        None
+    } else {
+        Some(fields[9].parse().ok()?)
+    };
+    let exit_code = if fields[10].is_empty() {
+        None
+    } else {
+        Some(fields[10].parse().ok()?)
+    };
+    let last_error = if fields[16].is_empty() {
+        None
+    } else {
+        Some(unescape(fields[16]))
+    };
+
+    Some(RuntimeProcessRecord {
+        id,
+        parent_id,
+        session_id: RuntimeSessionId(fields[2].parse().ok()?),
+        status,
+        kind,
+        profile,
+        path: PathBuf::from(unescape(fields[6])),
+        args: unescape(fields[7])
+            .split(',')
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_string)
+            .collect(),
+        started_at_ms: fields[8].parse().ok()?,
+        ended_at_ms,
+        exit_code,
+        stats: RuntimeStats {
+            executed_instructions: fields[11].parse().ok()?,
+            call_depth: fields[12].parse().ok()?,
+            heap_objects: fields[13].parse().ok()?,
+            gc_collections: fields[14].parse().ok()?,
+            incremental_gc_steps: fields[15].parse().ok()?,
+        },
+        last_error,
+    })
 }
 
 fn format_checkpoint(checkpoint: &RuntimeCheckpoint) -> String {
@@ -794,7 +1416,10 @@ fn append_line(path: &Path, line: &str) -> Result<(), RuntimeError> {
 }
 
 fn escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\n', "\\n")
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }
 
 fn unescape(value: &str) -> String {
@@ -804,6 +1429,7 @@ fn unescape(value: &str) -> String {
         if ch == '\\' {
             match chars.next() {
                 Some('n') => output.push('\n'),
+                Some('t') => output.push('\t'),
                 Some('\\') => output.push('\\'),
                 Some(other) => {
                     output.push('\\');
@@ -816,6 +1442,14 @@ fn unescape(value: &str) -> String {
         }
     }
     output
+}
+
+fn optional_unescape(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(unescape(value))
+    }
 }
 
 fn runtime_io_error(error: io::Error) -> RuntimeError {
