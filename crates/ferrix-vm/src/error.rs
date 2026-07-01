@@ -72,6 +72,10 @@ pub enum VmErrorKind {
     },
     /// Program declared a native function that was not registered in the VM.
     MissingNativeFunction { function: FunctionId },
+    /// Program called a custom extension id that was not registered in the VM.
+    MissingExtension { id: String },
+    /// Registered custom extension failed while running host code or policy checks.
+    ExtensionError { id: String, message: String },
     /// Call stack exceeded [`RuntimeLimits`](crate::RuntimeLimits).
     CallDepthExceeded { max_call_depth: usize },
     /// Instruction budget exceeded [`RuntimeLimits`](crate::RuntimeLimits).
@@ -230,6 +234,12 @@ impl fmt::Display for VmError {
             ),
             VmErrorKind::MissingNativeFunction { function } => {
                 write!(f, "missing native implementation for {function}")
+            }
+            VmErrorKind::MissingExtension { id } => {
+                write!(f, "missing custom extension handler `{id}`")
+            }
+            VmErrorKind::ExtensionError { id, message } => {
+                write!(f, "custom extension `{id}` failed: {message}")
             }
             VmErrorKind::CallDepthExceeded { max_call_depth } => {
                 write!(f, "call depth limit exceeded; maximum is {max_call_depth}")
