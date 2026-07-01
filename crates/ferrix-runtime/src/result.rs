@@ -96,6 +96,8 @@ pub enum RuntimeErrorKind {
     Execution(String),
     /// The selected runtime mode needs a daemon that is not available yet.
     RuntimeUnavailable { mode: RuntimeMode },
+    /// Runtime daemon state or process metadata operation failed.
+    DaemonState { message: String },
 }
 
 impl RuntimeError {
@@ -165,6 +167,9 @@ impl RuntimeError {
             RuntimeErrorKind::RuntimeUnavailable {
                 mode: RuntimeMode::Embedded,
             } => "Ferrix embedded runtime is not available.\n".to_string(),
+            RuntimeErrorKind::DaemonState { message } => {
+                format!("error: runtime daemon state error: {message}\n")
+            }
         }
     }
 }
