@@ -35,13 +35,18 @@ pub fn analyze_with_function_aliases(
                 initializer,
                 span,
             } => {
-                check_expr(initializer, &locals, &functions)?;
-                if !locals.insert(name.clone()) {
+                if locals.contains(name) {
                     return Err(CompileError::new(
                         CompileErrorKind::DuplicateVariable { name: name.clone() },
                         Some(*span),
                     ));
                 }
+                let mut initializer_locals = locals.clone();
+                if matches!(initializer, Expr::Function { .. }) {
+                    initializer_locals.insert(name.clone());
+                }
+                check_expr(initializer, &initializer_locals, &functions)?;
+                locals.insert(name.clone());
             }
             Stmt::Assign { name, value, span } => {
                 if !locals.contains(name) {
@@ -173,16 +178,21 @@ fn check_statements_with_outer(
                 initializer,
                 span,
             } => {
-                check_expr_with_outer(initializer, locals, functions, outer)?;
-                if !locals.insert(name.clone()) {
+                if locals.contains(name) {
                     return Err(CompileError::new(
                         CompileErrorKind::DuplicateVariable { name: name.clone() },
                         Some(*span),
                     ));
                 }
+                let mut initializer_locals = locals.clone();
+                if matches!(initializer, Expr::Function { .. }) {
+                    initializer_locals.insert(name.clone());
+                }
+                check_expr_with_outer(initializer, &initializer_locals, functions, outer)?;
+                locals.insert(name.clone());
             }
             Stmt::Assign { name, value, span } => {
-                if !locals.contains(name) {
+                if !locals.contains(name) && !outer.contains(name) {
                     return Err(CompileError::new(
                         CompileErrorKind::UndefinedVariable { name: name.clone() },
                         Some(*span),
