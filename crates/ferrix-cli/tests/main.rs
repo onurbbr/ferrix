@@ -63,6 +63,29 @@ fn run_file_prints_non_nil_result() {
 }
 
 #[test]
+fn run_file_can_print_stats_and_audit() {
+    let dir = temp_dir();
+    let file = write_file(
+        &dir,
+        "main.fx",
+        "print(\"hello\");\nreturn len([1, 2, 3]);\n",
+    );
+
+    let output = run(["run", file.to_str().unwrap(), "--stats", "--audit"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("hello\n3\n"));
+    assert!(stdout.contains("stats:\n"));
+    assert!(stdout.contains("  executed_instructions: "));
+    assert!(stdout.contains("  native_calls: 2"));
+    assert!(stdout.contains("audit:\n"));
+    assert!(stdout.contains("program_started"));
+    assert!(stdout.contains("program_completed exit_code=0"));
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
 fn run_file_requires_runtime_when_mode_is_required() {
     let dir = temp_dir();
     let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
