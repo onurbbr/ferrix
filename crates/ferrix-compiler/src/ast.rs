@@ -48,6 +48,15 @@ pub enum Stmt {
     },
     /// `return expr;` from the current function or main chunk.
     Return { value: Expr, span: SourceSpan },
+    /// `throw expr;` raises a recoverable source-level error.
+    Throw { value: Expr, span: SourceSpan },
+    /// `try { ... } catch (name) { ... }` error recovery block.
+    TryCatch {
+        try_branch: Vec<Stmt>,
+        catch_name: String,
+        catch_branch: Vec<Stmt>,
+        span: SourceSpan,
+    },
     /// Conditional statement with optional else branch.
     If {
         condition: Expr,
