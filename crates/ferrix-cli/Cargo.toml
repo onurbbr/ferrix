@@ -1,0 +1,11 @@
+[package]
+name = "ferrix-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrix-core.workspace = true
+ferrix-vm.workspace = true
+ferrix-compiler.workspace = true
+ferrix-stdlib.workspace = true
