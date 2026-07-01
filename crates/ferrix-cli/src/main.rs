@@ -25,13 +25,16 @@ const USAGE: &str = "\
 Ferrix
 
 Usage:
-  ferrix run <file>
-  ferrix compile <file> <output>
+  ferrix run <file|package>
+  ferrix check <file|package>
+  ferrix compile <file|package> <output>
   ferrix run-bytecode <file>
-  ferrix debug <file>
+  ferrix debug <file|package>
   ferrix --help
   ferrix --version
 ";
+
+const MANIFEST_FILES: &[&str] = &["Ferrix.toml", "ferrix.toml"];
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -71,6 +74,7 @@ fn run_cli(
             0
         }
         [command, path] if command == "run" => run_file(path, &mut read_file, stdout, stderr),
+        [command, path] if command == "check" => check_file(path, &mut read_file, stderr),
         [command, path, output] if command == "compile" => {
             compile_bytecode(path, output, &mut read_file, stderr)
         }
@@ -79,7 +83,14 @@ fn run_cli(
             debug_file(path, &mut read_file, stdin, stdout, stderr)
         }
         [command, ..] if command == "run" => {
-            writeln!(stderr, "error: expected a file path\n").expect("stderr write failed");
+            writeln!(stderr, "error: expected a file or package path\n")
+                .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
+        }
+        [command, ..] if command == "check" => {
+            writeln!(stderr, "error: expected a file or package path\n")
+                .expect("stderr write failed");
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
         }
@@ -96,7 +107,8 @@ fn run_cli(
             64
         }
         [command, ..] if command == "debug" => {
-            writeln!(stderr, "error: expected a file path\n").expect("stderr write failed");
+            writeln!(stderr, "error: expected a file or package path\n")
+                .expect("stderr write failed");
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
         }
@@ -105,6 +117,17 @@ fn run_cli(
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
         }
+    }
+}
+
+fn check_file(
+    path: &str,
+    read_file: &mut impl FnMut(&str) -> io::Result<String>,
+    stderr: &mut impl io::Write,
+) -> i32 {
+    match compile_file(path, read_file, stderr) {
+        Ok(_) => 0,
+        Err(code) => code,
     }
 }
 
@@ -252,8 +275,39 @@ fn compile_file(
 ) -> Result<(SourceManager, VerifiedProgram), i32> {
     // Load the import graph into one source manager so parse/codegen/runtime
     // diagnostics can all render against the same file table.
+    let input = match resolve_compile_input(Path::new(path)) {
+        Ok(input) => input,
+        Err(LoadError::Read { path, error }) => {
+            writeln!(
+                stderr,
+                "error: could not read `{}`: {error}",
+                path.display()
+            )
+            .expect("stderr write failed");
+            return Err(66);
+        }
+        Err(LoadError::Manifest { path, message }) => {
+            writeln!(
+                stderr,
+                "error: invalid package manifest `{}`: {message}",
+                path.display()
+            )
+            .expect("stderr write failed");
+            return Err(65);
+        }
+        Err(_) => {
+            writeln!(stderr, "error: could not prepare source input").expect("stderr write failed");
+            return Err(65);
+        }
+    };
+
     let mut sources = SourceManager::new();
-    let graph = match load_module_graph(Path::new(path), read_file, &mut sources) {
+    let graph = match load_module_graph(
+        &input.entry_path,
+        input.package.as_ref(),
+        read_file,
+        &mut sources,
+    ) {
         Ok(graph) => graph,
         Err(LoadError::Read { path, error }) => {
             writeln!(
@@ -279,6 +333,25 @@ fn compile_file(
             .expect("stderr write failed");
             return Err(66);
         }
+        Err(LoadError::PackageImport {
+            importer,
+            package,
+            module,
+            searched,
+        }) => {
+            let searched = searched
+                .iter()
+                .map(|path| format!("`{}`", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                stderr,
+                "error: could not resolve package import `{module}` from `{}` in package `{package}`; searched {searched}",
+                importer.display()
+            )
+            .expect("stderr write failed");
+            return Err(66);
+        }
         Err(LoadError::Compile(error)) => {
             write!(
                 stderr,
@@ -291,6 +364,15 @@ fn compile_file(
         Err(LoadError::ImportCycle { path }) => {
             writeln!(stderr, "error: import cycle involving `{}`", path.display())
                 .expect("stderr write failed");
+            return Err(65);
+        }
+        Err(LoadError::Manifest { path, message }) => {
+            writeln!(
+                stderr,
+                "error: invalid package manifest `{}`: {message}",
+                path.display()
+            )
+            .expect("stderr write failed");
             return Err(65);
         }
     };
@@ -311,6 +393,252 @@ fn compile_file(
     Ok((sources, program))
 }
 
+struct CompileInput {
+    /// Source file compiled as the program entrypoint.
+    entry_path: PathBuf,
+    /// Package metadata used to resolve imports when the input is a package.
+    package: Option<PackageContext>,
+}
+
+#[derive(Clone)]
+struct PackageContext {
+    /// Human-readable package name from the manifest.
+    name: String,
+    /// Absolute package root used as the boundary for local module lookup.
+    root: PathBuf,
+    /// Absolute module search roots tried in manifest order.
+    module_roots: Vec<PathBuf>,
+    /// Future external package metadata retained from the manifest.
+    dependencies: Vec<PackageDependency>,
+}
+
+#[derive(Clone)]
+struct PackageDependency {
+    /// Dependency package name or locator.
+    name: String,
+    /// Optional future version requirement parsed from `name@requirement`.
+    requirement: Option<String>,
+}
+
+struct PackageManifest {
+    name: String,
+    entry: PathBuf,
+    module_roots: Option<Vec<PathBuf>>,
+    dependencies: Vec<PackageDependency>,
+}
+
+impl PackageContext {
+    fn dependency_metadata(&self) -> Vec<(&str, Option<&str>)> {
+        self.dependencies
+            .iter()
+            .map(|dependency| (dependency.name.as_str(), dependency.requirement.as_deref()))
+            .collect()
+    }
+}
+
+fn resolve_compile_input(path: &Path) -> Result<CompileInput, LoadError> {
+    if path.is_dir() {
+        return load_package_input(path);
+    }
+
+    if is_manifest_path(path) {
+        let root = path.parent().unwrap_or_else(|| Path::new("."));
+        return load_package_input_from_manifest(root, path);
+    }
+
+    Ok(CompileInput {
+        entry_path: path.to_path_buf(),
+        package: None,
+    })
+}
+
+fn load_package_input(root: &Path) -> Result<CompileInput, LoadError> {
+    let manifest_path = MANIFEST_FILES
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| LoadError::Read {
+            path: root.join(MANIFEST_FILES[0]),
+            error: io::Error::new(io::ErrorKind::NotFound, "package manifest not found"),
+        })?;
+    load_package_input_from_manifest(root, &manifest_path)
+}
+
+fn load_package_input_from_manifest(
+    root: &Path,
+    manifest_path: &Path,
+) -> Result<CompileInput, LoadError> {
+    let source = fs::read_to_string(manifest_path).map_err(|error| LoadError::Read {
+        path: manifest_path.to_path_buf(),
+        error,
+    })?;
+    let manifest = parse_package_manifest(&source, manifest_path)?;
+    let root = normalize_existing_path(root);
+    let entry_path = root.join(&manifest.entry);
+    let module_roots = manifest
+        .module_roots
+        .unwrap_or_else(|| default_module_roots(&manifest.entry))
+        .into_iter()
+        .map(|root_path| root.join(root_path))
+        .collect::<Vec<_>>();
+    let package = PackageContext {
+        name: manifest.name,
+        root,
+        module_roots,
+        dependencies: manifest.dependencies,
+    };
+    let _ = package.dependency_metadata();
+
+    Ok(CompileInput {
+        entry_path,
+        package: Some(package),
+    })
+}
+
+fn parse_package_manifest(source: &str, path: &Path) -> Result<PackageManifest, LoadError> {
+    let mut name = None;
+    let mut entry = None;
+    let mut module_roots = None;
+    let mut dependencies = Vec::new();
+
+    for (line_index, raw_line) in source.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = strip_manifest_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            return Err(manifest_error(path, line_number, "expected `key = value`"));
+        };
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        match key {
+            "name" => name = Some(parse_manifest_string(value, path, line_number)?),
+            "entry" => {
+                entry = Some(PathBuf::from(parse_manifest_string(
+                    value,
+                    path,
+                    line_number,
+                )?))
+            }
+            "module_roots" => {
+                module_roots = Some(
+                    parse_manifest_string_array(value, path, line_number)?
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .collect(),
+                );
+            }
+            "dependencies" => {
+                dependencies = parse_manifest_string_array(value, path, line_number)?
+                    .into_iter()
+                    .map(parse_dependency)
+                    .collect();
+            }
+            _ => return Err(manifest_error(path, line_number, "unknown manifest key")),
+        }
+    }
+
+    let name = name.ok_or_else(|| manifest_error(path, 0, "missing `name`"))?;
+    let entry = entry.ok_or_else(|| manifest_error(path, 0, "missing `entry`"))?;
+
+    Ok(PackageManifest {
+        name,
+        entry,
+        module_roots,
+        dependencies,
+    })
+}
+
+fn strip_manifest_comment(line: &str) -> &str {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '#' if !in_string => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_manifest_string(
+    value: &str,
+    path: &Path,
+    line_number: usize,
+) -> Result<String, LoadError> {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(manifest_error(path, line_number, "expected quoted string"));
+    };
+    Ok(inner.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+fn parse_manifest_string_array(
+    value: &str,
+    path: &Path,
+    line_number: usize,
+) -> Result<Vec<String>, LoadError> {
+    let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return Err(manifest_error(path, line_number, "expected string array"));
+    };
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    inner
+        .split(',')
+        .map(|item| parse_manifest_string(item.trim(), path, line_number))
+        .collect()
+}
+
+fn parse_dependency(value: String) -> PackageDependency {
+    let Some((name, requirement)) = value.split_once('@') else {
+        return PackageDependency {
+            name: value,
+            requirement: None,
+        };
+    };
+    PackageDependency {
+        name: name.to_string(),
+        requirement: Some(requirement.to_string()),
+    }
+}
+
+fn manifest_error(path: &Path, line_number: usize, message: &str) -> LoadError {
+    let message = if line_number == 0 {
+        message.to_string()
+    } else {
+        format!("line {line_number}: {message}")
+    };
+    LoadError::Manifest {
+        path: path.to_path_buf(),
+        message,
+    }
+}
+
+fn default_module_roots(entry: &Path) -> Vec<PathBuf> {
+    vec![
+        entry
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    ]
+}
+
 struct LoadedGraph {
     /// Entry file AST compiled as the program's main module.
     entry: ProgramAst,
@@ -321,12 +649,21 @@ struct LoadedGraph {
 enum LoadError {
     /// A source file could not be read from disk.
     Read { path: PathBuf, error: io::Error },
+    /// Package manifest syntax or required fields are invalid.
+    Manifest { path: PathBuf, message: String },
     /// An imported source file could not be resolved relative to its importer.
     ReadImport {
         importer: PathBuf,
         module: String,
         path: PathBuf,
         error: io::Error,
+    },
+    /// A package-local import was not found under the manifest module roots.
+    PackageImport {
+        importer: PathBuf,
+        package: String,
+        module: String,
+        searched: Vec<PathBuf>,
     },
     /// Lexing/parsing one source file failed.
     Compile(CompileError),
@@ -336,6 +673,7 @@ enum LoadError {
 
 fn load_module_graph(
     entry_path: &Path,
+    package: Option<&PackageContext>,
     read_file: &mut impl FnMut(&str) -> io::Result<String>,
     sources: &mut SourceManager,
 ) -> Result<LoadedGraph, LoadError> {
@@ -345,6 +683,7 @@ fn load_module_graph(
     let mut modules = Vec::new();
     let entry = load_module(
         entry_path,
+        package,
         read_file,
         sources,
         &mut loaded,
@@ -358,6 +697,7 @@ fn load_module_graph(
 
 fn load_module(
     path: &Path,
+    package: Option<&PackageContext>,
     read_file: &mut impl FnMut(&str) -> io::Result<String>,
     sources: &mut SourceManager,
     loaded: &mut HashSet<PathBuf>,
@@ -383,22 +723,28 @@ fn load_module(
     let ast = parse_source_with_file_id(&source, file_id).map_err(LoadError::Compile)?;
 
     for module in module_imports(&ast) {
-        let import_path = resolve_import(path, module);
-        let loaded_module =
-            load_module(&import_path, read_file, sources, loaded, visiting, modules).map_err(
-                |error| match error {
-                    LoadError::Read {
-                        path: missing_path,
-                        error,
-                    } => LoadError::ReadImport {
-                        importer: path.to_path_buf(),
-                        module: module.to_string(),
-                        path: missing_path,
-                        error,
-                    },
-                    error => error,
-                },
-            )?;
+        let import_path = resolve_import(path, module, package)?;
+        let loaded_module = load_module(
+            &import_path,
+            package,
+            read_file,
+            sources,
+            loaded,
+            visiting,
+            modules,
+        )
+        .map_err(|error| match error {
+            LoadError::Read {
+                path: missing_path,
+                error,
+            } => LoadError::ReadImport {
+                importer: path.to_path_buf(),
+                module: module.to_string(),
+                path: missing_path,
+                error,
+            },
+            error => error,
+        })?;
         if let Some(module_ast) = loaded_module {
             modules.push(ImportedModuleAst {
                 name: module.to_string(),
@@ -419,21 +765,74 @@ fn module_imports(ast: &ProgramAst) -> impl Iterator<Item = &str> {
     })
 }
 
-fn resolve_import(importer: &Path, module: &str) -> PathBuf {
-    importer
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join(format!("{module}.fx"))
+fn resolve_import(
+    importer: &Path,
+    module: &str,
+    package: Option<&PackageContext>,
+) -> Result<PathBuf, LoadError> {
+    let module_path = module_file_path(module);
+    let Some(package) = package else {
+        return Ok(importer
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(module_path));
+    };
+
+    let importer_key = module_key(importer);
+    if !importer_key.starts_with(&package.root) {
+        return Err(LoadError::PackageImport {
+            importer: importer.to_path_buf(),
+            package: package.name.clone(),
+            module: module.to_string(),
+            searched: Vec::new(),
+        });
+    }
+
+    let searched = package
+        .module_roots
+        .iter()
+        .map(|root| root.join(&module_path))
+        .collect::<Vec<_>>();
+    searched
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| LoadError::PackageImport {
+            importer: importer.to_path_buf(),
+            package: package.name.clone(),
+            module: module.to_string(),
+            searched,
+        })
+}
+
+fn module_file_path(module: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for segment in module.split('.') {
+        path.push(segment);
+    }
+    path.set_extension("fx");
+    path
 }
 
 fn module_key(path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    normalize_existing_path(path)
+}
+
+fn normalize_existing_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
-    }
+    };
+    fs::canonicalize(&absolute).unwrap_or(absolute)
+}
+
+fn is_manifest_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| MANIFEST_FILES.contains(&name))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
