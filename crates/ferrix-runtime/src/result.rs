@@ -110,6 +110,10 @@ pub enum RuntimeErrorKind {
     ImportCycle { path: PathBuf },
     /// Bytecode serialization failed to decode.
     DecodeBytecode(String),
+    /// Bytecode declares a feature unsupported by this runtime.
+    UnsupportedFeature { feature: String },
+    /// Custom extension id was not registered.
+    MissingExtension { id: String },
     /// Runtime bytecode execution failed without source diagnostics.
     Execution(String),
     /// The selected runtime mode needs a daemon that is not available yet.
@@ -177,6 +181,12 @@ impl RuntimeError {
             }
             RuntimeErrorKind::DecodeBytecode(message) => {
                 format!("error: could not decode bytecode: {message}\n")
+            }
+            RuntimeErrorKind::UnsupportedFeature { feature } => {
+                format!("error: unsupported bytecode feature `{feature}`\n")
+            }
+            RuntimeErrorKind::MissingExtension { id } => {
+                format!("error: missing custom extension handler `{id}`\n")
             }
             RuntimeErrorKind::Execution(message) => format!("error: {message}\n"),
             RuntimeErrorKind::RuntimeUnavailable {
