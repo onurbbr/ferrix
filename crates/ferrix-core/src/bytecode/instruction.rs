@@ -158,6 +158,11 @@ pub enum Instruction {
         entries_start: Register,
         entry_count: u8,
     },
+    RecordNew {
+        dst: Register,
+        fields_start: Register,
+        fields: Vec<StringId>,
+    },
     IndexGet {
         dst: Register,
         target: Register,
@@ -176,6 +181,16 @@ pub enum Instruction {
     ArraySet {
         array: Register,
         index: Register,
+        value: Register,
+    },
+    FieldGet {
+        dst: Register,
+        target: Register,
+        field: StringId,
+    },
+    FieldSet {
+        target: Register,
+        field: StringId,
         value: Register,
     },
     PushHandler {
@@ -242,6 +257,9 @@ impl Instruction {
             Self::MapNew {
                 dst, entries_start, ..
             } => vec![*dst, *entries_start],
+            Self::RecordNew {
+                dst, fields_start, ..
+            } => vec![*dst, *fields_start],
             Self::IndexGet { dst, target, index } => vec![*dst, *target, *index],
             Self::IndexSet {
                 target,
@@ -254,6 +272,8 @@ impl Instruction {
                 index,
                 value,
             } => vec![*array, *index, *value],
+            Self::FieldGet { dst, target, .. } => vec![*dst, *target],
+            Self::FieldSet { target, value, .. } => vec![*target, *value],
             Self::PushHandler { error, .. } => vec![*error],
             Self::PopHandler => vec![],
             Self::Throw { src } => vec![*src],
@@ -269,11 +289,15 @@ impl Instruction {
         }
     }
 
-    /// Returns the string operand, if the instruction has one.
-    pub fn string_operand(&self) -> Option<StringId> {
+    /// Returns every string-pool operand mentioned by this instruction.
+    ///
+    /// Used by the verifier to check string table bounds.
+    pub fn string_operands(&self) -> Vec<StringId> {
         match self {
-            Self::LoadString { string, .. } => Some(*string),
-            _ => None,
+            Self::LoadString { string, .. } => vec![*string],
+            Self::RecordNew { fields, .. } => fields.clone(),
+            Self::FieldGet { field, .. } | Self::FieldSet { field, .. } => vec![*field],
+            _ => Vec::new(),
         }
     }
 
