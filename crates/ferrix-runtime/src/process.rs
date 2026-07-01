@@ -27,18 +27,27 @@ impl fmt::Display for RuntimeSessionId {
 /// Kind of execution represented by a process record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeProcessKind {
-    /// Source file or package execution.
-    Source,
-    /// Serialized bytecode execution.
-    Bytecode,
+    /// Source file or package execution via `ferrix run`.
+    Run,
+    /// Source validation via `ferrix check`.
+    Check,
+    /// Source-to-bytecode compilation via `ferrix compile`.
+    Compile,
+    /// Serialized bytecode execution via `ferrix run-bytecode`.
+    RunBytecode,
+    /// Interactive source debugging via `ferrix debug`.
+    Debug,
 }
 
 impl RuntimeProcessKind {
     /// Returns the stable lowercase name.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Source => "source",
-            Self::Bytecode => "bytecode",
+            Self::Run => "run",
+            Self::Check => "check",
+            Self::Compile => "compile",
+            Self::RunBytecode => "run-bytecode",
+            Self::Debug => "debug",
         }
     }
 }
@@ -84,6 +93,11 @@ impl RuntimeProcessStatus {
             "killed" => Some(Self::Killed),
             _ => None,
         }
+    }
+
+    /// Returns true for processes that are currently live.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Paused)
     }
 }
 
