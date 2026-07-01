@@ -283,6 +283,30 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 arg_count
             )
         }
+        Instruction::MakeUpvalue { dst, src } => {
+            format!(
+                "{:<11} {}, {}",
+                "MakeUpvalue",
+                register(*dst),
+                register(*src)
+            )
+        }
+        Instruction::LoadUpvalue { dst, upvalue } => {
+            format!(
+                "{:<11} {}, {}",
+                "LoadUpvalue",
+                register(*dst),
+                register(*upvalue)
+            )
+        }
+        Instruction::StoreUpvalue { upvalue, src } => {
+            format!(
+                "{:<11} {}, {}",
+                "StoreUpvalue",
+                register(*upvalue),
+                register(*src)
+            )
+        }
         Instruction::MakeClosure {
             dst,
             function,
@@ -300,6 +324,12 @@ pub fn format_instruction(instruction: &Instruction) -> String {
         }
         Instruction::LoadCapture { dst, capture } => {
             format!("{:<11} {}, {}", "LoadCapture", register(*dst), capture)
+        }
+        Instruction::LoadCaptureCell { dst, capture } => {
+            format!("{:<11} {}, {}", "LoadCaptureCell", register(*dst), capture)
+        }
+        Instruction::StoreCapture { capture, src } => {
+            format!("{:<11} {}, {}", "StoreCapture", capture, register(*src))
         }
         Instruction::CallValue {
             dst,
