@@ -18,6 +18,8 @@ pub struct Chunk {
     pub arity: u8,
     /// Number of VM registers allocated for this chunk.
     pub register_count: u8,
+    /// Number of captured values available to this chunk.
+    pub capture_count: u8,
     /// Constant pool used by `LoadConst`.
     pub constants: Vec<Value>,
     /// String pool used by `LoadString`.
@@ -46,6 +48,7 @@ impl Chunk {
             name: name.into(),
             arity: 0,
             register_count,
+            capture_count: 0,
             constants: Vec::new(),
             strings: Vec::new(),
             instructions: Vec::new(),
@@ -57,6 +60,12 @@ impl Chunk {
     /// Sets the function arity and returns the updated chunk.
     pub fn with_arity(mut self, arity: u8) -> Self {
         self.arity = arity;
+        self
+    }
+
+    /// Sets the captured value count and returns the updated chunk.
+    pub fn with_capture_count(mut self, capture_count: u8) -> Self {
+        self.capture_count = capture_count;
         self
     }
 
