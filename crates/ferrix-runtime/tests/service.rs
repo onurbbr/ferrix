@@ -8,8 +8,9 @@ use std::{
 
 use ferrix_core::bytecode::encode_program;
 use ferrix_runtime::{
-    RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus, RuntimeEventKind,
-    RuntimeGateway, RuntimeMode, RuntimeProcessKind, RuntimeProcessStatus, RuntimeService,
+    HostCapability, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeEventBus,
+    RuntimeEventKind, RuntimeGateway, RuntimeMode, RuntimePolicy, RuntimeProcessKind,
+    RuntimeProcessStatus, RuntimeProfile, RuntimeService,
 };
 
 #[test]
@@ -178,6 +179,19 @@ fn runtime_mode_parses_configuration_names() {
 }
 
 #[test]
+fn runtime_policy_combines_profile_and_request_capabilities() {
+    let policy = RuntimePolicy::new(RuntimeProfile::Server, [HostCapability::IoOutput]);
+
+    assert!(policy.allows_capability(HostCapability::NativeCall));
+    assert!(policy.allows_capability(HostCapability::IoOutput));
+    assert!(
+        policy
+            .require_capability(HostCapability::FsWrite, "write file")
+            .is_err()
+    );
+}
+
+#[test]
 fn runtime_captures_stdlib_output() {
     let dir = temp_dir();
     let file = write_file(
@@ -222,6 +236,48 @@ return math.add(40, 2);
         .run_source(RunSourceRequest::new(&file))
         .unwrap();
 
+    assert_eq!(result.value_display.as_deref(), Some("42"));
+}
+
+#[test]
+fn safe_profile_runs_pure_bytecode_without_host_capabilities() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
+    let mut request = RunSourceRequest::new(&file);
+    request.profile = RuntimeProfile::Safe;
+
+    let result = RuntimeService::new().run_source(request).unwrap();
+
+    assert_eq!(result.value_display.as_deref(), Some("42"));
+}
+
+#[test]
+fn server_profile_denies_output_capability_by_default() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "print(\"hello\");\nreturn 42;\n");
+    let mut request = RunSourceRequest::new(&file);
+    request.profile = RuntimeProfile::Server;
+
+    let error = RuntimeService::new().run_source(request).unwrap_err();
+
+    assert_eq!(error.exit_code, 70);
+    assert!(
+        error
+            .render()
+            .contains("policy denied `io.output` for profile `server`")
+    );
+}
+
+#[test]
+fn request_capability_grants_allow_profile_restricted_output() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "print(\"hello\");\nreturn 42;\n");
+    let mut request = RunSourceRequest::new(&file).with_capability(HostCapability::IoOutput);
+    request.profile = RuntimeProfile::Server;
+
+    let result = RuntimeService::new().run_source(request).unwrap();
+
+    assert_eq!(result.output, "hello\n");
     assert_eq!(result.value_display.as_deref(), Some("42"));
 }
 
