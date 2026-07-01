@@ -20,7 +20,8 @@ use ferrix_core::{
     diagnostics::{SourceLocation, SourceManager},
 };
 use ferrix_runtime::{
-    DebugRequest, RunBytecodeRequest, RunSourceRequest, RuntimeGateway, RuntimeMode,
+    DebugRequest, RunBytecodeRequest, RunSourceRequest, RuntimeDaemon, RuntimeGateway,
+    RuntimeHealth, RuntimeMode, RuntimeProcessId, RuntimeProcessRecord,
 };
 use ferrix_vm::{CallFrame, DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
 
@@ -33,6 +34,10 @@ Usage:
   ferrix compile <file|package> <output>
   ferrix run-bytecode <file>
   ferrix debug <file|package>
+  ferrix runtime start|stop|status|restart
+  ferrix ps
+  ferrix logs <pid>
+  ferrix kill <pid>
   ferrix --help
   ferrix --version
 ";
@@ -84,6 +89,10 @@ fn run_cli(
         }
         [command, path] if command == "run-bytecode" => run_bytecode(path, stdout, stderr),
         [command, path] if command == "debug" => debug_file(path, stdin, stdout, stderr),
+        [command, action] if command == "runtime" => runtime_command(action, stdout, stderr),
+        [command] if command == "ps" => list_processes(stdout, stderr),
+        [command, pid] if command == "logs" => show_logs(pid, stdout, stderr),
+        [command, pid] if command == "kill" => kill_process(pid, stdout, stderr),
         [command, ..] if command == "run" => {
             writeln!(stderr, "error: expected a file or package path\n")
                 .expect("stderr write failed");
@@ -114,10 +123,147 @@ fn run_cli(
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
         }
+        [command, ..] if command == "runtime" => {
+            writeln!(
+                stderr,
+                "error: expected runtime action start, stop, status, or restart\n"
+            )
+            .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
+        }
+        [command, ..] if command == "logs" => {
+            writeln!(stderr, "error: expected a runtime process id\n")
+                .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
+        }
+        [command, ..] if command == "kill" => {
+            writeln!(stderr, "error: expected a runtime process id\n")
+                .expect("stderr write failed");
+            write!(stderr, "{USAGE}").expect("stderr write failed");
+            64
+        }
         _ => {
             writeln!(stderr, "error: unknown command\n").expect("stderr write failed");
             write!(stderr, "{USAGE}").expect("stderr write failed");
             64
+        }
+    }
+}
+
+fn runtime_command(action: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+    let mut daemon = RuntimeDaemon::new();
+    let result = match action {
+        "start" => daemon.start(),
+        "stop" => daemon.stop(),
+        "status" => daemon.status(),
+        "restart" => daemon.restart(),
+        _ => {
+            writeln!(stderr, "error: unknown runtime action `{action}`")
+                .expect("stderr write failed");
+            return 64;
+        }
+    };
+
+    match result {
+        Ok(status) => {
+            write_status(stdout, &status);
+            0
+        }
+        Err(error) => {
+            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            error.exit_code
+        }
+    }
+}
+
+fn write_status(stdout: &mut impl io::Write, status: &ferrix_runtime::RuntimeStatusReport) {
+    writeln!(stdout, "runtime: {}", status.health.as_str()).expect("stdout write failed");
+    writeln!(stdout, "version: {}", status.version).expect("stdout write failed");
+    if let Some(uptime_ms) = status.uptime_ms {
+        writeln!(stdout, "uptime_ms: {uptime_ms}").expect("stdout write failed");
+    }
+    writeln!(stdout, "processes: {}", status.process_count).expect("stdout write failed");
+    writeln!(stdout, "active: {}", status.active_process_count).expect("stdout write failed");
+    writeln!(stdout, "completed: {}", status.completed_process_count).expect("stdout write failed");
+    writeln!(stdout, "failed: {}", status.failed_process_count).expect("stdout write failed");
+    if status.health == RuntimeHealth::Stopped {
+        writeln!(stdout, "hint: ferrix runtime start").expect("stdout write failed");
+    }
+}
+
+fn list_processes(stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+    let daemon = RuntimeDaemon::new();
+    match daemon.list_processes() {
+        Ok(processes) => {
+            writeln!(stdout, "pid\tsession\tstatus\tkind\tpath").expect("stdout write failed");
+            for process in processes {
+                write_process_row(stdout, &process);
+            }
+            0
+        }
+        Err(error) => {
+            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            error.exit_code
+        }
+    }
+}
+
+fn write_process_row(stdout: &mut impl io::Write, process: &RuntimeProcessRecord) {
+    writeln!(
+        stdout,
+        "{}\t{}\t{}\t{}\t{}",
+        process.id,
+        process.session_id,
+        process.status.as_str(),
+        process.kind.as_str(),
+        process.path.display()
+    )
+    .expect("stdout write failed");
+}
+
+fn show_logs(pid: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+    let Some(process_id) = parse_process_id(pid, stderr) else {
+        return 64;
+    };
+    let daemon = RuntimeDaemon::new();
+    match daemon.logs(process_id) {
+        Ok(logs) => {
+            write!(stdout, "{logs}").expect("stdout write failed");
+            0
+        }
+        Err(error) => {
+            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            error.exit_code
+        }
+    }
+}
+
+fn kill_process(pid: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+    let Some(process_id) = parse_process_id(pid, stderr) else {
+        return 64;
+    };
+    let mut daemon = RuntimeDaemon::new();
+    match daemon.kill_process(process_id) {
+        Ok(process) => {
+            writeln!(stdout, "killed process {}", process.id).expect("stdout write failed");
+            0
+        }
+        Err(error) => {
+            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            error.exit_code
+        }
+    }
+}
+
+fn parse_process_id(pid: &str, stderr: &mut impl io::Write) -> Option<RuntimeProcessId> {
+    match pid.parse::<u64>() {
+        Ok(pid) => Some(RuntimeProcessId(pid)),
+        Err(_) => {
+            writeln!(stderr, "error: invalid runtime process id `{pid}`")
+                .expect("stderr write failed");
+            None
         }
     }
 }
