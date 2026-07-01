@@ -122,6 +122,7 @@ fn type_of(ctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError
             Obj::Array(_) => "array",
             Obj::Map(_) => "map",
             Obj::Function(_) => "function",
+            Obj::Closure { .. } => "function",
             Obj::NativeFunction(_) => "native_function",
             Obj::Module(_) => "module",
         },
