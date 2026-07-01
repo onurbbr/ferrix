@@ -297,6 +297,12 @@ impl Parser {
                     value,
                     span,
                 }),
+                Expr::Field { target, field, .. } => Ok(Stmt::FieldAssign {
+                    target: *target,
+                    field,
+                    value,
+                    span,
+                }),
                 target => Err(self.error(
                     CompileErrorKind::UnexpectedToken {
                         expected: "assignment target".to_string(),
@@ -424,15 +430,7 @@ impl Parser {
                     span: join(span, right),
                 };
             } else if self.match_kind(&TokenKind::Dot) {
-                let Expr::Variable { name, span } = expr else {
-                    return Err(self.error(
-                        CompileErrorKind::UnexpectedToken {
-                            expected: "module name".to_string(),
-                            found: "expression".to_string(),
-                        },
-                        self.previous().span,
-                    ));
-                };
+                let target_span = expr.span();
                 let member_token = self.advance().clone();
                 let TokenKind::Identifier(member) = member_token.kind else {
                     return Err(self.error(
@@ -443,10 +441,20 @@ impl Parser {
                         member_token.span,
                     ));
                 };
-                expr = Expr::Variable {
-                    name: format!("{name}.{member}"),
-                    span: join(span, member_token.span),
-                };
+                if let Expr::Variable { name, span } = &expr
+                    && self.check(&TokenKind::LeftParen)
+                {
+                    expr = Expr::Variable {
+                        name: format!("{name}.{member}"),
+                        span: join(*span, member_token.span),
+                    };
+                } else {
+                    expr = Expr::Field {
+                        target: Box::new(expr),
+                        field: member,
+                        span: join(target_span, member_token.span),
+                    };
+                }
             } else if self.match_kind(&TokenKind::LeftBracket) {
                 let index = self.expression()?;
                 let right = self.consume(&TokenKind::RightBracket, "`]`")?.span;
@@ -567,6 +575,10 @@ impl Parser {
     }
 
     fn map_literal(&mut self, start: SourceSpan) -> Result<Expr, CompileError> {
+        if self.check_identifier_field_start() {
+            return self.record_literal(start);
+        }
+
         let mut entries = Vec::new();
         if !self.check(&TokenKind::RightBrace) {
             loop {
@@ -582,6 +594,35 @@ impl Parser {
         let right = self.consume(&TokenKind::RightBrace, "`}`")?.span;
         Ok(Expr::Map {
             entries,
+            span: join(start, right),
+        })
+    }
+
+    fn record_literal(&mut self, start: SourceSpan) -> Result<Expr, CompileError> {
+        let mut fields = Vec::new();
+        if !self.check(&TokenKind::RightBrace) {
+            loop {
+                let field_token = self.advance().clone();
+                let TokenKind::Identifier(field) = field_token.kind else {
+                    return Err(self.error(
+                        CompileErrorKind::UnexpectedToken {
+                            expected: "record field name".to_string(),
+                            found: field_token.kind.describe(),
+                        },
+                        field_token.span,
+                    ));
+                };
+                self.consume(&TokenKind::Colon, "`:`")?;
+                let value = self.expression()?;
+                fields.push((field, value));
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let right = self.consume(&TokenKind::RightBrace, "`}`")?.span;
+        Ok(Expr::Record {
+            fields,
             span: join(start, right),
         })
     }
@@ -621,6 +662,14 @@ impl Parser {
 
     fn check(&self, kind: &TokenKind) -> bool {
         token_kind_eq(&self.peek().kind, kind)
+    }
+
+    fn check_identifier_field_start(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Identifier(_))
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| token_kind_eq(&token.kind, &TokenKind::Colon))
     }
 
     fn advance(&mut self) -> &Token {
@@ -673,8 +722,10 @@ fn target_description(expr: &Expr) -> &'static str {
         Expr::Call { .. } => "function call",
         Expr::Function { .. } => "function literal",
         Expr::Index { .. } => "index expression",
+        Expr::Field { .. } => "field expression",
         Expr::Array { .. } => "array literal",
         Expr::Map { .. } => "map literal",
+        Expr::Record { .. } => "record literal",
         Expr::Grouping { .. } => "grouping expression",
     }
 }
