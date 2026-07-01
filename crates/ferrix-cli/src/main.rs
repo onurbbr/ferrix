@@ -16,9 +16,10 @@ use ferrix_compiler::{
 };
 use ferrix_core::{
     Obj, Value,
-    bytecode::{FunctionId, VerifiedProgram, decode_program, encode_program, format_instruction},
+    bytecode::{FunctionId, VerifiedProgram, encode_program, format_instruction},
     diagnostics::{SourceLocation, SourceManager},
 };
+use ferrix_runtime::{RunBytecodeRequest, RunSourceRequest, RuntimeService};
 use ferrix_vm::{CallFrame, DebugAction, DebugEvent, DebugOutcome, Debugger, Heap, Vm};
 
 const USAGE: &str = "\
@@ -73,7 +74,7 @@ fn run_cli(
             writeln!(stdout, "ferrix {}", env!("CARGO_PKG_VERSION")).expect("stdout write failed");
             0
         }
-        [command, path] if command == "run" => run_file(path, &mut read_file, stdout, stderr),
+        [command, path] if command == "run" => run_file(path, stdout, stderr),
         [command, path] if command == "check" => check_file(path, &mut read_file, stderr),
         [command, path, output] if command == "compile" => {
             compile_bytecode(path, output, &mut read_file, stderr)
@@ -160,68 +161,35 @@ fn compile_bytecode(
 }
 
 fn run_bytecode(path: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
-    // Bytecode files are decoded as verified programs before entering the VM.
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let runtime = RuntimeService::new();
+    match runtime.run_bytecode(RunBytecodeRequest::new(path)) {
+        Ok(result) => write_run_result(stdout, result),
         Err(error) => {
-            writeln!(stderr, "error: could not read `{path}`: {error}")
-                .expect("stderr write failed");
-            return 66;
-        }
-    };
-    let program = match decode_program(&bytes) {
-        Ok(program) => program,
-        Err(error) => {
-            writeln!(stderr, "error: could not decode bytecode `{path}`: {error}")
-                .expect("stderr write failed");
-            return 65;
-        }
-    };
-    let mut vm = Vm::new();
-    ferrix_stdlib::install(&mut vm, program.as_program());
-    match vm.run_program(&program) {
-        Ok(value) => {
-            if value != Value::Nil {
-                writeln!(stdout, "{}", display_value(&vm, value)).expect("stdout write failed");
-            }
-            0
-        }
-        Err(error) => {
-            writeln!(stderr, "error: {error}").expect("stderr write failed");
-            70
+            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            error.exit_code
         }
     }
 }
 
-fn run_file(
-    path: &str,
-    read_file: &mut impl FnMut(&str) -> io::Result<String>,
-    stdout: &mut impl io::Write,
-    stderr: &mut impl io::Write,
-) -> i32 {
-    // Normal source execution compiles imports first, installs stdlib natives,
-    // and then renders runtime errors with source-aware diagnostics.
-    let (sources, program) = match compile_file(path, read_file, stderr) {
-        Ok(compiled) => compiled,
-        Err(code) => return code,
-    };
-
-    let mut vm = Vm::new();
-    ferrix_stdlib::install(&mut vm, program.as_program());
-    match vm.run_program(&program) {
-        Ok(value) => {
-            if value != Value::Nil {
-                writeln!(stdout, "{}", display_value(&vm, value)).expect("stdout write failed");
-            }
-            0
-        }
+fn run_file(path: &str, stdout: &mut impl io::Write, stderr: &mut impl io::Write) -> i32 {
+    // Normal source execution is delegated to ferrix-runtime so the CLI remains
+    // a thin command surface instead of wiring compiler, stdlib, and VM itself.
+    let runtime = RuntimeService::new();
+    match runtime.run_source(RunSourceRequest::new(path)) {
+        Ok(result) => write_run_result(stdout, result),
         Err(error) => {
-            let diagnostic = error.to_diagnostic_with_program(program.as_program());
-            write!(stderr, "{}", sources.render_diagnostic(&diagnostic))
-                .expect("stderr write failed");
-            70
+            write!(stderr, "{}", error.render()).expect("stderr write failed");
+            error.exit_code
         }
     }
+}
+
+fn write_run_result(stdout: &mut impl io::Write, result: ferrix_runtime::RunResult) -> i32 {
+    write!(stdout, "{}", result.output).expect("stdout write failed");
+    if let Some(value) = result.value_display {
+        writeln!(stdout, "{value}").expect("stdout write failed");
+    }
+    result.exit_code
 }
 
 fn debug_file(
