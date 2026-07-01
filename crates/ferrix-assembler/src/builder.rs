@@ -286,6 +286,19 @@ impl Assembler {
         })
     }
 
+    /// Emits record allocation from contiguous field value registers.
+    pub fn record_new(self, dst: u8, fields_start: u8, fields: impl Into<Vec<u16>>) -> Self {
+        self.push(Instruction::RecordNew {
+            dst: Register(dst),
+            fields_start: Register(fields_start),
+            fields: fields
+                .into()
+                .into_iter()
+                .map(ferrix_core::bytecode::StringId)
+                .collect(),
+        })
+    }
+
     /// Emits generic index read for arrays and maps.
     pub fn index_get(self, dst: u8, target: u8, index: u8) -> Self {
         self.push(Instruction::IndexGet {
@@ -300,6 +313,24 @@ impl Assembler {
         self.push(Instruction::IndexSet {
             target: Register(target),
             index: Register(index),
+            value: Register(value),
+        })
+    }
+
+    /// Emits a named field read from a record.
+    pub fn field_get(self, dst: u8, target: u8, field: u16) -> Self {
+        self.push(Instruction::FieldGet {
+            dst: Register(dst),
+            target: Register(target),
+            field: ferrix_core::bytecode::StringId(field),
+        })
+    }
+
+    /// Emits a named field write into a record.
+    pub fn field_set(self, target: u8, field: u16, value: u8) -> Self {
+        self.push(Instruction::FieldSet {
+            target: Register(target),
+            field: ferrix_core::bytecode::StringId(field),
             value: Register(value),
         })
     }
