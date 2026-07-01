@@ -47,6 +47,8 @@ pub struct CallFrame {
     pub ip: usize,
     /// Register file owned by this frame.
     pub registers: Vec<Value>,
+    /// Captured values available to this frame.
+    pub captures: Vec<Value>,
     /// Caller register that should receive this frame's return value.
     pub return_dst: Option<Register>,
 }
@@ -160,6 +162,7 @@ impl Vm {
         roots.insert_values(self.registers.iter().copied());
         for frame in &self.frames {
             roots.insert_values(frame.registers.iter().copied());
+            roots.insert_values(frame.captures.iter().copied());
         }
         roots.into_vec()
     }
@@ -400,6 +403,17 @@ impl Vm {
                         },
                     ));
                 }
+                Instruction::MakeClosure { .. }
+                | Instruction::LoadCapture { .. }
+                | Instruction::CallValue { .. } => {
+                    return Err(VmError::new(
+                        Some(ip),
+                        VmErrorKind::InvalidFunction {
+                            function: FunctionId(0),
+                            function_count: 0,
+                        },
+                    ));
+                }
                 Instruction::ArrayNew {
                     dst,
                     elements_start,
@@ -464,7 +478,7 @@ impl Vm {
         self.registers.clear();
         self.instruction_ip = 0;
         self.executed_instruction_count = 0;
-        self.push_frame(program, program.entry, None, &[], None)?;
+        self.push_frame(program, program.entry, None, &[], &[], None)?;
 
         loop {
             let frame_index = self
@@ -622,6 +636,46 @@ impl Vm {
                         continue;
                     }
                 }
+                Instruction::MakeClosure {
+                    dst,
+                    function,
+                    captures_start,
+                    capture_count,
+                } => {
+                    let captures = self.read_arguments(ip, captures_start, capture_count)?;
+                    let reference = self.allocate_object(Obj::Closure { function, captures })?;
+                    self.write_register(ip, dst, Value::Obj(reference))?;
+                }
+                Instruction::LoadCapture { dst, capture } => {
+                    let value = self.frames[frame_index]
+                        .captures
+                        .get(usize::from(capture.0))
+                        .copied()
+                        .ok_or_else(|| {
+                            VmError::new(
+                                Some(ip),
+                                VmErrorKind::InvalidCapture {
+                                    capture,
+                                    capture_count: self.frames[frame_index].captures.len(),
+                                },
+                            )
+                        })?;
+                    self.write_register(ip, dst, value)?;
+                }
+                Instruction::CallValue {
+                    dst,
+                    callee,
+                    args_start,
+                    arg_count,
+                } => {
+                    let callee = self.read_register(ip, callee)?;
+                    let args = self.read_arguments(ip, args_start, arg_count)?;
+                    self.frames[frame_index].registers = self.registers.clone();
+                    self.frames[frame_index].ip = self.instruction_ip;
+                    if self.call_value(program, ip, callee, dst, &args)? {
+                        continue;
+                    }
+                }
                 Instruction::ArrayNew {
                     dst,
                     elements_start,
@@ -708,7 +762,7 @@ impl Vm {
 
         match &function.kind {
             FunctionKind::Bytecode(_) => {
-                self.push_frame(program, function_id, Some(return_dst), args, Some(ip))?;
+                self.push_frame(program, function_id, Some(return_dst), args, &[], Some(ip))?;
                 Ok(true)
             }
             FunctionKind::Native { .. } => {
@@ -739,12 +793,68 @@ impl Vm {
         }
     }
 
+    fn call_value(
+        &mut self,
+        program: &Program,
+        ip: usize,
+        callee: Value,
+        return_dst: Register,
+        args: &[Value],
+    ) -> Result<bool, VmError> {
+        let Value::Obj(reference) = callee else {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "function",
+                    found: callee,
+                },
+            ));
+        };
+        let Obj::Closure { function, captures } = self.heap_object(reference)?.clone() else {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "function",
+                    found: callee,
+                },
+            ));
+        };
+        let expected = program.function(function).ok_or_else(|| {
+            VmError::new(
+                Some(ip),
+                VmErrorKind::InvalidFunction {
+                    function,
+                    function_count: program.functions.len(),
+                },
+            )
+        })?;
+        if expected.arity != args.len() as u8 {
+            return Err(VmError::new(
+                Some(ip),
+                VmErrorKind::TypeError {
+                    expected: "matching function arity",
+                    found: callee,
+                },
+            ));
+        }
+        self.push_frame(
+            program,
+            function,
+            Some(return_dst),
+            args,
+            &captures,
+            Some(ip),
+        )?;
+        Ok(true)
+    }
+
     fn push_frame(
         &mut self,
         program: &Program,
         function_id: FunctionId,
         return_dst: Option<Register>,
         args: &[Value],
+        captures: &[Value],
         ip: Option<usize>,
     ) -> Result<(), VmError> {
         if self.frames.len() >= self.limits.max_call_depth {
@@ -774,6 +884,7 @@ impl Vm {
             function_id,
             ip: 0,
             registers,
+            captures: captures.to_vec(),
             return_dst,
         });
         Ok(())
@@ -1296,6 +1407,7 @@ fn object_references(object: &Obj) -> Vec<ObjRef> {
             .flat_map(|(key, value)| [key.as_obj_ref(), value.as_obj_ref()])
             .flatten()
             .collect(),
+        Obj::Closure { captures, .. } => captures.iter().filter_map(Value::as_obj_ref).collect(),
         Obj::String(_) | Obj::Function(_) | Obj::NativeFunction(_) | Obj::Module(_) => Vec::new(),
     }
 }
