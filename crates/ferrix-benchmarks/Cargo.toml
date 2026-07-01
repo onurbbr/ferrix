@@ -1,0 +1,10 @@
+[package]
+name = "ferrix-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrix-compiler.workspace = true
+ferrix-stdlib.workspace = true
+ferrix-vm.workspace = true
