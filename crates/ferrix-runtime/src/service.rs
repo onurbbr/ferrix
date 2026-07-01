@@ -14,10 +14,14 @@ use ferrix_compiler::{
 };
 use ferrix_core::{
     Obj, Value,
-    bytecode::{FunctionKind, Program, VerifiedProgram, decode_program},
+    bytecode::{
+        BYTECODE_CONTAINER_MAGIC, BytecodeContainerMetadata, FunctionKind, Program,
+        SUPPORTED_BYTECODE_FEATURE_FLAGS, VerifiedProgram, bytecode_features, decode_container,
+        decode_program, unsupported_feature_flags,
+    },
     diagnostics::SourceManager,
 };
-use ferrix_vm::{Heap, Vm};
+use ferrix_vm::{Heap, HostCapability, Vm};
 
 use crate::{
     DebugRequest, RunBytecodeRequest, RunResult, RunSourceRequest, RuntimeError, RuntimeErrorKind,
@@ -95,11 +99,16 @@ impl RuntimeService {
                 },
             )
         })?;
-        let program = decode_program(&bytes).map_err(|error| {
-            RuntimeError::new(65, RuntimeErrorKind::DecodeBytecode(error.to_string()))
-        })?;
-
         let policy = RuntimePolicy::new(request.profile, request.capabilities.iter().copied());
+        let (program, metadata) = decode_bytecode_for_runtime(&bytes)?;
+        check_feature_compatibility(
+            metadata
+                .as_ref()
+                .map_or(program.as_program().format.feature_flags, |metadata| {
+                    metadata.feature_flags | program.as_program().format.feature_flags
+                }),
+        )?;
+        check_required_capabilities(metadata.as_ref(), &policy)?;
         let mut vm = vm_for_policy(&policy);
         let capture = install_output(&mut vm, request.output);
         install_stdlib_for_policy(&mut vm, program.as_program(), &policy)?;
@@ -144,6 +153,98 @@ impl RuntimeService {
         let DebugRequest { path, profile: _ } = request;
         self.compile_source_path(&path)
     }
+
+    /// Inspects bytecode/container metadata without executing it.
+    pub fn inspect_bytecode(
+        &self,
+        request: crate::InspectBytecodeRequest,
+    ) -> Result<crate::InspectResult, RuntimeError> {
+        let bytes = fs::read(&request.path).map_err(|error| {
+            RuntimeError::new(
+                66,
+                RuntimeErrorKind::Read {
+                    path: request.path.clone(),
+                    message: error.to_string(),
+                },
+            )
+        })?;
+        let (program, metadata) = decode_bytecode_for_runtime(&bytes)?;
+        let flags = metadata
+            .as_ref()
+            .map_or(program.as_program().format.feature_flags, |metadata| {
+                metadata.feature_flags
+            });
+        let features = bytecode_features(flags)
+            .into_iter()
+            .map(|feature| feature.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut diagnostics = vec![
+            format!("entry={}", program.as_program().entry.0),
+            format!("functions={}", program.as_program().functions.len()),
+            format!("features={features}"),
+        ];
+        if let Some(metadata) = metadata {
+            diagnostics.push(format!(
+                "min_ferrix_version={}",
+                metadata.min_ferrix_version
+            ));
+            diagnostics.push(format!("checksum={}", metadata.checksum));
+            if let Some(module_name) = metadata.module_name {
+                diagnostics.push(format!("module={module_name}"));
+            }
+        }
+        Ok(crate::InspectResult { diagnostics })
+    }
+}
+
+fn decode_bytecode_for_runtime(
+    bytes: &[u8],
+) -> Result<(VerifiedProgram, Option<BytecodeContainerMetadata>), RuntimeError> {
+    if bytes.starts_with(BYTECODE_CONTAINER_MAGIC.as_bytes()) {
+        let container = decode_container(bytes).map_err(|error| {
+            RuntimeError::new(65, RuntimeErrorKind::DecodeBytecode(error.to_string()))
+        })?;
+        Ok((container.program, Some(container.metadata)))
+    } else {
+        let program = decode_program(bytes).map_err(|error| {
+            RuntimeError::new(65, RuntimeErrorKind::DecodeBytecode(error.to_string()))
+        })?;
+        Ok((program, None))
+    }
+}
+
+fn check_feature_compatibility(feature_flags: u32) -> Result<(), RuntimeError> {
+    let unsupported = unsupported_feature_flags(feature_flags, SUPPORTED_BYTECODE_FEATURE_FLAGS);
+    if unsupported == 0 {
+        return Ok(());
+    }
+    let feature = bytecode_features(unsupported)
+        .first()
+        .map(|feature| feature.as_str().to_string())
+        .unwrap_or_else(|| format!("unknown:{unsupported:#x}"));
+    Err(RuntimeError::new(
+        65,
+        RuntimeErrorKind::UnsupportedFeature { feature },
+    ))
+}
+
+fn check_required_capabilities(
+    metadata: Option<&BytecodeContainerMetadata>,
+    policy: &RuntimePolicy,
+) -> Result<(), RuntimeError> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    for capability in &metadata.required_capabilities {
+        let capability = capability.parse::<HostCapability>().map_err(|error| {
+            RuntimeError::new(65, RuntimeErrorKind::DecodeBytecode(error.to_string()))
+        })?;
+        policy
+            .require_capability(capability, "load bytecode container")
+            .map_err(policy_error)?;
+    }
+    Ok(())
 }
 
 fn vm_for_policy(policy: &RuntimePolicy) -> Vm {
