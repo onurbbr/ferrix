@@ -154,6 +154,16 @@ fn check_statements(
     locals: &mut HashSet<String>,
     functions: &HashMap<String, usize>,
 ) -> Result<(), CompileError> {
+    let outer = HashSet::new();
+    check_statements_with_outer(stmts, locals, functions, &outer)
+}
+
+fn check_statements_with_outer(
+    stmts: &[Stmt],
+    locals: &mut HashSet<String>,
+    functions: &HashMap<String, usize>,
+    outer: &HashSet<String>,
+) -> Result<(), CompileError> {
     for stmt in stmts {
         match stmt {
             Stmt::Import { .. } => {}
@@ -163,7 +173,7 @@ fn check_statements(
                 initializer,
                 span,
             } => {
-                check_expr(initializer, locals, functions)?;
+                check_expr_with_outer(initializer, locals, functions, outer)?;
                 if !locals.insert(name.clone()) {
                     return Err(CompileError::new(
                         CompileErrorKind::DuplicateVariable { name: name.clone() },
@@ -178,7 +188,7 @@ fn check_statements(
                         Some(*span),
                     ));
                 }
-                check_expr(value, locals, functions)?;
+                check_expr_with_outer(value, locals, functions, outer)?;
             }
             Stmt::IndexAssign {
                 target,
@@ -186,12 +196,12 @@ fn check_statements(
                 value,
                 ..
             } => {
-                check_expr(target, locals, functions)?;
-                check_expr(index, locals, functions)?;
-                check_expr(value, locals, functions)?;
+                check_expr_with_outer(target, locals, functions, outer)?;
+                check_expr_with_outer(index, locals, functions, outer)?;
+                check_expr_with_outer(value, locals, functions, outer)?;
             }
             Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
-                check_expr(value, locals, functions)?;
+                check_expr_with_outer(value, locals, functions, outer)?;
             }
             Stmt::If {
                 condition,
@@ -199,18 +209,18 @@ fn check_statements(
                 else_branch,
                 ..
             } => {
-                check_expr(condition, locals, functions)?;
-                check_statements(then_branch, locals, functions)?;
-                check_statements(else_branch, locals, functions)?;
+                check_expr_with_outer(condition, locals, functions, outer)?;
+                check_statements_with_outer(then_branch, locals, functions, outer)?;
+                check_statements_with_outer(else_branch, locals, functions, outer)?;
             }
             Stmt::While {
                 condition, body, ..
             } => {
-                check_expr(condition, locals, functions)?;
-                check_statements(body, locals, functions)?;
+                check_expr_with_outer(condition, locals, functions, outer)?;
+                check_statements_with_outer(body, locals, functions, outer)?;
             }
             Stmt::Block { statements, .. } => {
-                check_statements(statements, locals, functions)?;
+                check_statements_with_outer(statements, locals, functions, outer)?;
             }
         }
     }
@@ -223,10 +233,20 @@ fn check_expr(
     locals: &HashSet<String>,
     functions: &HashMap<String, usize>,
 ) -> Result<(), CompileError> {
+    let outer = HashSet::new();
+    check_expr_with_outer(expr, locals, functions, &outer)
+}
+
+fn check_expr_with_outer(
+    expr: &Expr,
+    locals: &HashSet<String>,
+    functions: &HashMap<String, usize>,
+    outer: &HashSet<String>,
+) -> Result<(), CompileError> {
     match expr {
         Expr::Literal { .. } => Ok(()),
         Expr::Variable { name, span } => {
-            if locals.contains(name) {
+            if locals.contains(name) || outer.contains(name) {
                 Ok(())
             } else {
                 Err(CompileError::new(
@@ -236,8 +256,8 @@ fn check_expr(
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            check_expr(lhs, locals, functions)?;
-            check_expr(rhs, locals, functions)
+            check_expr_with_outer(lhs, locals, functions, outer)?;
+            check_expr_with_outer(rhs, locals, functions, outer)
         }
         Expr::Array { elements, .. } => {
             if elements.len() > u8::MAX as usize {
@@ -250,7 +270,7 @@ fn check_expr(
             }
 
             for element in elements {
-                check_expr(element, locals, functions)?;
+                check_expr_with_outer(element, locals, functions, outer)?;
             }
             Ok(())
         }
@@ -265,14 +285,14 @@ fn check_expr(
             }
 
             for (key, value) in entries {
-                check_expr(key, locals, functions)?;
-                check_expr(value, locals, functions)?;
+                check_expr_with_outer(key, locals, functions, outer)?;
+                check_expr_with_outer(value, locals, functions, outer)?;
             }
             Ok(())
         }
         Expr::Index { target, index, .. } => {
-            check_expr(target, locals, functions)?;
-            check_expr(index, locals, functions)
+            check_expr_with_outer(target, locals, functions, outer)?;
+            check_expr_with_outer(index, locals, functions, outer)
         }
         Expr::Call { callee, args, span } => {
             if args.len() > u8::MAX as usize {
@@ -283,29 +303,54 @@ fn check_expr(
                     Some(*span),
                 ));
             }
-            let expected = functions.get(callee).copied().ok_or_else(|| {
-                CompileError::new(
+            if let Some(expected) = functions.get(callee).copied() {
+                if expected != args.len() {
+                    return Err(CompileError::new(
+                        CompileErrorKind::WrongCallArity {
+                            name: callee.clone(),
+                            expected,
+                            actual: args.len(),
+                        },
+                        Some(*span),
+                    ));
+                }
+            } else if !locals.contains(callee) && !outer.contains(callee) {
+                return Err(CompileError::new(
                     CompileErrorKind::UndefinedFunction {
                         name: callee.clone(),
-                    },
-                    Some(*span),
-                )
-            })?;
-            if expected != args.len() {
-                return Err(CompileError::new(
-                    CompileErrorKind::WrongCallArity {
-                        name: callee.clone(),
-                        expected,
-                        actual: args.len(),
                     },
                     Some(*span),
                 ));
             }
             for arg in args {
-                check_expr(arg, locals, functions)?;
+                check_expr_with_outer(arg, locals, functions, outer)?;
             }
             Ok(())
         }
-        Expr::Grouping { expr, .. } => check_expr(expr, locals, functions),
+        Expr::Function { params, body, span } => {
+            let mut function_locals = HashSet::new();
+            let mut closure_outer = outer.clone();
+            closure_outer.extend(locals.iter().cloned());
+            if params.len() > u8::MAX as usize {
+                return Err(CompileError::new(
+                    CompileErrorKind::TooManyParameters {
+                        max: u8::MAX as usize,
+                    },
+                    Some(*span),
+                ));
+            }
+            for param in params {
+                if !function_locals.insert(param.clone()) {
+                    return Err(CompileError::new(
+                        CompileErrorKind::DuplicateParameter {
+                            name: param.clone(),
+                        },
+                        Some(*span),
+                    ));
+                }
+            }
+            check_statements_with_outer(body, &mut function_locals, functions, &closure_outer)
+        }
+        Expr::Grouping { expr, .. } => check_expr_with_outer(expr, locals, functions, outer),
     }
 }
