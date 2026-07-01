@@ -73,6 +73,9 @@ fn fold_constant_instructions(chunk: &mut Chunk) {
                     Instruction::Jump { .. }
                         | Instruction::JumpIfFalse { .. }
                         | Instruction::JumpIfTrue { .. }
+                        | Instruction::RecordNew { .. }
+                        | Instruction::FieldGet { .. }
+                        | Instruction::FieldSet { .. }
                         | Instruction::PushHandler { .. }
                         | Instruction::Throw { .. }
                         | Instruction::Return { .. }
@@ -211,8 +214,10 @@ fn written_registers(instruction: &Instruction) -> Vec<Register> {
         | Instruction::CallValue { dst, .. }
         | Instruction::ArrayNew { dst, .. }
         | Instruction::MapNew { dst, .. }
+        | Instruction::RecordNew { dst, .. }
         | Instruction::IndexGet { dst, .. }
         | Instruction::ArrayGet { dst, .. }
+        | Instruction::FieldGet { dst, .. }
         | Instruction::PushHandler { error: dst, .. } => vec![*dst],
         Instruction::Jump { .. }
         | Instruction::JumpIfFalse { .. }
@@ -223,6 +228,7 @@ fn written_registers(instruction: &Instruction) -> Vec<Register> {
         | Instruction::StoreCapture { .. }
         | Instruction::IndexSet { .. }
         | Instruction::ArraySet { .. }
+        | Instruction::FieldSet { .. }
         | Instruction::Return { .. } => Vec::new(),
     }
 }
