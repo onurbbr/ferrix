@@ -35,6 +35,31 @@ fn verifies_valid_chunk() {
 }
 
 #[test]
+fn verifies_error_handling_instructions() {
+    let mut chunk = Chunk::new("main", 2);
+    chunk.push_instruction(Instruction::PushHandler {
+        error: Register(0),
+        target: JumpTarget(2),
+    });
+    chunk.push_instruction(Instruction::Throw { src: Register(1) });
+    chunk.push_instruction(Instruction::Return { src: Register(0) });
+
+    let verified = StructuralVerifier::verify(chunk).unwrap();
+
+    assert_eq!(verified.as_chunk().instructions.len(), 3);
+}
+
+#[test]
+fn throw_counts_as_terminal_for_verification() {
+    let mut chunk = Chunk::new("main", 1);
+    chunk.push_instruction(Instruction::Throw { src: Register(0) });
+
+    let verified = StructuralVerifier::verify(chunk).unwrap();
+
+    assert_eq!(verified.as_chunk().instructions.len(), 1);
+}
+
+#[test]
 fn rejects_invalid_register() {
     let mut chunk = Chunk::new("main", 1);
     chunk.push_instruction(Instruction::Return { src: Register(1) });
