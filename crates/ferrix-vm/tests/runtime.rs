@@ -664,6 +664,71 @@ fn map_get_missing_key_returns_nil() {
 }
 
 #[test]
+fn record_new_get_and_set_are_supported() {
+    let mut chunk = Chunk::new("record", 5);
+    let field = chunk.add_string("answer").unwrap();
+    let initial = chunk.add_constant(Value::Int(1)).unwrap();
+    let replacement = chunk.add_constant(Value::Int(42)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: initial,
+    });
+    chunk.push_instruction(Instruction::RecordNew {
+        dst: Register(1),
+        fields_start: Register(0),
+        fields: vec![field],
+    });
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(2),
+        constant: replacement,
+    });
+    chunk.push_instruction(Instruction::FieldSet {
+        target: Register(1),
+        field,
+        value: Register(2),
+    });
+    chunk.push_instruction(Instruction::FieldGet {
+        dst: Register(3),
+        target: Register(1),
+        field,
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(3) });
+    let chunk = VerifiedChunk::new(chunk).unwrap();
+
+    let result = Vm::new().run(&chunk).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn record_get_missing_field_returns_nil() {
+    let mut chunk = Chunk::new("record", 4);
+    let present = chunk.add_string("present").unwrap();
+    let missing = chunk.add_string("missing").unwrap();
+    let value = chunk.add_constant(Value::Int(42)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: value,
+    });
+    chunk.push_instruction(Instruction::RecordNew {
+        dst: Register(1),
+        fields_start: Register(0),
+        fields: vec![present],
+    });
+    chunk.push_instruction(Instruction::FieldGet {
+        dst: Register(2),
+        target: Register(1),
+        field: missing,
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+    let chunk = VerifiedChunk::new(chunk).unwrap();
+
+    let result = Vm::new().run(&chunk).unwrap();
+
+    assert_eq!(result, Value::Nil);
+}
+
+#[test]
 fn arithmetic_instructions_operate_on_ints() {
     assert_eq!(run_binary(8, 3, InstructionKind::Sub), Value::Int(5));
     assert_eq!(run_binary(8, 3, InstructionKind::Mul), Value::Int(24));
