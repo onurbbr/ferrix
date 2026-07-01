@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "ferrix-compiler",
  "ferrix-core",
+ "ferrix-runtime",
  "ferrix-stdlib",
  "ferrix-vm",
 ]
@@ -42,6 +43,16 @@ dependencies = [
 [[package]]
 name = "ferrix-core"
 version = "0.1.0"
+
+[[package]]
+name = "ferrix-runtime"
+version = "0.1.0"
+dependencies = [
+ "ferrix-compiler",
+ "ferrix-core",
+ "ferrix-stdlib",
+ "ferrix-vm",
+]
 
 [[package]]
 name = "ferrix-stdlib"
