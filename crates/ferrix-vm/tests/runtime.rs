@@ -1574,6 +1574,105 @@ fn missing_native_implementation_is_typed_error() {
     );
 }
 
+#[test]
+fn custom_extension_calls_are_supported() {
+    let mut main = Chunk::new("main", 2);
+    let extension = main.add_string("math.double").unwrap();
+    let value = main.add_constant(Value::Int(21)).unwrap();
+    main.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: value,
+    });
+    main.push_instruction(Instruction::CallExtension {
+        dst: Register(1),
+        extension,
+        args_start: Register(0),
+        arg_count: 1,
+    });
+    main.push_instruction(Instruction::Return { src: Register(1) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+    let mut vm = Vm::new();
+    vm.grant_capability(HostCapability::ExtensionCall);
+    vm.register_extension_fn("math.double", |args| match args {
+        [Value::Int(value)] => Ok(Value::Int(value * 2)),
+        [found] => Err(VmError::new(
+            None,
+            VmErrorKind::TypeError {
+                expected: "int",
+                found: *found,
+            },
+        )),
+        _ => unreachable!("verifier enforces extension argument register shape"),
+    });
+
+    let result = vm.run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+    assert_eq!(
+        vm.audit_events(),
+        &["custom_extension_called id=math.double arity=1".to_string()]
+    );
+}
+
+#[test]
+fn custom_extension_requires_capability() {
+    let mut main = Chunk::new("main", 1);
+    let extension = main.add_string("host.echo").unwrap();
+    main.push_instruction(Instruction::CallExtension {
+        dst: Register(0),
+        extension,
+        args_start: Register(0),
+        arg_count: 0,
+    });
+    main.push_instruction(Instruction::Return { src: Register(0) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+    let mut vm = Vm::new();
+    vm.register_extension_fn("host.echo", |_args| Ok(Value::Nil));
+
+    let err = vm.run_program(&program).unwrap_err();
+
+    assert_eq!(err.instruction_ip, Some(0));
+    assert_eq!(
+        err.kind,
+        VmErrorKind::CapabilityDenied {
+            capability: HostCapability::ExtensionCall,
+            operation: "call custom extension",
+        }
+    );
+}
+
+#[test]
+fn missing_custom_extension_is_typed_error() {
+    let mut main = Chunk::new("main", 1);
+    let extension = main.add_string("missing").unwrap();
+    main.push_instruction(Instruction::CallExtension {
+        dst: Register(0),
+        extension,
+        args_start: Register(0),
+        arg_count: 0,
+    });
+    main.push_instruction(Instruction::Return { src: Register(0) });
+    let mut program = Program::new(FunctionId(0));
+    program.add_function(Function::bytecode(main)).unwrap();
+    let program = VerifiedProgram::new(program).unwrap();
+    let mut vm = Vm::new();
+    vm.grant_capability(HostCapability::ExtensionCall);
+
+    let err = vm.run_program(&program).unwrap_err();
+
+    assert_eq!(err.instruction_ip, Some(0));
+    assert_eq!(
+        err.kind,
+        VmErrorKind::MissingExtension {
+            id: "missing".to_string(),
+        }
+    );
+}
+
 #[derive(Clone, Copy)]
 enum InstructionKind {
     Sub,
