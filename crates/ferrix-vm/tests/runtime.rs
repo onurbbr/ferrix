@@ -937,6 +937,10 @@ fn runs_closure_call_with_captured_value() {
         dst: Register(0),
         constant: forty,
     });
+    main.push_instruction(Instruction::MakeUpvalue {
+        dst: Register(0),
+        src: Register(0),
+    });
     main.push_instruction(Instruction::MakeClosure {
         dst: Register(1),
         function: FunctionId(0),
@@ -963,6 +967,39 @@ fn runs_closure_call_with_captured_value() {
     let program = VerifiedProgram::new(program).unwrap();
 
     let result = Vm::new().run_program(&program).unwrap();
+
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn upvalue_cells_load_and_store_values() {
+    let mut chunk = Chunk::new("upvalue", 4);
+    let one = chunk.add_constant(Value::Int(1)).unwrap();
+    let forty_two = chunk.add_constant(Value::Int(42)).unwrap();
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(0),
+        constant: one,
+    });
+    chunk.push_instruction(Instruction::MakeUpvalue {
+        dst: Register(1),
+        src: Register(0),
+    });
+    chunk.push_instruction(Instruction::LoadConst {
+        dst: Register(2),
+        constant: forty_two,
+    });
+    chunk.push_instruction(Instruction::StoreUpvalue {
+        upvalue: Register(1),
+        src: Register(2),
+    });
+    chunk.push_instruction(Instruction::LoadUpvalue {
+        dst: Register(3),
+        upvalue: Register(1),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(3) });
+    let chunk = VerifiedChunk::new(chunk).unwrap();
+
+    let result = Vm::new().run(&chunk).unwrap();
 
     assert_eq!(result, Value::Int(42));
 }
