@@ -46,7 +46,17 @@ pub enum Instruction {
         lhs: Register,
         rhs: Register,
     },
+    AddInt {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
     Sub {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
+    SubInt {
         dst: Register,
         lhs: Register,
         rhs: Register,
@@ -56,7 +66,17 @@ pub enum Instruction {
         lhs: Register,
         rhs: Register,
     },
+    MulInt {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
     Div {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
+    DivInt {
         dst: Register,
         lhs: Register,
         rhs: Register,
@@ -87,7 +107,17 @@ pub enum Instruction {
         lhs: Register,
         rhs: Register,
     },
+    LessInt {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
     LessEqual {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
+    LessEqualInt {
         dst: Register,
         lhs: Register,
         rhs: Register,
@@ -97,7 +127,17 @@ pub enum Instruction {
         lhs: Register,
         rhs: Register,
     },
+    GreaterInt {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
     GreaterEqual {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
+    GreaterEqualInt {
         dst: Register,
         lhs: Register,
         rhs: Register,
@@ -215,15 +255,23 @@ impl Instruction {
             Self::LoadConst { dst, .. } | Self::LoadString { dst, .. } => vec![*dst],
             Self::Move { dst, src } => vec![*dst, *src],
             Self::Add { dst, lhs, rhs }
+            | Self::AddInt { dst, lhs, rhs }
             | Self::Sub { dst, lhs, rhs }
+            | Self::SubInt { dst, lhs, rhs }
             | Self::Mul { dst, lhs, rhs }
+            | Self::MulInt { dst, lhs, rhs }
             | Self::Div { dst, lhs, rhs }
+            | Self::DivInt { dst, lhs, rhs }
             | Self::Equal { dst, lhs, rhs }
             | Self::NotEqual { dst, lhs, rhs }
             | Self::Less { dst, lhs, rhs }
+            | Self::LessInt { dst, lhs, rhs }
             | Self::LessEqual { dst, lhs, rhs }
+            | Self::LessEqualInt { dst, lhs, rhs }
             | Self::Greater { dst, lhs, rhs }
-            | Self::GreaterEqual { dst, lhs, rhs } => vec![*dst, *lhs, *rhs],
+            | Self::GreaterInt { dst, lhs, rhs }
+            | Self::GreaterEqual { dst, lhs, rhs }
+            | Self::GreaterEqualInt { dst, lhs, rhs } => vec![*dst, *lhs, *rhs],
             Self::Jump { .. } => vec![],
             Self::JumpIfFalse { condition, .. } | Self::JumpIfTrue { condition, .. } => {
                 vec![*condition]
