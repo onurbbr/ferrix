@@ -8,13 +8,135 @@ use std::{error::Error, fmt};
 use crate::{
     ObjRef, Value,
     bytecode::{
-        BYTECODE_MAGIC, BytecodeFormat, Chunk, Function, FunctionId, FunctionKind, Instruction,
-        JumpTarget, Program, Register, VerifiedProgram,
+        BYTECODE_CONTAINER_MAGIC, BYTECODE_MAGIC, BytecodeFormat, CURRENT_CONTAINER_VERSION, Chunk,
+        Function, FunctionId, FunctionKind, Instruction, JumpTarget, Program, Register,
+        VerifiedProgram, infer_program_feature_flags,
     },
     diagnostics::{FileId, SourceSpan},
 };
 
 const FORMAT_VERSION: u16 = 1;
+
+/// Optional section kind in a Ferrix bytecode container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BytecodeSectionKind {
+    /// Encoded legacy program payload.
+    ProgramPayload,
+    /// Reserved import table metadata.
+    ImportTable,
+    /// Reserved export table metadata.
+    ExportTable,
+    /// Reserved interface metadata.
+    InterfaceMetadata,
+    /// Reserved debug/source-map metadata.
+    Debug,
+}
+
+impl BytecodeSectionKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::ProgramPayload => 0,
+            Self::ImportTable => 1,
+            Self::ExportTable => 2,
+            Self::InterfaceMetadata => 3,
+            Self::Debug => 4,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self, BytecodeDecodeError> {
+        match tag {
+            0 => Ok(Self::ProgramPayload),
+            1 => Ok(Self::ImportTable),
+            2 => Ok(Self::ExportTable),
+            3 => Ok(Self::InterfaceMetadata),
+            4 => Ok(Self::Debug),
+            _ => Err(BytecodeDecodeError::InvalidSectionKind { tag }),
+        }
+    }
+}
+
+/// One section entry discovered in a bytecode container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BytecodeSectionEntry {
+    /// Section kind.
+    pub kind: BytecodeSectionKind,
+    /// Byte offset in the container where the section payload starts.
+    pub offset: usize,
+    /// Section payload length in bytes.
+    pub len: usize,
+}
+
+/// Stable metadata wrapper for serialized bytecode containers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BytecodeContainerMetadata {
+    /// Bytecode instruction/schema version required by the payload.
+    pub bytecode_format_version: u16,
+    /// Minimum Ferrix version expected by producer/tooling.
+    pub min_ferrix_version: String,
+    /// Required bytecode feature flags.
+    pub feature_flags: u32,
+    /// Dotted host capabilities required by the payload.
+    pub required_capabilities: Vec<String>,
+    /// Entry function encoded in the payload.
+    pub entry: FunctionId,
+    /// Optional module or package name.
+    pub module_name: Option<String>,
+    /// Whether debug/source metadata is present.
+    pub debug_section_present: bool,
+    /// Simple checksum of the program payload.
+    pub checksum: u64,
+    /// Producer optimization level.
+    pub optimization_level: u8,
+    /// Whether an import table section is present.
+    pub import_table_present: bool,
+    /// Whether an export table section is present.
+    pub export_table_present: bool,
+    /// Whether an interface metadata section is present.
+    pub interface_metadata_present: bool,
+}
+
+impl BytecodeContainerMetadata {
+    /// Builds metadata from the current program model.
+    pub fn for_program(program: &Program) -> Self {
+        Self {
+            bytecode_format_version: program.format.version,
+            min_ferrix_version: env!("CARGO_PKG_VERSION").to_string(),
+            feature_flags: infer_program_feature_flags(program),
+            required_capabilities: Vec::new(),
+            entry: program.entry,
+            module_name: None,
+            debug_section_present: program_has_debug_metadata(program),
+            checksum: 0,
+            optimization_level: 0,
+            import_table_present: false,
+            export_table_present: false,
+            interface_metadata_present: false,
+        }
+    }
+
+    /// Adds one required host capability by dotted name.
+    pub fn with_required_capability(mut self, capability: impl Into<String>) -> Self {
+        self.required_capabilities.push(capability.into());
+        self
+    }
+
+    /// Sets optional module or package name.
+    pub fn with_module_name(mut self, module_name: impl Into<String>) -> Self {
+        self.module_name = Some(module_name.into());
+        self
+    }
+}
+
+/// Decoded bytecode container with metadata and verified program payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BytecodeContainer {
+    /// Stable container metadata.
+    pub metadata: BytecodeContainerMetadata,
+    /// Section entries discovered while decoding.
+    pub sections: Vec<BytecodeSectionEntry>,
+    /// Verified program payload.
+    pub program: VerifiedProgram,
+}
 
 /// Errors produced while encoding a bytecode program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +154,14 @@ pub enum BytecodeDecodeError {
     InvalidMagic,
     /// Serialization format version is unknown.
     UnsupportedVersion { version: u16 },
+    /// Bytecode container format version is unknown.
+    UnsupportedContainerVersion { version: u16 },
+    /// Encoded section kind is unknown.
+    InvalidSectionKind { tag: u8 },
+    /// Bytecode container did not include a program payload section.
+    MissingProgramSection,
+    /// Bytecode container payload checksum did not match metadata.
+    ChecksumMismatch { expected: u64, actual: u64 },
     /// String data was not valid UTF-8.
     InvalidUtf8,
     /// Encoded `Value` tag is unknown.
@@ -60,6 +190,32 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, BytecodeEncodeError>
     for function in &program.functions {
         encoder.function(function)?;
     }
+    Ok(encoder.bytes)
+}
+
+/// Encodes a program into a metadata-rich bytecode container.
+pub fn encode_container(
+    program: &Program,
+    metadata: Option<BytecodeContainerMetadata>,
+) -> Result<Vec<u8>, BytecodeEncodeError> {
+    let payload = encode_program(program)?;
+    let mut metadata = metadata.unwrap_or_else(|| BytecodeContainerMetadata::for_program(program));
+    metadata.bytecode_format_version = program.format.version;
+    metadata.feature_flags |= infer_program_feature_flags(program);
+    metadata.entry = program.entry;
+    metadata.debug_section_present |= program_has_debug_metadata(program);
+    metadata.checksum = checksum64(&payload);
+
+    let mut encoder = Encoder { bytes: Vec::new() };
+    encoder
+        .bytes
+        .extend_from_slice(BYTECODE_CONTAINER_MAGIC.as_bytes());
+    encoder.u16(CURRENT_CONTAINER_VERSION);
+    encoder.container_metadata(&metadata)?;
+    encoder.len("sections", 1)?;
+    encoder.u8(BytecodeSectionKind::ProgramPayload.tag());
+    encoder.len("section.program_payload", payload.len())?;
+    encoder.bytes.extend_from_slice(&payload);
     Ok(encoder.bytes)
 }
 
@@ -95,11 +251,93 @@ pub fn decode_program(bytes: &[u8]) -> Result<VerifiedProgram, BytecodeDecodeErr
     VerifiedProgram::new(program).map_err(BytecodeDecodeError::InvalidBytecode)
 }
 
+/// Decodes either a legacy program payload or a bytecode container.
+pub fn decode_bytecode(bytes: &[u8]) -> Result<VerifiedProgram, BytecodeDecodeError> {
+    if bytes.starts_with(BYTECODE_CONTAINER_MAGIC.as_bytes()) {
+        decode_container(bytes).map(|container| container.program)
+    } else {
+        decode_program(bytes)
+    }
+}
+
+/// Decodes a metadata-rich bytecode container.
+pub fn decode_container(bytes: &[u8]) -> Result<BytecodeContainer, BytecodeDecodeError> {
+    let mut decoder = Decoder { bytes, cursor: 0 };
+    decoder.container_magic()?;
+    let version = decoder.u16()?;
+    if version != CURRENT_CONTAINER_VERSION {
+        return Err(BytecodeDecodeError::UnsupportedContainerVersion { version });
+    }
+    let metadata = decoder.container_metadata()?;
+    let section_count = decoder.len("sections")?;
+    let mut sections = Vec::with_capacity(section_count);
+    let mut program_payload = None;
+    for _ in 0..section_count {
+        let kind = BytecodeSectionKind::from_tag(decoder.u8()?)?;
+        let len = decoder.len("section")?;
+        let offset = decoder.cursor;
+        let payload = decoder.take(len)?;
+        if kind == BytecodeSectionKind::ProgramPayload {
+            program_payload = Some(payload.to_vec());
+        }
+        sections.push(BytecodeSectionEntry { kind, offset, len });
+    }
+    if decoder.remaining() != 0 {
+        return Err(BytecodeDecodeError::TrailingBytes {
+            count: decoder.remaining(),
+        });
+    }
+    let payload = program_payload.ok_or(BytecodeDecodeError::MissingProgramSection)?;
+    let actual = checksum64(&payload);
+    if metadata.checksum != 0 && metadata.checksum != actual {
+        return Err(BytecodeDecodeError::ChecksumMismatch {
+            expected: metadata.checksum,
+            actual,
+        });
+    }
+    let program = decode_program(&payload)?;
+    Ok(BytecodeContainer {
+        metadata,
+        sections,
+        program,
+    })
+}
+
+/// Reads bytecode container metadata without returning the verified payload.
+pub fn inspect_container(bytes: &[u8]) -> Result<BytecodeContainerMetadata, BytecodeDecodeError> {
+    decode_container(bytes).map(|container| container.metadata)
+}
+
 struct Encoder {
     bytes: Vec<u8>,
 }
 
 impl Encoder {
+    fn container_metadata(
+        &mut self,
+        metadata: &BytecodeContainerMetadata,
+    ) -> Result<(), BytecodeEncodeError> {
+        self.u16(metadata.bytecode_format_version);
+        self.string("metadata.min_ferrix_version", &metadata.min_ferrix_version)?;
+        self.u32(metadata.feature_flags);
+        self.len(
+            "metadata.required_capabilities",
+            metadata.required_capabilities.len(),
+        )?;
+        for capability in &metadata.required_capabilities {
+            self.string("metadata.required_capability", capability)?;
+        }
+        self.u16(metadata.entry.0);
+        self.option_string("metadata.module_name", metadata.module_name.as_deref())?;
+        self.u8(u8::from(metadata.debug_section_present));
+        self.u64(metadata.checksum);
+        self.u8(metadata.optimization_level);
+        self.u8(u8::from(metadata.import_table_present));
+        self.u8(u8::from(metadata.export_table_present));
+        self.u8(u8::from(metadata.interface_metadata_present));
+        Ok(())
+    }
+
     fn function(&mut self, function: &Function) -> Result<(), BytecodeEncodeError> {
         self.string("function.name", &function.name)?;
         self.u8(function.arity);
@@ -477,6 +715,49 @@ impl Decoder<'_> {
         }
     }
 
+    fn container_magic(&mut self) -> Result<(), BytecodeDecodeError> {
+        let magic = self.take(BYTECODE_CONTAINER_MAGIC.len())?;
+        if magic == BYTECODE_CONTAINER_MAGIC.as_bytes() {
+            Ok(())
+        } else {
+            Err(BytecodeDecodeError::InvalidMagic)
+        }
+    }
+
+    fn container_metadata(&mut self) -> Result<BytecodeContainerMetadata, BytecodeDecodeError> {
+        let bytecode_format_version = self.u16()?;
+        let min_ferrix_version = self.string()?;
+        let feature_flags = self.u32()?;
+        let capability_count = self.len("metadata.required_capabilities")?;
+        let mut required_capabilities = Vec::with_capacity(capability_count);
+        for _ in 0..capability_count {
+            required_capabilities.push(self.string()?);
+        }
+        let entry = FunctionId(self.u16()?);
+        let module_name = self.option_string()?;
+        let debug_section_present = self.u8()? != 0;
+        let checksum = self.u64()?;
+        let optimization_level = self.u8()?;
+        let import_table_present = self.u8()? != 0;
+        let export_table_present = self.u8()? != 0;
+        let interface_metadata_present = self.u8()? != 0;
+
+        Ok(BytecodeContainerMetadata {
+            bytecode_format_version,
+            min_ferrix_version,
+            feature_flags,
+            required_capabilities,
+            entry,
+            module_name,
+            debug_section_present,
+            checksum,
+            optimization_level,
+            import_table_present,
+            export_table_present,
+            interface_metadata_present,
+        })
+    }
+
     fn function(&mut self) -> Result<Function, BytecodeDecodeError> {
         let name = self.string()?;
         let arity = self.u8()?;
@@ -818,6 +1099,17 @@ impl fmt::Display for BytecodeDecodeError {
             Self::UnsupportedVersion { version } => {
                 write!(f, "unsupported bytecode serialization version {version}")
             }
+            Self::UnsupportedContainerVersion { version } => {
+                write!(f, "unsupported bytecode container version {version}")
+            }
+            Self::InvalidSectionKind { tag } => write!(f, "invalid bytecode section kind {tag}"),
+            Self::MissingProgramSection => f.write_str("bytecode container has no program section"),
+            Self::ChecksumMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "bytecode container checksum mismatch: expected {expected}, got {actual}"
+                )
+            }
             Self::InvalidUtf8 => f.write_str("invalid utf-8 in bytecode"),
             Self::InvalidValueTag { tag } => write!(f, "invalid value tag {tag}"),
             Self::InvalidInstructionOpcode { opcode } => {
@@ -834,3 +1126,21 @@ impl fmt::Display for BytecodeDecodeError {
 impl Error for BytecodeEncodeError {}
 
 impl Error for BytecodeDecodeError {}
+
+fn program_has_debug_metadata(program: &Program) -> bool {
+    program.functions.iter().any(|function| {
+        function.chunk().is_some_and(|chunk| {
+            chunk.source_map.iter().any(Option::is_some)
+                || chunk.debug_local_names.iter().any(Option::is_some)
+        })
+    })
+}
+
+fn checksum64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
