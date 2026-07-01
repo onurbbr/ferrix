@@ -51,6 +51,27 @@ constants:
 }
 
 #[test]
+fn disassembles_integer_specialized_instructions() {
+    let mut chunk = Chunk::new("specialized", 3);
+    chunk.push_instruction(Instruction::AddInt {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::LessEqualInt {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(2) });
+
+    let output = Disassembler::disassemble_chunk(&chunk);
+
+    assert!(output.contains("0000 AddInt      r2, r0, r1\n"));
+    assert!(output.contains("0001 LessEqualInt r2, r0, r1\n"));
+}
+
+#[test]
 fn disassembles_empty_constant_pool() {
     let mut chunk = Chunk::new("main", 1);
     chunk.push_instruction(Instruction::Return { src: Register(0) });
