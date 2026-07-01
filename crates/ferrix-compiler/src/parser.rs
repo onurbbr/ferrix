@@ -93,6 +93,10 @@ impl Parser {
             self.while_statement()
         } else if self.match_kind(&TokenKind::Return) {
             self.return_statement()
+        } else if self.match_kind(&TokenKind::Throw) {
+            self.throw_statement()
+        } else if self.match_kind(&TokenKind::Try) {
+            self.try_catch_statement()
         } else if self.match_kind(&TokenKind::LeftBrace) {
             self.block_statement()
         } else {
@@ -239,6 +243,42 @@ impl Parser {
         let end = self.consume(&TokenKind::Semicolon, "`;`")?.span;
         Ok(Stmt::Return {
             value,
+            span: join(start, end),
+        })
+    }
+
+    fn throw_statement(&mut self) -> Result<Stmt, CompileError> {
+        let start = self.previous().span;
+        let value = self.expression()?;
+        let end = self.consume(&TokenKind::Semicolon, "`;`")?.span;
+        Ok(Stmt::Throw {
+            value,
+            span: join(start, end),
+        })
+    }
+
+    fn try_catch_statement(&mut self) -> Result<Stmt, CompileError> {
+        let start = self.previous().span;
+        let (try_branch, _) = self.block()?;
+        self.consume(&TokenKind::Catch, "`catch`")?;
+        self.consume(&TokenKind::LeftParen, "`(`")?;
+        let name_token = self.advance().clone();
+        let TokenKind::Identifier(catch_name) = name_token.kind else {
+            return Err(self.error(
+                CompileErrorKind::UnexpectedToken {
+                    expected: "catch binding".to_string(),
+                    found: name_token.kind.describe(),
+                },
+                name_token.span,
+            ));
+        };
+        self.consume(&TokenKind::RightParen, "`)`")?;
+        let (catch_branch, end) = self.block()?;
+
+        Ok(Stmt::TryCatch {
+            try_branch,
+            catch_name,
+            catch_branch,
             span: join(start, end),
         })
     }
