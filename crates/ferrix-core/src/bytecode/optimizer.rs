@@ -4,25 +4,153 @@
 //! file or function metadata. It performs conservative local rewrites that keep
 //! the output acceptable to the structural and program verifiers.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Instant};
 
 use crate::{
     Value,
     bytecode::{Chunk, Instruction, JumpTarget, Register},
 };
 
-/// Optimizes a single bytecode chunk while preserving verifier invariants.
-pub fn optimize_chunk(mut chunk: Chunk) -> Chunk {
-    fold_constant_instructions(&mut chunk);
-    specialize_integer_instructions(&mut chunk);
-    collapse_jump_chains(&mut chunk);
-    remove_redundant_moves(&mut chunk);
-    remove_unreachable_instructions(&mut chunk);
-    collapse_jump_chains(&mut chunk);
-    chunk
+/// Structured metadata emitted by one optimizer pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptimizationPassReport {
+    /// Stable pass name suitable for CLI output.
+    pub name: &'static str,
+    /// Short description of the transformation.
+    pub description: &'static str,
+    /// Whether the pass changed the instruction stream.
+    pub changed: bool,
+    /// Pass wall-clock duration in nanoseconds.
+    pub duration_ns: u128,
+    /// Human-readable pass warnings.
+    pub warnings: Vec<String>,
+    /// Number of instructions inspected by the pass.
+    pub instructions_inspected: usize,
+    /// Number of bytecode functions inspected by the pass.
+    pub functions_inspected: usize,
+    /// Number of local rewrites/removals performed by the pass.
+    pub transformations_applied: usize,
 }
 
-fn specialize_integer_instructions(chunk: &mut Chunk) {
+/// Optimization metadata for one bytecode chunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptimizationReport {
+    /// Chunk/function name optimized.
+    pub chunk_name: String,
+    /// Instruction count before running optimizer passes.
+    pub instructions_before: usize,
+    /// Instruction count after running optimizer passes.
+    pub instructions_after: usize,
+    /// Reports emitted by individual passes.
+    pub passes: Vec<OptimizationPassReport>,
+}
+
+impl OptimizationReport {
+    /// Returns the total number of transformations applied by all passes.
+    pub fn total_transformations(&self) -> usize {
+        self.passes
+            .iter()
+            .map(|pass| pass.transformations_applied)
+            .sum()
+    }
+}
+
+/// Optimized chunk paired with pass metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptimizedChunk {
+    /// Optimized bytecode chunk.
+    pub chunk: Chunk,
+    /// Optimization report for this chunk.
+    pub report: OptimizationReport,
+}
+
+/// Optimizes a single bytecode chunk while preserving verifier invariants.
+pub fn optimize_chunk(chunk: Chunk) -> Chunk {
+    optimize_chunk_with_report(chunk).chunk
+}
+
+/// Optimizes a single bytecode chunk and returns pass-level metadata.
+pub fn optimize_chunk_with_report(mut chunk: Chunk) -> OptimizedChunk {
+    let mut report = OptimizationReport {
+        chunk_name: chunk.name.clone(),
+        instructions_before: chunk.instructions.len(),
+        instructions_after: chunk.instructions.len(),
+        passes: Vec::new(),
+    };
+
+    run_pass(
+        &mut report,
+        "constant-folding",
+        "Fold register-local constant expressions into constant loads.",
+        &mut chunk,
+        fold_constant_instructions,
+    );
+    run_pass(
+        &mut report,
+        "integer-specialization",
+        "Specialize generic arithmetic/comparison opcodes to integer opcodes.",
+        &mut chunk,
+        specialize_integer_instructions,
+    );
+    run_pass(
+        &mut report,
+        "jump-chain-collapse",
+        "Collapse jump targets that point at unconditional jumps.",
+        &mut chunk,
+        collapse_jump_chains,
+    );
+    run_pass(
+        &mut report,
+        "redundant-move-removal",
+        "Remove self-moves that are not jump targets.",
+        &mut chunk,
+        remove_redundant_moves,
+    );
+    run_pass(
+        &mut report,
+        "unreachable-code-removal",
+        "Remove straight-line instructions after terminal control flow.",
+        &mut chunk,
+        remove_unreachable_instructions,
+    );
+    run_pass(
+        &mut report,
+        "post-compact-jump-chain-collapse",
+        "Collapse jump chains after instruction compaction.",
+        &mut chunk,
+        collapse_jump_chains,
+    );
+
+    report.instructions_after = chunk.instructions.len();
+    OptimizedChunk { chunk, report }
+}
+
+fn run_pass(
+    report: &mut OptimizationReport,
+    name: &'static str,
+    description: &'static str,
+    chunk: &mut Chunk,
+    pass: fn(&mut Chunk) -> usize,
+) {
+    let instructions_before = chunk.instructions.len();
+    let started = Instant::now();
+    let transformations = pass(chunk);
+    let duration_ns = started.elapsed().as_nanos();
+    let instructions_after = chunk.instructions.len();
+    report.passes.push(OptimizationPassReport {
+        name,
+        description,
+        changed: transformations > 0 || instructions_before != instructions_after,
+        duration_ns,
+        warnings: Vec::new(),
+        instructions_inspected: instructions_before,
+        functions_inspected: 1,
+        transformations_applied: transformations,
+    });
+}
+
+fn specialize_integer_instructions(chunk: &mut Chunk) -> usize {
+    let mut transformations = 0;
     for instruction in &mut chunk.instructions {
         let replacement = match instruction {
             Instruction::Add { dst, lhs, rhs } => Some(Instruction::AddInt {
@@ -70,13 +198,16 @@ fn specialize_integer_instructions(chunk: &mut Chunk) {
 
         if let Some(replacement) = replacement {
             *instruction = replacement;
+            transformations += 1;
         }
     }
+    transformations
 }
 
-fn fold_constant_instructions(chunk: &mut Chunk) {
+fn fold_constant_instructions(chunk: &mut Chunk) -> usize {
     let jump_targets = jump_targets(&chunk.instructions);
     let mut constants_by_register = vec![None; usize::from(chunk.register_count)];
+    let mut transformations = 0;
 
     for ip in 0..chunk.instructions.len() {
         if jump_targets.contains(&ip) {
@@ -149,8 +280,10 @@ fn fold_constant_instructions(chunk: &mut Chunk) {
 
         if let Some(instruction) = replacement {
             chunk.instructions[ip] = instruction;
+            transformations += 1;
         }
     }
+    transformations
 }
 
 fn fold_binary(instruction: &Instruction, lhs: Option<Value>, rhs: Option<Value>) -> Option<Value> {
@@ -320,8 +453,9 @@ fn written_registers(instruction: &Instruction) -> Vec<Register> {
     }
 }
 
-fn collapse_jump_chains(chunk: &mut Chunk) {
+fn collapse_jump_chains(chunk: &mut Chunk) -> usize {
     let instructions = chunk.instructions.clone();
+    let mut transformations = 0;
     for instruction in &mut chunk.instructions {
         let Some(target) = instruction.jump_operand() else {
             continue;
@@ -331,9 +465,19 @@ fn collapse_jump_chains(chunk: &mut Chunk) {
             Instruction::Jump { target }
             | Instruction::JumpIfFalse { target, .. }
             | Instruction::JumpIfTrue { target, .. }
-            | Instruction::PushHandler { target, .. } => *target = collapsed,
+            | Instruction::PushHandler { target, .. } => {
+                update_jump_target(target, collapsed, &mut transformations);
+            }
             _ => {}
         }
+    }
+    transformations
+}
+
+fn update_jump_target(target: &mut JumpTarget, collapsed: JumpTarget, transformations: &mut usize) {
+    if *target != collapsed {
+        *target = collapsed;
+        *transformations += 1;
     }
 }
 
@@ -351,7 +495,7 @@ fn follow_jump_chain(instructions: &[Instruction], mut target: JumpTarget) -> Ju
     target
 }
 
-fn remove_redundant_moves(chunk: &mut Chunk) {
+fn remove_redundant_moves(chunk: &mut Chunk) -> usize {
     let targets = jump_targets(&chunk.instructions);
     let keep = chunk
         .instructions
@@ -361,10 +505,12 @@ fn remove_redundant_moves(chunk: &mut Chunk) {
             !matches!(instruction, Instruction::Move { dst, src } if dst == src && !targets.contains(&index))
         })
         .collect::<Vec<_>>();
+    let removed = keep.iter().filter(|keep| !**keep).count();
     compact_chunk(chunk, &keep);
+    removed
 }
 
-fn remove_unreachable_instructions(chunk: &mut Chunk) {
+fn remove_unreachable_instructions(chunk: &mut Chunk) -> usize {
     let targets = jump_targets(&chunk.instructions);
     let mut keep = Vec::with_capacity(chunk.instructions.len());
     let mut reachable = true;
@@ -386,7 +532,9 @@ fn remove_unreachable_instructions(chunk: &mut Chunk) {
         }
     }
 
+    let removed = keep.iter().filter(|keep| !**keep).count();
     compact_chunk(chunk, &keep);
+    removed
 }
 
 fn compact_chunk(chunk: &mut Chunk, keep: &[bool]) {
