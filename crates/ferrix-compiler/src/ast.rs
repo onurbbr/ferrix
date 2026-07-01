@@ -109,6 +109,13 @@ pub enum Expr {
         args: Vec<Expr>,
         span: SourceSpan,
     },
+    /// Receiver-style method call, lowered to an explicit function call.
+    MethodCall {
+        target: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+        span: SourceSpan,
+    },
     /// Anonymous function expression that can capture outer locals.
     Function {
         params: Vec<String>,
@@ -203,6 +210,7 @@ impl Expr {
             | Self::Variable { span, .. }
             | Self::Binary { span, .. }
             | Self::Call { span, .. }
+            | Self::MethodCall { span, .. }
             | Self::Function { span, .. }
             | Self::Index { span, .. }
             | Self::Field { span, .. }
