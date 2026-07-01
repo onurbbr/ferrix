@@ -73,6 +73,8 @@ fn fold_constant_instructions(chunk: &mut Chunk) {
                     Instruction::Jump { .. }
                         | Instruction::JumpIfFalse { .. }
                         | Instruction::JumpIfTrue { .. }
+                        | Instruction::PushHandler { .. }
+                        | Instruction::Throw { .. }
                         | Instruction::Return { .. }
                 ) {
                     constants_by_register.fill(None);
@@ -210,10 +212,13 @@ fn written_registers(instruction: &Instruction) -> Vec<Register> {
         | Instruction::ArrayNew { dst, .. }
         | Instruction::MapNew { dst, .. }
         | Instruction::IndexGet { dst, .. }
-        | Instruction::ArrayGet { dst, .. } => vec![*dst],
+        | Instruction::ArrayGet { dst, .. }
+        | Instruction::PushHandler { error: dst, .. } => vec![*dst],
         Instruction::Jump { .. }
         | Instruction::JumpIfFalse { .. }
         | Instruction::JumpIfTrue { .. }
+        | Instruction::PopHandler
+        | Instruction::Throw { .. }
         | Instruction::StoreUpvalue { .. }
         | Instruction::StoreCapture { .. }
         | Instruction::IndexSet { .. }
@@ -232,7 +237,8 @@ fn collapse_jump_chains(chunk: &mut Chunk) {
         match instruction {
             Instruction::Jump { target }
             | Instruction::JumpIfFalse { target, .. }
-            | Instruction::JumpIfTrue { target, .. } => *target = collapsed,
+            | Instruction::JumpIfTrue { target, .. }
+            | Instruction::PushHandler { target, .. } => *target = collapsed,
             _ => {}
         }
     }
@@ -280,7 +286,7 @@ fn remove_unreachable_instructions(chunk: &mut Chunk) {
         if reachable
             && matches!(
                 instruction,
-                Instruction::Jump { .. } | Instruction::Return { .. }
+                Instruction::Jump { .. } | Instruction::Throw { .. } | Instruction::Return { .. }
             )
         {
             reachable = false;
@@ -344,7 +350,8 @@ fn remap_jump_target(instruction: &mut Instruction, mapping: &[Option<usize>]) {
     match instruction {
         Instruction::Jump { target }
         | Instruction::JumpIfFalse { target, .. }
-        | Instruction::JumpIfTrue { target, .. } => *target = new_target,
+        | Instruction::JumpIfTrue { target, .. }
+        | Instruction::PushHandler { target, .. } => *target = new_target,
         _ => {}
     }
 }
