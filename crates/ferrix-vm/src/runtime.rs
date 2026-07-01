@@ -42,10 +42,13 @@ pub struct Vm {
     capabilities: HashSet<HostCapability>,
     audit_events: Vec<String>,
     native_functions: HashMap<FunctionId, Rc<NativeFunction>>,
+    extension_functions: HashMap<String, Rc<ExtensionFunction>>,
     field_cache: HashMap<FieldCacheKey, usize>,
 }
 
 type NativeFunction =
+    dyn for<'vm> Fn(&mut NativeContext<'vm>, &[Value]) -> Result<Value, VmError> + 'static;
+type ExtensionFunction =
     dyn for<'vm> Fn(&mut NativeContext<'vm>, &[Value]) -> Result<Value, VmError> + 'static;
 
 /// Saved execution state for one active function call.
@@ -136,6 +139,7 @@ impl Vm {
             capabilities: HashSet::new(),
             audit_events: Vec::new(),
             native_functions: HashMap::new(),
+            extension_functions: HashMap::new(),
             field_cache: HashMap::new(),
         }
     }
@@ -356,6 +360,26 @@ impl Vm {
         native: impl for<'vm> Fn(&mut NativeContext<'vm>, &[Value]) -> Result<Value, VmError> + 'static,
     ) {
         self.native_functions.insert(function, Rc::new(native));
+    }
+
+    /// Registers a custom extension handler that does not need direct VM context access.
+    pub fn register_extension_fn(
+        &mut self,
+        id: impl Into<String>,
+        extension: impl Fn(&[Value]) -> Result<Value, VmError> + 'static,
+    ) {
+        self.register_extension_context_fn(id, move |_ctx, args| extension(args));
+    }
+
+    /// Registers a custom extension handler that can allocate, inspect heap, or write output.
+    pub fn register_extension_context_fn(
+        &mut self,
+        id: impl Into<String>,
+        extension: impl for<'vm> Fn(&mut NativeContext<'vm>, &[Value]) -> Result<Value, VmError>
+        + 'static,
+    ) {
+        self.extension_functions
+            .insert(id.into(), Rc::new(extension));
     }
 
     /// Executes a verified single chunk and returns its final value.
@@ -647,6 +671,16 @@ impl Vm {
                             function_count: 0,
                         },
                     ));
+                }
+                Instruction::CallExtension {
+                    dst,
+                    extension,
+                    args_start,
+                    arg_count,
+                } => {
+                    let args = self.read_arguments(ip, *args_start, *arg_count)?;
+                    let value = self.call_extension(chunk, ip, *extension, &args)?;
+                    self.write_register(ip, *dst, value)?;
                 }
                 Instruction::ArrayNew {
                     dst,
@@ -1013,6 +1047,16 @@ impl Vm {
                         continue;
                     }
                 }
+                Instruction::CallExtension {
+                    dst,
+                    extension,
+                    args_start,
+                    arg_count,
+                } => {
+                    let args = self.read_arguments(ip, args_start, arg_count)?;
+                    let value = self.call_extension(chunk, ip, extension, &args)?;
+                    self.write_register(ip, dst, value)?;
+                }
                 Instruction::ArrayNew {
                     dst,
                     elements_start,
@@ -1225,6 +1269,52 @@ impl Vm {
             Some(ip),
         )?;
         Ok(true)
+    }
+
+    fn call_extension(
+        &mut self,
+        chunk: &Chunk,
+        ip: usize,
+        extension: StringId,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        self.require_capability(HostCapability::ExtensionCall, "call custom extension")
+            .map_err(|mut err| {
+                if err.instruction_ip.is_none() {
+                    err.instruction_ip = Some(ip);
+                }
+                err
+            })?;
+        let id = chunk
+            .strings
+            .get(usize::from(extension.0))
+            .cloned()
+            .ok_or_else(|| {
+                VmError::new(
+                    Some(ip),
+                    VmErrorKind::InvalidString {
+                        string: extension,
+                        string_count: chunk.strings.len(),
+                    },
+                )
+            })?;
+        let extension_fn = self.extension_functions.get(&id).cloned().ok_or_else(|| {
+            VmError::new(Some(ip), VmErrorKind::MissingExtension { id: id.clone() })
+        })?;
+        let value = {
+            let mut context = NativeContext::new(self);
+            extension_fn(&mut context, args).map_err(|mut err| {
+                if err.instruction_ip.is_none() {
+                    err.instruction_ip = Some(ip);
+                }
+                err
+            })?
+        };
+        self.audit_events.push(format!(
+            "custom_extension_called id={id} arity={}",
+            args.len()
+        ));
+        Ok(value)
     }
 
     fn push_exception_handler_for_chunk(
