@@ -416,6 +416,18 @@ pub fn format_instruction(instruction: &Instruction) -> String {
                 register(*value)
             )
         }
+        Instruction::PushHandler { error, target } => {
+            format!(
+                "{:<11} {}, {}",
+                "PushHandler",
+                register(*error),
+                jump_target(*target)
+            )
+        }
+        Instruction::PopHandler => "PopHandler".to_string(),
+        Instruction::Throw { src } => {
+            format!("{:<11} {}", "Throw", register(*src))
+        }
         Instruction::Return { src } => {
             format!("{:<11} {}", "Return", register(*src))
         }
