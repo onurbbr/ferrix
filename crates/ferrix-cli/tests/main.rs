@@ -189,6 +189,145 @@ fn runtime_lifecycle_commands_are_silent_except_status() {
 }
 
 #[test]
+fn runtime_inspection_commands_report_metrics_events_config_and_json_status() {
+    let dir = temp_dir();
+    let runtime_home = dir.join("runtime");
+    let file = write_file(&dir, "main.fx", "return 42;\n");
+
+    let start = run([
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "start",
+    ]);
+    assert_eq!(start.status.code(), Some(0));
+
+    let output = run([
+        "--runtime-mode",
+        "required",
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "run",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let metrics = run([
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "metrics",
+    ]);
+    assert_eq!(metrics.status.code(), Some(0));
+    assert!(stdout(&metrics).contains("processes: 1"));
+    assert!(stdout(&metrics).contains("executed_instructions: "));
+    assert!(stderr(&metrics).is_empty());
+
+    let events = run([
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "events",
+    ]);
+    assert_eq!(events.status.code(), Some(0));
+    assert!(stdout(&events).contains("id\tseverity\tkind"));
+    assert!(stdout(&events).contains("runtime_started"));
+    assert!(stderr(&events).is_empty());
+
+    let config = run([
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "config",
+    ]);
+    assert_eq!(config.status.code(), Some(0));
+    assert!(stdout(&config).contains("mode: embedded"));
+    assert!(stdout(&config).contains("rate_limit_per_second: 64"));
+    assert!(stderr(&config).is_empty());
+
+    let status = run([
+        "--format",
+        "json",
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "status",
+    ]);
+    assert_eq!(status.status.code(), Some(0));
+    assert!(stdout(&status).contains("\"runtime\":\"serving\""));
+    assert!(stdout(&status).contains("\"protocol\":\"1.0\""));
+    assert!(stderr(&status).is_empty());
+
+    let metrics_json = run([
+        "--format",
+        "json",
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "metrics",
+    ]);
+    assert_eq!(metrics_json.status.code(), Some(0));
+    assert!(stdout(&metrics_json).contains("\"processes\":1"));
+    assert!(stderr(&metrics_json).is_empty());
+
+    let stop = run([
+        "--runtime-home",
+        runtime_home.to_str().unwrap(),
+        "runtime",
+        "stop",
+    ]);
+    assert_eq!(stop.status.code(), Some(0));
+}
+
+#[test]
+fn run_and_check_watch_once_execute_one_iteration() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 42;\n");
+
+    let run_output = run(["run", file.to_str().unwrap(), "--watch-once"]);
+    assert_eq!(run_output.status.code(), Some(0));
+    assert!(stdout(&run_output).contains("watch: running"));
+    assert!(stdout(&run_output).contains("42\n"));
+    assert!(stderr(&run_output).is_empty());
+
+    let check_output = run(["check", file.to_str().unwrap(), "--watch-once"]);
+    assert_eq!(check_output.status.code(), Some(0));
+    assert!(stdout(&check_output).contains("watch: checking"));
+    assert!(stderr(&check_output).is_empty());
+}
+
+#[test]
+fn inspect_and_explain_commands_report_static_metadata() {
+    let dir = temp_dir();
+    let file = write_file(&dir, "main.fx", "return 40 + 2;\n");
+    let bytecode = dir.join("main.fxb");
+
+    let compile = run([
+        "compile",
+        file.to_str().unwrap(),
+        bytecode.to_str().unwrap(),
+    ]);
+    assert_eq!(compile.status.code(), Some(0));
+
+    let inspect = run(["inspect", bytecode.to_str().unwrap()]);
+    assert_eq!(inspect.status.code(), Some(0));
+    assert!(stdout(&inspect).contains("bytecode_format_version: "));
+    assert!(stdout(&inspect).contains("optimization_level: "));
+    assert!(stderr(&inspect).is_empty());
+
+    let inspect_json = run(["--format", "json", "inspect", bytecode.to_str().unwrap()]);
+    assert_eq!(inspect_json.status.code(), Some(0));
+    assert!(stdout(&inspect_json).contains("\"bytecode_format_version\":"));
+    assert!(stderr(&inspect_json).is_empty());
+
+    let explain = run(["explain", file.to_str().unwrap()]);
+    assert_eq!(explain.status.code(), Some(0));
+    assert!(stdout(&explain).contains("features: "));
+    assert!(stdout(&explain).contains("optimizer: "));
+    assert!(stderr(&explain).is_empty());
+}
+
+#[test]
 fn runtime_serve_is_internal_only() {
     let output = run(["runtime", "serve"]);
 
