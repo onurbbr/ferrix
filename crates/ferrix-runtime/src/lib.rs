@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod event;
 pub mod mode;
 pub mod output;
+pub mod policy;
 pub mod process;
 pub mod profile;
 pub mod request;
@@ -20,9 +21,11 @@ pub use daemon::{
     default_config_path, default_ferrix_home, default_runtime_home, ensure_default_layout,
 };
 pub use event::{RuntimeEvent, RuntimeEventBus, RuntimeEventKind};
+pub use ferrix_vm::{HostCapability, HostCapabilityParseError};
 pub use mode::{
     RuntimeConnection, RuntimeController, RuntimeGateway, RuntimeMode, RuntimeModeParseError,
 };
+pub use policy::{PolicyFailure, PolicyRule, RuntimePolicy};
 pub use process::{
     RuntimeProcessId, RuntimeProcessKind, RuntimeProcessRecord, RuntimeProcessStatus,
     RuntimeProcessTable, RuntimeSessionId,
