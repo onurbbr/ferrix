@@ -114,6 +114,32 @@ fn mark_sweep_traces_nested_array_and_map_values() {
 }
 
 #[test]
+fn mark_sweep_traces_record_fields() {
+    let mut heap = Heap::new();
+    let leaf = heap
+        .allocate(Obj::String("leaf".to_string()), RuntimeLimits::default())
+        .unwrap();
+    let root = heap
+        .allocate(
+            Obj::Record(vec![("leaf".to_string(), Value::Obj(leaf))]),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let dropped = heap
+        .allocate(Obj::String("drop".to_string()), RuntimeLimits::default())
+        .unwrap();
+
+    let stats = heap.collect_garbage(&[root]);
+
+    assert_eq!(stats.marked, 2);
+    assert_eq!(stats.swept, 1);
+    assert_eq!(stats.live, 2);
+    assert!(heap.get(leaf).is_ok());
+    assert!(heap.get(root).is_ok());
+    assert!(heap.get(dropped).is_err());
+}
+
+#[test]
 fn swept_slots_are_reused_with_new_generation() {
     let mut heap = Heap::new();
     let old = heap
