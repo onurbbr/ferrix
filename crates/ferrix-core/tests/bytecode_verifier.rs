@@ -118,6 +118,54 @@ fn rejects_invalid_string() {
 }
 
 #[test]
+fn rejects_custom_extension_with_invalid_string_id() {
+    let mut chunk = Chunk::new("main", 2);
+    chunk.push_instruction(Instruction::CallExtension {
+        dst: Register(1),
+        extension: StringId(0),
+        args_start: Register(0),
+        arg_count: 1,
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(1) });
+
+    let err = StructuralVerifier::verify(chunk).unwrap_err();
+
+    assert_eq!(err.instruction_ip, Some(0));
+    assert_eq!(
+        err.kind,
+        VerificationErrorKind::InvalidString {
+            string: StringId(0),
+            string_count: 0,
+        }
+    );
+}
+
+#[test]
+fn rejects_custom_extension_arguments_out_of_range() {
+    let mut chunk = Chunk::new("main", 2);
+    let extension = chunk.add_string("math.double").unwrap();
+    chunk.push_instruction(Instruction::CallExtension {
+        dst: Register(0),
+        extension,
+        args_start: Register(1),
+        arg_count: 2,
+    });
+    chunk.push_instruction(Instruction::Return { src: Register(0) });
+
+    let err = StructuralVerifier::verify(chunk).unwrap_err();
+
+    assert_eq!(err.instruction_ip, Some(0));
+    assert_eq!(
+        err.kind,
+        VerificationErrorKind::CallArgumentsOutOfRange {
+            args_start: Register(1),
+            arg_count: 2,
+            register_count: 2,
+        }
+    );
+}
+
+#[test]
 fn rejects_arity_that_does_not_fit_register_file() {
     let chunk = Chunk::new("main", 1).with_arity(2);
 
