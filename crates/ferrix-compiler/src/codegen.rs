@@ -720,9 +720,9 @@ impl Codegen {
                 Ok(())
             }
             Expr::Call { callee, args, span } => self.compile_call_into(callee, args, dst, *span),
-            Expr::Function { params, body, span } => {
-                self.compile_function_literal_into(params, body, dst, *span)
-            }
+            Expr::Function {
+                params, body, span, ..
+            } => self.compile_function_literal_into(params, body, dst, *span),
             Expr::Grouping { expr, .. } => self.compile_expr_into(expr, dst),
         }
     }
@@ -1289,6 +1289,8 @@ fn link_named_modules(
                 Stmt::Function {
                     name,
                     params,
+                    param_types,
+                    return_type,
                     body,
                     exported,
                     span,
@@ -1302,6 +1304,8 @@ fn link_named_modules(
                     statements.push(Stmt::Function {
                         name: target,
                         params,
+                        param_types,
+                        return_type,
                         body: rewrite_module_statements(&function_targets, body),
                         exported: false,
                         span,
@@ -1309,12 +1313,14 @@ fn link_named_modules(
                 }
                 Stmt::Let {
                     name,
+                    type_annotation,
                     initializer,
                     exported,
                     span,
                 } if exports.values.contains(&name) || exported => {
                     statements.push(Stmt::Let {
                         name: format!("{}.{}", module.name, name),
+                        type_annotation,
                         initializer: rewrite_module_value_expr(
                             &function_targets,
                             &value_targets,
@@ -1389,11 +1395,13 @@ fn rewrite_module_stmt(function_targets: &HashMap<String, String>, stmt: Stmt) -
     match stmt {
         Stmt::Let {
             name,
+            type_annotation,
             initializer,
             exported,
             span,
         } => Stmt::Let {
             name,
+            type_annotation,
             initializer: rewrite_module_expr(function_targets, initializer),
             exported,
             span,
@@ -1401,12 +1409,16 @@ fn rewrite_module_stmt(function_targets: &HashMap<String, String>, stmt: Stmt) -
         Stmt::Function {
             name,
             params,
+            param_types,
+            return_type,
             body,
             exported,
             span,
         } => Stmt::Function {
             name,
             params,
+            param_types,
+            return_type,
             body: rewrite_module_statements(function_targets, body),
             exported,
             span,
@@ -1505,8 +1517,16 @@ fn rewrite_module_expr(function_targets: &HashMap<String, String>, expr: Expr) -
                 .collect(),
             span,
         },
-        Expr::Function { params, body, span } => Expr::Function {
+        Expr::Function {
             params,
+            param_types,
+            return_type,
+            body,
+            span,
+        } => Expr::Function {
+            params,
+            param_types,
+            return_type,
             body: rewrite_module_statements(function_targets, body),
             span,
         },
@@ -1594,8 +1614,16 @@ fn rewrite_module_value_expr(
                 .collect(),
             span,
         },
-        Expr::Function { params, body, span } => Expr::Function {
+        Expr::Function {
             params,
+            param_types,
+            return_type,
+            body,
+            span,
+        } => Expr::Function {
+            params,
+            param_types,
+            return_type,
             body: rewrite_module_statements(function_targets, body),
             span,
         },
