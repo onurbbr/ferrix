@@ -89,6 +89,8 @@ pub enum VmErrorKind {
     ArithmeticOverflow { operation: &'static str },
     /// Array access used an index outside the array bounds.
     IndexOutOfBounds { index: i64, len: usize },
+    /// Source program raised a value that no active catch handler recovered.
+    UncaughtThrow { value: Value },
     /// Instruction pointer itself moved outside the current chunk.
     InstructionPointerOutOfBounds { ip: usize, instruction_count: usize },
     /// Execution left a function without encountering `return`.
@@ -247,6 +249,9 @@ impl fmt::Display for VmError {
             }
             VmErrorKind::IndexOutOfBounds { index, len } => {
                 write!(f, "array index {index} is out of bounds for length {len}")
+            }
+            VmErrorKind::UncaughtThrow { value } => {
+                write!(f, "uncaught throw: {value:?}")
             }
             VmErrorKind::InstructionPointerOutOfBounds {
                 ip,
