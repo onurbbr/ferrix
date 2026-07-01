@@ -133,6 +133,7 @@ fn runtime_lifecycle_commands_are_silent_except_status() {
     ]);
     assert_eq!(status.status.code(), Some(0));
     assert!(stdout(&status).contains("runtime: serving"));
+    assert!(stdout(&status).contains("protocol: 1.0"));
     assert!(stderr(&status).is_empty());
 
     let duplicate_start = run([
@@ -163,6 +164,7 @@ fn runtime_lifecycle_commands_are_silent_except_status() {
     ]);
     assert_eq!(status.status.code(), Some(0));
     assert!(stdout(&status).contains("runtime: serving"));
+    assert!(stdout(&status).contains("protocol: 1.0"));
     assert!(stderr(&status).is_empty());
 
     let stop = run([
@@ -277,6 +279,8 @@ return 42;
         "1",
     ]);
     assert_eq!(info.status.code(), Some(0));
+    assert!(stdout(&info).contains("request: 1"));
+    assert!(stdout(&info).contains("correlation: 1"));
     assert!(stdout(&info).contains("kind: run"));
     assert!(stdout(&info).contains("output:\nhello\n42\n"));
     assert!(stderr(&info).is_empty());
