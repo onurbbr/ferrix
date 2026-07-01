@@ -308,6 +308,11 @@ impl StructuralVerifier {
                 args_start,
                 arg_count,
                 ..
+            }
+            | Instruction::CallExtension {
+                args_start,
+                arg_count,
+                ..
             } = instruction
                 && *arg_count > 0
             {
