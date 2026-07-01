@@ -12,7 +12,8 @@ fn help_prints_usage() {
     let output = run(["--help"]);
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout(&output).contains("ferrix run <file>"));
+    assert!(stdout(&output).contains("ferrix run <file|package>"));
+    assert!(stdout(&output).contains("ferrix check <file|package>"));
     assert!(stderr(&output).is_empty());
 }
 
@@ -270,6 +271,170 @@ fn run_file_reports_missing_static_imports() {
         file.display(),
         missing.display()
     )));
+}
+
+#[test]
+fn run_package_uses_manifest_entry_and_module_roots() {
+    let dir = temp_dir();
+    write_file(
+        &dir,
+        "Ferrix.toml",
+        "\
+name = \"demo\"
+entry = \"src/main.fx\"
+module_roots = [\"src\"]
+dependencies = [\"stdlib@0.1\"]
+",
+    );
+    write_file(
+        &dir,
+        "src/math.fx",
+        "\
+export fn answer() {
+    return 42;
+}
+",
+    );
+    write_file(
+        &dir,
+        "src/main.fx",
+        "\
+import math;
+return math.answer();
+",
+    );
+
+    let output = run(["run", dir.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "42\n");
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn run_package_resolves_nested_modules_from_manifest_roots() {
+    let dir = temp_dir();
+    write_file(
+        &dir,
+        "Ferrix.toml",
+        "\
+name = \"nested\"
+entry = \"src/main.fx\"
+module_roots = [\"modules\", \"src\"]
+",
+    );
+    write_file(
+        &dir,
+        "modules/util/math.fx",
+        "\
+export fn answer() {
+    return 42;
+}
+",
+    );
+    write_file(
+        &dir,
+        "src/main.fx",
+        "\
+import util.math;
+return answer();
+",
+    );
+
+    let output = run(["run", dir.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "42\n");
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn check_package_entrypoint_compiles_without_running() {
+    let dir = temp_dir();
+    write_file(
+        &dir,
+        "Ferrix.toml",
+        "\
+name = \"checkable\"
+entry = \"src/main.fx\"
+module_roots = [\"src\"]
+",
+    );
+    write_file(
+        &dir,
+        "src/main.fx",
+        "\
+print(42);
+return 99;
+",
+    );
+
+    let output = run(["check", dir.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn compile_package_entrypoint_writes_bytecode() {
+    let dir = temp_dir();
+    write_file(
+        &dir,
+        "Ferrix.toml",
+        "\
+name = \"compiled\"
+entry = \"src/main.fx\"
+module_roots = [\"src\"]
+",
+    );
+    write_file(&dir, "src/main.fx", "return 40 + 2;\n");
+    let bytecode = dir.join("main.fxb");
+
+    let compile = run(["compile", dir.to_str().unwrap(), bytecode.to_str().unwrap()]);
+    assert_eq!(compile.status.code(), Some(0));
+    assert!(stdout(&compile).is_empty());
+    assert!(stderr(&compile).is_empty());
+
+    let output = run(["run-bytecode", bytecode.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "42\n");
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn run_package_reports_missing_modules_with_search_roots() {
+    let dir = temp_dir();
+    write_file(
+        &dir,
+        "Ferrix.toml",
+        "\
+name = \"missing-demo\"
+entry = \"src/main.fx\"
+module_roots = [\"modules\"]
+",
+    );
+    let file = write_file(
+        &dir,
+        "src/main.fx",
+        "\
+import local;
+return 1;
+",
+    );
+    write_file(&dir, "src/local.fx", "export fn value() { return 42; }\n");
+    let searched = dir.join("modules/local.fx");
+
+    let output = run(["run", dir.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(66));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains(&format!(
+        "could not resolve package import `local` from `{}` in package `missing-demo`",
+        file.display()
+    )));
+    assert!(stderr(&output).contains(&format!("`{}`", searched.display())));
 }
 
 #[test]
@@ -556,6 +721,9 @@ fn temp_dir() -> PathBuf {
 
 fn write_file(dir: &Path, name: &str, source: &str) -> PathBuf {
     let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
     fs::write(&path, source).unwrap();
     path
 }
