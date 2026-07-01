@@ -68,7 +68,8 @@ pub fn compile_program_ast_with_modules(
     entry: ProgramAst,
     modules: Vec<ProgramAst>,
 ) -> Result<VerifiedProgram, CompileError> {
-    compile_program_ast_with_aliases(link_modules(entry, modules), Vec::new())
+    let (linked, aliases) = link_modules(entry, modules);
+    compile_program_ast_with_aliases(linked, aliases)
 }
 
 /// Compiles an entry AST with modules exposed through namespace aliases.
@@ -223,6 +224,7 @@ impl Codegen {
                 params,
                 body,
                 span,
+                ..
             } = stmt
             {
                 let function_id = *function_ids
@@ -976,40 +978,25 @@ impl Codegen {
     }
 }
 
-fn link_modules(entry: ProgramAst, modules: Vec<ProgramAst>) -> ProgramAst {
-    let mut statements = Vec::new();
-
-    for module in modules {
-        statements.extend(
-            module
-                .statements
-                .into_iter()
-                .filter(|stmt| matches!(stmt, Stmt::Function { .. })),
-        );
-    }
-
-    statements.extend(
-        entry
-            .statements
-            .into_iter()
-            .filter(|stmt| !matches!(stmt, Stmt::Import { .. })),
-    );
-
-    ProgramAst { statements }
-}
-
-fn link_named_modules(
+fn link_modules(
     entry: ProgramAst,
-    modules: Vec<ImportedModuleAst>,
+    modules: Vec<ProgramAst>,
 ) -> (ProgramAst, Vec<(String, String)>) {
     let mut statements = Vec::new();
     let mut aliases = Vec::new();
 
     for module in modules {
-        for stmt in module.ast.statements {
-            if let Stmt::Function { name, .. } = &stmt {
-                aliases.push((format!("{}.{}", module.name, name), name.clone()));
-                statements.push(stmt);
+        let exports = module_exports(&module);
+        for stmt in module.statements {
+            match stmt {
+                Stmt::Function { ref name, .. } if exports.functions.contains(name) => {
+                    aliases.push((name.clone(), name.clone()));
+                    statements.push(stmt);
+                }
+                Stmt::Let { ref name, .. } if exports.values.contains(name) => {
+                    statements.push(stmt);
+                }
+                _ => {}
             }
         }
     }
@@ -1022,6 +1009,357 @@ fn link_named_modules(
     );
 
     (ProgramAst { statements }, aliases)
+}
+
+fn link_named_modules(
+    entry: ProgramAst,
+    modules: Vec<ImportedModuleAst>,
+) -> (ProgramAst, Vec<(String, String)>) {
+    let mut statements = Vec::new();
+    let mut aliases = Vec::new();
+
+    for module in modules {
+        let exports = module_exports(&module.ast);
+        let function_targets = module
+            .ast
+            .statements
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Function { name, exported, .. } => {
+                    let exported = exports.functions.contains(name) || *exported;
+                    Some((
+                        name.clone(),
+                        module_function_name(&module.name, name, exported),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let value_targets = exports
+            .values
+            .iter()
+            .map(|name| (name.clone(), format!("{}.{}", module.name, name)))
+            .collect::<HashMap<_, _>>();
+
+        for stmt in module.ast.statements {
+            match stmt {
+                Stmt::Function {
+                    name,
+                    params,
+                    body,
+                    exported,
+                    span,
+                } => {
+                    let exported = exports.functions.contains(&name) || exported;
+                    let target = module_function_name(&module.name, &name, exported);
+                    if exported {
+                        aliases.push((format!("{}.{}", module.name, name), target.clone()));
+                        aliases.push((name.clone(), target.clone()));
+                    }
+                    statements.push(Stmt::Function {
+                        name: target,
+                        params,
+                        body: rewrite_module_statements(&function_targets, body),
+                        exported: false,
+                        span,
+                    });
+                }
+                Stmt::Let {
+                    name,
+                    initializer,
+                    exported,
+                    span,
+                } if exports.values.contains(&name) || exported => {
+                    statements.push(Stmt::Let {
+                        name: format!("{}.{}", module.name, name),
+                        initializer: rewrite_module_value_expr(
+                            &function_targets,
+                            &value_targets,
+                            initializer,
+                        ),
+                        exported: false,
+                        span,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    statements.extend(
+        entry
+            .statements
+            .into_iter()
+            .filter(|stmt| !matches!(stmt, Stmt::Import { .. })),
+    );
+
+    (ProgramAst { statements }, aliases)
+}
+
+struct ModuleExports {
+    functions: HashSet<String>,
+    values: HashSet<String>,
+}
+
+fn module_exports(module: &ProgramAst) -> ModuleExports {
+    let has_explicit_exports = module.statements.iter().any(|stmt| match stmt {
+        Stmt::Function { exported, .. } | Stmt::Let { exported, .. } => *exported,
+        _ => false,
+    });
+    let mut functions = HashSet::new();
+    let mut values = HashSet::new();
+
+    for stmt in &module.statements {
+        match stmt {
+            Stmt::Function { name, exported, .. } if *exported || !has_explicit_exports => {
+                functions.insert(name.clone());
+            }
+            Stmt::Let { name, exported, .. } if *exported => {
+                values.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    ModuleExports { functions, values }
+}
+
+fn module_function_name(module: &str, name: &str, exported: bool) -> String {
+    if exported {
+        format!("{module}.{name}")
+    } else {
+        format!("__module.{module}.{name}")
+    }
+}
+
+fn rewrite_module_statements(
+    function_targets: &HashMap<String, String>,
+    statements: Vec<Stmt>,
+) -> Vec<Stmt> {
+    statements
+        .into_iter()
+        .map(|stmt| rewrite_module_stmt(function_targets, stmt))
+        .collect()
+}
+
+fn rewrite_module_stmt(function_targets: &HashMap<String, String>, stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Let {
+            name,
+            initializer,
+            exported,
+            span,
+        } => Stmt::Let {
+            name,
+            initializer: rewrite_module_expr(function_targets, initializer),
+            exported,
+            span,
+        },
+        Stmt::Function {
+            name,
+            params,
+            body,
+            exported,
+            span,
+        } => Stmt::Function {
+            name,
+            params,
+            body: rewrite_module_statements(function_targets, body),
+            exported,
+            span,
+        },
+        Stmt::Assign { name, value, span } => Stmt::Assign {
+            name,
+            value: rewrite_module_expr(function_targets, value),
+            span,
+        },
+        Stmt::IndexAssign {
+            target,
+            index,
+            value,
+            span,
+        } => Stmt::IndexAssign {
+            target: rewrite_module_expr(function_targets, target),
+            index: rewrite_module_expr(function_targets, index),
+            value: rewrite_module_expr(function_targets, value),
+            span,
+        },
+        Stmt::Return { value, span } => Stmt::Return {
+            value: rewrite_module_expr(function_targets, value),
+            span,
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        } => Stmt::If {
+            condition: rewrite_module_expr(function_targets, condition),
+            then_branch: rewrite_module_statements(function_targets, then_branch),
+            else_branch: rewrite_module_statements(function_targets, else_branch),
+            span,
+        },
+        Stmt::While {
+            condition,
+            body,
+            span,
+        } => Stmt::While {
+            condition: rewrite_module_expr(function_targets, condition),
+            body: rewrite_module_statements(function_targets, body),
+            span,
+        },
+        Stmt::Block { statements, span } => Stmt::Block {
+            statements: rewrite_module_statements(function_targets, statements),
+            span,
+        },
+        Stmt::Expr { value, span } => Stmt::Expr {
+            value: rewrite_module_expr(function_targets, value),
+            span,
+        },
+        Stmt::Import { .. } => stmt,
+    }
+}
+
+fn rewrite_module_expr(function_targets: &HashMap<String, String>, expr: Expr) -> Expr {
+    match expr {
+        Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+            op,
+            lhs: Box::new(rewrite_module_expr(function_targets, *lhs)),
+            rhs: Box::new(rewrite_module_expr(function_targets, *rhs)),
+            span,
+        },
+        Expr::Call { callee, args, span } => Expr::Call {
+            callee: function_targets.get(&callee).cloned().unwrap_or(callee),
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_module_expr(function_targets, arg))
+                .collect(),
+            span,
+        },
+        Expr::Function { params, body, span } => Expr::Function {
+            params,
+            body: rewrite_module_statements(function_targets, body),
+            span,
+        },
+        Expr::Index {
+            target,
+            index,
+            span,
+        } => Expr::Index {
+            target: Box::new(rewrite_module_expr(function_targets, *target)),
+            index: Box::new(rewrite_module_expr(function_targets, *index)),
+            span,
+        },
+        Expr::Array { elements, span } => Expr::Array {
+            elements: elements
+                .into_iter()
+                .map(|element| rewrite_module_expr(function_targets, element))
+                .collect(),
+            span,
+        },
+        Expr::Map { entries, span } => Expr::Map {
+            entries: entries
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        rewrite_module_expr(function_targets, key),
+                        rewrite_module_expr(function_targets, value),
+                    )
+                })
+                .collect(),
+            span,
+        },
+        Expr::Grouping { expr, span } => Expr::Grouping {
+            expr: Box::new(rewrite_module_expr(function_targets, *expr)),
+            span,
+        },
+        Expr::Literal { .. } | Expr::Variable { .. } => expr,
+    }
+}
+
+fn rewrite_module_value_expr(
+    function_targets: &HashMap<String, String>,
+    value_targets: &HashMap<String, String>,
+    expr: Expr,
+) -> Expr {
+    match expr {
+        Expr::Variable { name, span } => Expr::Variable {
+            name: value_targets.get(&name).cloned().unwrap_or(name),
+            span,
+        },
+        Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+            op,
+            lhs: Box::new(rewrite_module_value_expr(
+                function_targets,
+                value_targets,
+                *lhs,
+            )),
+            rhs: Box::new(rewrite_module_value_expr(
+                function_targets,
+                value_targets,
+                *rhs,
+            )),
+            span,
+        },
+        Expr::Call { callee, args, span } => Expr::Call {
+            callee: function_targets.get(&callee).cloned().unwrap_or(callee),
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_module_value_expr(function_targets, value_targets, arg))
+                .collect(),
+            span,
+        },
+        Expr::Function { params, body, span } => Expr::Function {
+            params,
+            body: rewrite_module_statements(function_targets, body),
+            span,
+        },
+        Expr::Index {
+            target,
+            index,
+            span,
+        } => Expr::Index {
+            target: Box::new(rewrite_module_value_expr(
+                function_targets,
+                value_targets,
+                *target,
+            )),
+            index: Box::new(rewrite_module_value_expr(
+                function_targets,
+                value_targets,
+                *index,
+            )),
+            span,
+        },
+        Expr::Array { elements, span } => Expr::Array {
+            elements: elements
+                .into_iter()
+                .map(|element| rewrite_module_value_expr(function_targets, value_targets, element))
+                .collect(),
+            span,
+        },
+        Expr::Map { entries, span } => Expr::Map {
+            entries: entries
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        rewrite_module_value_expr(function_targets, value_targets, key),
+                        rewrite_module_value_expr(function_targets, value_targets, value),
+                    )
+                })
+                .collect(),
+            span,
+        },
+        Expr::Grouping { expr, span } => Expr::Grouping {
+            expr: Box::new(rewrite_module_value_expr(
+                function_targets,
+                value_targets,
+                *expr,
+            )),
+            span,
+        },
+        Expr::Literal { .. } => expr,
+    }
 }
 
 fn map_chunk_error(error: ChunkBuildError) -> CompileError {
