@@ -196,6 +196,10 @@ impl Encoder {
             Instruction::Sub { dst, lhs, rhs } => self.three_reg(4, *dst, *lhs, *rhs),
             Instruction::Mul { dst, lhs, rhs } => self.three_reg(5, *dst, *lhs, *rhs),
             Instruction::Div { dst, lhs, rhs } => self.three_reg(6, *dst, *lhs, *rhs),
+            Instruction::AddInt { dst, lhs, rhs } => self.three_reg(39, *dst, *lhs, *rhs),
+            Instruction::SubInt { dst, lhs, rhs } => self.three_reg(40, *dst, *lhs, *rhs),
+            Instruction::MulInt { dst, lhs, rhs } => self.three_reg(41, *dst, *lhs, *rhs),
+            Instruction::DivInt { dst, lhs, rhs } => self.three_reg(42, *dst, *lhs, *rhs),
             Instruction::Jump { target } => {
                 self.u8(7);
                 self.u32(target.0);
@@ -216,6 +220,12 @@ impl Encoder {
             Instruction::LessEqual { dst, lhs, rhs } => self.three_reg(13, *dst, *lhs, *rhs),
             Instruction::Greater { dst, lhs, rhs } => self.three_reg(14, *dst, *lhs, *rhs),
             Instruction::GreaterEqual { dst, lhs, rhs } => self.three_reg(15, *dst, *lhs, *rhs),
+            Instruction::LessInt { dst, lhs, rhs } => self.three_reg(43, *dst, *lhs, *rhs),
+            Instruction::LessEqualInt { dst, lhs, rhs } => self.three_reg(44, *dst, *lhs, *rhs),
+            Instruction::GreaterInt { dst, lhs, rhs } => self.three_reg(45, *dst, *lhs, *rhs),
+            Instruction::GreaterEqualInt { dst, lhs, rhs } => {
+                self.three_reg(46, *dst, *lhs, *rhs);
+            }
             Instruction::Not { dst, src } => {
                 self.u8(16);
                 self.reg(*dst);
@@ -558,6 +568,10 @@ impl Decoder<'_> {
             4 => self.three_reg(|dst, lhs, rhs| Instruction::Sub { dst, lhs, rhs })?,
             5 => self.three_reg(|dst, lhs, rhs| Instruction::Mul { dst, lhs, rhs })?,
             6 => self.three_reg(|dst, lhs, rhs| Instruction::Div { dst, lhs, rhs })?,
+            39 => self.three_reg(|dst, lhs, rhs| Instruction::AddInt { dst, lhs, rhs })?,
+            40 => self.three_reg(|dst, lhs, rhs| Instruction::SubInt { dst, lhs, rhs })?,
+            41 => self.three_reg(|dst, lhs, rhs| Instruction::MulInt { dst, lhs, rhs })?,
+            42 => self.three_reg(|dst, lhs, rhs| Instruction::DivInt { dst, lhs, rhs })?,
             7 => Instruction::Jump {
                 target: JumpTarget(self.u32()?),
             },
@@ -575,6 +589,10 @@ impl Decoder<'_> {
             13 => self.three_reg(|dst, lhs, rhs| Instruction::LessEqual { dst, lhs, rhs })?,
             14 => self.three_reg(|dst, lhs, rhs| Instruction::Greater { dst, lhs, rhs })?,
             15 => self.three_reg(|dst, lhs, rhs| Instruction::GreaterEqual { dst, lhs, rhs })?,
+            43 => self.three_reg(|dst, lhs, rhs| Instruction::LessInt { dst, lhs, rhs })?,
+            44 => self.three_reg(|dst, lhs, rhs| Instruction::LessEqualInt { dst, lhs, rhs })?,
+            45 => self.three_reg(|dst, lhs, rhs| Instruction::GreaterInt { dst, lhs, rhs })?,
+            46 => self.three_reg(|dst, lhs, rhs| Instruction::GreaterEqualInt { dst, lhs, rhs })?,
             16 => Instruction::Not {
                 dst: self.reg()?,
                 src: self.reg()?,
