@@ -8,4 +8,5 @@ license.workspace = true
 ferrix-core.workspace = true
 ferrix-vm.workspace = true
 ferrix-compiler.workspace = true
+ferrix-runtime.workspace = true
 ferrix-stdlib.workspace = true
