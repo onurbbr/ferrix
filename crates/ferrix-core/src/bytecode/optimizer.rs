@@ -14,11 +14,64 @@ use crate::{
 /// Optimizes a single bytecode chunk while preserving verifier invariants.
 pub fn optimize_chunk(mut chunk: Chunk) -> Chunk {
     fold_constant_instructions(&mut chunk);
+    specialize_integer_instructions(&mut chunk);
     collapse_jump_chains(&mut chunk);
     remove_redundant_moves(&mut chunk);
     remove_unreachable_instructions(&mut chunk);
     collapse_jump_chains(&mut chunk);
     chunk
+}
+
+fn specialize_integer_instructions(chunk: &mut Chunk) {
+    for instruction in &mut chunk.instructions {
+        let replacement = match instruction {
+            Instruction::Add { dst, lhs, rhs } => Some(Instruction::AddInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            Instruction::Sub { dst, lhs, rhs } => Some(Instruction::SubInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            Instruction::Mul { dst, lhs, rhs } => Some(Instruction::MulInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            Instruction::Div { dst, lhs, rhs } => Some(Instruction::DivInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            Instruction::Less { dst, lhs, rhs } => Some(Instruction::LessInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            Instruction::LessEqual { dst, lhs, rhs } => Some(Instruction::LessEqualInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            Instruction::Greater { dst, lhs, rhs } => Some(Instruction::GreaterInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            Instruction::GreaterEqual { dst, lhs, rhs } => Some(Instruction::GreaterEqualInt {
+                dst: *dst,
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            _ => None,
+        };
+
+        if let Some(replacement) = replacement {
+            *instruction = replacement;
+        }
+    }
 }
 
 fn fold_constant_instructions(chunk: &mut Chunk) {
@@ -45,15 +98,23 @@ fn fold_constant_instructions(chunk: &mut Chunk) {
                 None
             }
             Instruction::Add { dst, lhs, rhs }
+            | Instruction::AddInt { dst, lhs, rhs }
             | Instruction::Sub { dst, lhs, rhs }
+            | Instruction::SubInt { dst, lhs, rhs }
             | Instruction::Mul { dst, lhs, rhs }
+            | Instruction::MulInt { dst, lhs, rhs }
             | Instruction::Div { dst, lhs, rhs }
+            | Instruction::DivInt { dst, lhs, rhs }
             | Instruction::Equal { dst, lhs, rhs }
             | Instruction::NotEqual { dst, lhs, rhs }
             | Instruction::Less { dst, lhs, rhs }
+            | Instruction::LessInt { dst, lhs, rhs }
             | Instruction::LessEqual { dst, lhs, rhs }
+            | Instruction::LessEqualInt { dst, lhs, rhs }
             | Instruction::Greater { dst, lhs, rhs }
-            | Instruction::GreaterEqual { dst, lhs, rhs } => {
+            | Instruction::GreaterInt { dst, lhs, rhs }
+            | Instruction::GreaterEqual { dst, lhs, rhs }
+            | Instruction::GreaterEqualInt { dst, lhs, rhs } => {
                 let lhs_value = get_register_constant(&constants_by_register, *lhs);
                 let rhs_value = get_register_constant(&constants_by_register, *rhs);
                 let folded = fold_binary(&chunk.instructions[ip], lhs_value, rhs_value);
@@ -94,19 +155,29 @@ fn fold_constant_instructions(chunk: &mut Chunk) {
 
 fn fold_binary(instruction: &Instruction, lhs: Option<Value>, rhs: Option<Value>) -> Option<Value> {
     match (instruction, lhs?, rhs?) {
-        (Instruction::Add { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            lhs.checked_add(rhs).map(Value::Int)
+        (
+            Instruction::Add { .. } | Instruction::AddInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => lhs.checked_add(rhs).map(Value::Int),
+        (
+            Instruction::Sub { .. } | Instruction::SubInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => lhs.checked_sub(rhs).map(Value::Int),
+        (
+            Instruction::Mul { .. } | Instruction::MulInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => lhs.checked_mul(rhs).map(Value::Int),
+        (Instruction::Div { .. } | Instruction::DivInt { .. }, Value::Int(_), Value::Int(0)) => {
+            None
         }
-        (Instruction::Sub { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            lhs.checked_sub(rhs).map(Value::Int)
-        }
-        (Instruction::Mul { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            lhs.checked_mul(rhs).map(Value::Int)
-        }
-        (Instruction::Div { .. }, Value::Int(_), Value::Int(0)) => None,
-        (Instruction::Div { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            lhs.checked_div(rhs).map(Value::Int)
-        }
+        (
+            Instruction::Div { .. } | Instruction::DivInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => lhs.checked_div(rhs).map(Value::Int),
         (Instruction::Equal { .. }, lhs, rhs)
             if is_foldable_value(lhs) && is_foldable_value(rhs) =>
         {
@@ -117,18 +188,26 @@ fn fold_binary(instruction: &Instruction, lhs: Option<Value>, rhs: Option<Value>
         {
             Some(Value::Bool(lhs != rhs))
         }
-        (Instruction::Less { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            Some(Value::Bool(lhs < rhs))
-        }
-        (Instruction::LessEqual { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            Some(Value::Bool(lhs <= rhs))
-        }
-        (Instruction::Greater { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            Some(Value::Bool(lhs > rhs))
-        }
-        (Instruction::GreaterEqual { .. }, Value::Int(lhs), Value::Int(rhs)) => {
-            Some(Value::Bool(lhs >= rhs))
-        }
+        (
+            Instruction::Less { .. } | Instruction::LessInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => Some(Value::Bool(lhs < rhs)),
+        (
+            Instruction::LessEqual { .. } | Instruction::LessEqualInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => Some(Value::Bool(lhs <= rhs)),
+        (
+            Instruction::Greater { .. } | Instruction::GreaterInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => Some(Value::Bool(lhs > rhs)),
+        (
+            Instruction::GreaterEqual { .. } | Instruction::GreaterEqualInt { .. },
+            Value::Int(lhs),
+            Value::Int(rhs),
+        ) => Some(Value::Bool(lhs >= rhs)),
         _ => None,
     }
 }
@@ -195,15 +274,23 @@ fn written_registers(instruction: &Instruction) -> Vec<Register> {
         | Instruction::LoadString { dst, .. }
         | Instruction::Move { dst, .. }
         | Instruction::Add { dst, .. }
+        | Instruction::AddInt { dst, .. }
         | Instruction::Sub { dst, .. }
+        | Instruction::SubInt { dst, .. }
         | Instruction::Mul { dst, .. }
+        | Instruction::MulInt { dst, .. }
         | Instruction::Div { dst, .. }
+        | Instruction::DivInt { dst, .. }
         | Instruction::Equal { dst, .. }
         | Instruction::NotEqual { dst, .. }
         | Instruction::Less { dst, .. }
+        | Instruction::LessInt { dst, .. }
         | Instruction::LessEqual { dst, .. }
+        | Instruction::LessEqualInt { dst, .. }
         | Instruction::Greater { dst, .. }
+        | Instruction::GreaterInt { dst, .. }
         | Instruction::GreaterEqual { dst, .. }
+        | Instruction::GreaterEqualInt { dst, .. }
         | Instruction::Not { dst, .. }
         | Instruction::CallFunction { dst, .. }
         | Instruction::MakeUpvalue { dst, .. }
