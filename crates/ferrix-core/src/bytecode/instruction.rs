@@ -188,6 +188,12 @@ pub enum Instruction {
         args_start: Register,
         arg_count: u8,
     },
+    CallExtension {
+        dst: Register,
+        extension: StringId,
+        args_start: Register,
+        arg_count: u8,
+    },
     ArrayNew {
         dst: Register,
         elements_start: Register,
@@ -297,6 +303,9 @@ impl Instruction {
                 args_start,
                 ..
             } => vec![*dst, *callee, *args_start],
+            Self::CallExtension {
+                dst, args_start, ..
+            } => vec![*dst, *args_start],
             Self::ArrayNew {
                 dst,
                 elements_start,
@@ -343,6 +352,7 @@ impl Instruction {
     pub fn string_operands(&self) -> Vec<StringId> {
         match self {
             Self::LoadString { string, .. } => vec![*string],
+            Self::CallExtension { extension, .. } => vec![*extension],
             Self::RecordNew { fields, .. } => fields.clone(),
             Self::FieldGet { field, .. } | Self::FieldSet { field, .. } => vec![*field],
             _ => Vec::new(),
