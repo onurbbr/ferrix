@@ -369,10 +369,22 @@ impl Codegen {
                     .push_instruction_with_span(Instruction::Return { src }, Some(*span));
                 Ok(())
             }
+            Stmt::Throw { value, span } => {
+                let src = self.compile_expr(value)?;
+                self.chunk
+                    .push_instruction_with_span(Instruction::Throw { src }, Some(*span));
+                Ok(())
+            }
             Stmt::Expr { value, .. } => {
                 self.compile_expr(value)?;
                 Ok(())
             }
+            Stmt::TryCatch {
+                try_branch,
+                catch_name,
+                catch_branch,
+                span,
+            } => self.compile_try_catch(try_branch, catch_name, catch_branch, *span),
             Stmt::If {
                 condition,
                 then_branch,
@@ -452,6 +464,31 @@ impl Codegen {
             },
             Some(span),
         );
+        self.patch_jump(jump_to_end, self.current_instruction_index()?)?;
+        Ok(())
+    }
+
+    fn compile_try_catch(
+        &mut self,
+        try_branch: &[Stmt],
+        catch_name: &str,
+        catch_branch: &[Stmt],
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<(), CompileError> {
+        let error = self.alloc_register()?;
+        let handler = self.emit_push_handler(error, span)?;
+        self.compile_scoped_block(try_branch)?;
+        self.chunk
+            .push_instruction_with_span(Instruction::PopHandler, Some(span));
+        let jump_to_end = self.emit_jump(span)?;
+
+        self.patch_handler(handler, self.current_instruction_index()?)?;
+        self.push_scope();
+        self.declare_local(catch_name.to_string(), error);
+        let result = self.compile_block(catch_branch);
+        self.pop_scope();
+        result?;
+
         self.patch_jump(jump_to_end, self.current_instruction_index()?)?;
         Ok(())
     }
@@ -938,6 +975,22 @@ impl Codegen {
         Ok(index)
     }
 
+    fn emit_push_handler(
+        &mut self,
+        error: Register,
+        span: ferrix_core::diagnostics::SourceSpan,
+    ) -> Result<usize, CompileError> {
+        let index = self.chunk.instructions.len();
+        self.chunk.push_instruction_with_span(
+            Instruction::PushHandler {
+                error,
+                target: JumpTarget(u32::MAX),
+            },
+            Some(span),
+        );
+        Ok(index)
+    }
+
     fn patch_jump(&mut self, instruction_index: usize, target: u32) -> Result<(), CompileError> {
         let instruction = self
             .chunk
@@ -954,6 +1007,24 @@ impl Codegen {
                 ..
             } => *jump_target = JumpTarget(target),
             _ => unreachable!("only jump instructions are patched"),
+        }
+
+        Ok(())
+    }
+
+    fn patch_handler(&mut self, instruction_index: usize, target: u32) -> Result<(), CompileError> {
+        let instruction = self
+            .chunk
+            .instructions
+            .get_mut(instruction_index)
+            .expect("compiler emits handler before patching it");
+
+        match instruction {
+            Instruction::PushHandler {
+                target: jump_target,
+                ..
+            } => *jump_target = JumpTarget(target),
+            _ => unreachable!("only handler instructions are patched"),
         }
 
         Ok(())
@@ -1186,6 +1257,21 @@ fn rewrite_module_stmt(function_targets: &HashMap<String, String>, stmt: Stmt) -
         },
         Stmt::Return { value, span } => Stmt::Return {
             value: rewrite_module_expr(function_targets, value),
+            span,
+        },
+        Stmt::Throw { value, span } => Stmt::Throw {
+            value: rewrite_module_expr(function_targets, value),
+            span,
+        },
+        Stmt::TryCatch {
+            try_branch,
+            catch_name,
+            catch_branch,
+            span,
+        } => Stmt::TryCatch {
+            try_branch: rewrite_module_statements(function_targets, try_branch),
+            catch_name,
+            catch_branch: rewrite_module_statements(function_targets, catch_branch),
             span,
         },
         Stmt::If {
@@ -1475,7 +1561,21 @@ fn stmt_references_call(stmt: &Stmt, name: &str) -> bool {
                 || expr_references_call(index, name)
                 || expr_references_call(value, name)
         }
-        Stmt::Return { value, .. } | Stmt::Expr { value, .. } => expr_references_call(value, name),
+        Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
+            expr_references_call(value, name)
+        }
+        Stmt::TryCatch {
+            try_branch,
+            catch_branch,
+            ..
+        } => {
+            try_branch
+                .iter()
+                .any(|stmt| stmt_references_call(stmt, name))
+                || catch_branch
+                    .iter()
+                    .any(|stmt| stmt_references_call(stmt, name))
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -1632,8 +1732,20 @@ fn collect_stmt_captured_locals(
                 collect_expr_captured_locals(index, scopes, functions, captured);
                 collect_expr_captured_locals(value, scopes, functions, captured);
             }
-            Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
+            Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
                 collect_expr_captured_locals(value, scopes, functions, captured);
+            }
+            Stmt::TryCatch {
+                try_branch,
+                catch_name,
+                catch_branch,
+                ..
+            } => {
+                collect_scoped_captures(try_branch, scopes, functions, captured);
+                scopes.push_scope();
+                scopes.declare(catch_name.clone());
+                collect_stmt_captured_locals(catch_branch, scopes, functions, captured);
+                scopes.pop_scope();
             }
             Stmt::If {
                 condition,
@@ -1743,8 +1855,20 @@ fn collect_stmt_free_variables(
                 collect_expr_free_variables(index, scopes, functions, seen, free);
                 collect_expr_free_variables(value, scopes, functions, seen, free);
             }
-            Stmt::Return { value, .. } | Stmt::Expr { value, .. } => {
+            Stmt::Return { value, .. } | Stmt::Throw { value, .. } | Stmt::Expr { value, .. } => {
                 collect_expr_free_variables(value, scopes, functions, seen, free);
+            }
+            Stmt::TryCatch {
+                try_branch,
+                catch_name,
+                catch_branch,
+                ..
+            } => {
+                collect_scoped_free_variables(try_branch, scopes, functions, seen, free);
+                scopes.push_scope();
+                scopes.declare(catch_name.clone());
+                collect_stmt_free_variables(catch_branch, scopes, functions, seen, free);
+                scopes.pop_scope();
             }
             Stmt::If {
                 condition,
@@ -1845,8 +1969,13 @@ fn statements_definitely_return(statements: &[Stmt]) -> bool {
 
 fn stmt_definitely_returns(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Return { .. } => true,
+        Stmt::Return { .. } | Stmt::Throw { .. } => true,
         Stmt::Block { statements, .. } => statements_definitely_return(statements),
+        Stmt::TryCatch {
+            try_branch,
+            catch_branch,
+            ..
+        } => statements_definitely_return(try_branch) && statements_definitely_return(catch_branch),
         Stmt::If {
             then_branch,
             else_branch,
