@@ -207,6 +207,7 @@ fn run_cli(
 struct CliConfig {
     runtime_mode: RuntimeMode,
     runtime_home: PathBuf,
+    runtime_config: ferrix_runtime::RuntimeConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -222,9 +223,11 @@ struct CompileDisplayOptions {
 
 impl Default for CliConfig {
     fn default() -> Self {
+        let runtime_config = ferrix_runtime::RuntimeConfig::default();
         Self {
-            runtime_mode: RuntimeMode::Embedded,
-            runtime_home: ferrix_runtime::default_runtime_home(),
+            runtime_mode: runtime_config.mode,
+            runtime_home: runtime_config.resolved_home(&ferrix_runtime::default_ferrix_home()),
+            runtime_config,
         }
     }
 }
@@ -238,7 +241,19 @@ fn parse_runtime_options(
         return Err(error.exit_code);
     }
 
-    let mut config = CliConfig::default();
+    let runtime_config =
+        match ferrix_runtime::RuntimeConfig::load(&ferrix_runtime::default_config_path()) {
+            Ok(config) => config,
+            Err(error) => {
+                write!(stderr, "{}", error.render()).expect("stderr write failed");
+                return Err(error.exit_code);
+            }
+        };
+    let mut config = CliConfig {
+        runtime_mode: runtime_config.mode,
+        runtime_home: runtime_config.resolved_home(&ferrix_runtime::default_ferrix_home()),
+        runtime_config,
+    };
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -257,6 +272,7 @@ fn parse_runtime_options(
                         return Err(64);
                     }
                 };
+                config.runtime_config.mode = config.runtime_mode;
                 index += 2;
             }
             "--runtime-home" => {
@@ -266,6 +282,7 @@ fn parse_runtime_options(
                     return Err(64);
                 };
                 config.runtime_home = PathBuf::from(value);
+                config.runtime_config.home = config.runtime_home.clone();
                 index += 2;
             }
             _ => {
@@ -385,11 +402,24 @@ fn consume_runtime_launch_config() -> Option<CliConfig> {
 
     let mut parent_pid = None;
     let mut runtime_home = None;
+    let mut runtime_config = ferrix_runtime::RuntimeConfig::default();
     for line in source.lines() {
         if let Some(value) = line.strip_prefix("parent_pid=") {
             parent_pid = value.parse::<u32>().ok();
         } else if let Some(value) = line.strip_prefix("runtime_home=") {
             runtime_home = Some(PathBuf::from(value));
+        } else if let Some(value) = line.strip_prefix("request_timeout_ms=") {
+            if let Ok(value) = value.parse() {
+                runtime_config.request_timeout_ms = value;
+            }
+        } else if let Some(value) = line.strip_prefix("max_concurrent_processes=") {
+            if let Ok(value) = value.parse() {
+                runtime_config.max_concurrent_runtime_processes = value;
+            }
+        } else if let Some(value) = line.strip_prefix("rate_limit_per_second=")
+            && let Ok(value) = value.parse()
+        {
+            runtime_config.rate_limit_per_second = value;
         }
     }
 
@@ -397,9 +427,12 @@ fn consume_runtime_launch_config() -> Option<CliConfig> {
         return None;
     }
 
+    let runtime_home = runtime_home?;
+    runtime_config.home = runtime_home.clone();
     Some(CliConfig {
         runtime_mode: RuntimeMode::Required,
-        runtime_home: runtime_home?,
+        runtime_home,
+        runtime_config,
     })
 }
 
@@ -487,6 +520,24 @@ fn write_runtime_launch_config(
     writeln!(file, "parent_pid={parent_pid}").map_err(runtime_state_error)?;
     writeln!(file, "runtime_home={}", config.runtime_home.display())
         .map_err(runtime_state_error)?;
+    writeln!(
+        file,
+        "request_timeout_ms={}",
+        config.runtime_config.request_timeout_ms
+    )
+    .map_err(runtime_state_error)?;
+    writeln!(
+        file,
+        "max_concurrent_processes={}",
+        config.runtime_config.max_concurrent_runtime_processes
+    )
+    .map_err(runtime_state_error)?;
+    writeln!(
+        file,
+        "rate_limit_per_second={}",
+        config.runtime_config.rate_limit_per_second
+    )
+    .map_err(runtime_state_error)?;
     Ok(path)
 }
 
@@ -569,7 +620,7 @@ fn stop_runtime_process(
 }
 
 fn runtime_daemon(config: &CliConfig) -> RuntimeDaemon {
-    RuntimeDaemon::with_home(config.runtime_home.clone())
+    RuntimeDaemon::with_home_and_config(config.runtime_home.clone(), config.runtime_config.clone())
 }
 
 fn wait_for_runtime(
@@ -593,6 +644,7 @@ fn wait_for_runtime(
 fn write_status(stdout: &mut impl io::Write, status: &ferrix_runtime::RuntimeStatusReport) {
     writeln!(stdout, "runtime: {}", status.health.as_str()).expect("stdout write failed");
     writeln!(stdout, "version: {}", status.version).expect("stdout write failed");
+    writeln!(stdout, "protocol: {}", status.protocol_version).expect("stdout write failed");
     if let Some(uptime_ms) = status.uptime_ms {
         writeln!(stdout, "uptime_ms: {uptime_ms}").expect("stdout write failed");
     }
@@ -696,6 +748,8 @@ fn show_process_info(
 
 fn write_process_info(stdout: &mut impl io::Write, process: &RuntimeProcessRecord) {
     writeln!(stdout, "pid: {}", process.id).expect("stdout write failed");
+    writeln!(stdout, "request: {}", process.request_id).expect("stdout write failed");
+    writeln!(stdout, "correlation: {}", process.correlation_id).expect("stdout write failed");
     writeln!(stdout, "session: {}", process.session_id).expect("stdout write failed");
     writeln!(stdout, "status: {}", process.status.as_str()).expect("stdout write failed");
     writeln!(stdout, "kind: {}", process.kind.as_str()).expect("stdout write failed");
