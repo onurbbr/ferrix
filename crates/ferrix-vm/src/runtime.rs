@@ -35,6 +35,7 @@ pub struct Vm {
     gc_stats: VmGcStats,
     output: Box<dyn OutputWriter>,
     native_functions: HashMap<FunctionId, Rc<NativeFunction>>,
+    field_cache: HashMap<FieldCacheKey, usize>,
 }
 
 type NativeFunction =
@@ -60,6 +61,12 @@ struct ExceptionHandler {
     frame_depth: usize,
     error_register: Register,
     target_ip: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FieldCacheKey {
+    object: ObjRef,
+    field: String,
 }
 
 /// Cumulative GC and allocation counters for one VM instance.
@@ -102,6 +109,7 @@ impl Vm {
             gc_stats: VmGcStats::default(),
             output: Box::new(NullOutput),
             native_functions: HashMap::new(),
+            field_cache: HashMap::new(),
         }
     }
 
@@ -557,6 +565,7 @@ impl Vm {
         self.registers = vec![Value::Nil; usize::from(chunk.register_count)];
         self.frames.clear();
         self.exception_handlers.clear();
+        self.field_cache.clear();
     }
 
     fn run_program_inner(
@@ -568,6 +577,7 @@ impl Vm {
         self.frames.clear();
         self.exception_handlers.clear();
         self.registers.clear();
+        self.field_cache.clear();
         self.instruction_ip = 0;
         self.executed_instruction_count = 0;
         self.push_frame(program, program.entry, None, &[], &[], None)?;
@@ -1571,7 +1581,7 @@ impl Vm {
     }
 
     fn field_get(
-        &self,
+        &mut self,
         ip: usize,
         target_register: Register,
         field: StringId,
@@ -1579,19 +1589,39 @@ impl Vm {
     ) -> Result<Value, VmError> {
         let target = self.read_record_ref(ip, target_register)?;
         let field = self.read_field_name(ip, field, chunk)?;
-        let Obj::Record(fields) = self.heap.get(target)? else {
-            let found = self.read_register(ip, target_register)?;
-            return Err(VmError::new(
-                Some(ip),
-                VmErrorKind::TypeError {
-                    expected: "record",
-                    found,
-                },
-            ));
+        let key = FieldCacheKey {
+            object: target,
+            field: field.clone(),
         };
-        Ok(record_field_index(fields, &field)
-            .map(|index| fields[index].1)
-            .unwrap_or(Value::Nil))
+        let cached_index = self.field_cache.get(&key).copied();
+        let lookup = {
+            let Obj::Record(fields) = self.heap.get(target)? else {
+                let found = self.read_register(ip, target_register)?;
+                return Err(VmError::new(
+                    Some(ip),
+                    VmErrorKind::TypeError {
+                        expected: "record",
+                        found,
+                    },
+                ));
+            };
+
+            if let Some(index) = cached_index
+                && fields
+                    .get(index)
+                    .is_some_and(|(existing_field, _)| existing_field == &field)
+            {
+                return Ok(fields[index].1);
+            }
+
+            record_field_index(fields, &field).map(|index| (index, fields[index].1))
+        };
+
+        let Some((index, value)) = lookup else {
+            return Ok(Value::Nil);
+        };
+        self.field_cache.insert(key, index);
+        Ok(value)
     }
 
     fn field_set(
@@ -1606,22 +1636,39 @@ impl Vm {
         let field = self.read_field_name(ip, field, chunk)?;
         let value = self.read_register(ip, value_register)?;
         let found = self.read_register(ip, target_register)?;
-
-        let Obj::Record(fields) = self.heap.get_mut(target)? else {
-            return Err(VmError::new(
-                Some(ip),
-                VmErrorKind::TypeError {
-                    expected: "record",
-                    found,
-                },
-            ));
+        let key = FieldCacheKey {
+            object: target,
+            field: field.clone(),
         };
+        let cached_index = self.field_cache.get(&key).copied();
 
-        if let Some(index) = record_field_index(fields, &field) {
-            fields[index].1 = value;
-        } else {
-            fields.push((field, value));
-        }
+        let index = {
+            let Obj::Record(fields) = self.heap.get_mut(target)? else {
+                return Err(VmError::new(
+                    Some(ip),
+                    VmErrorKind::TypeError {
+                        expected: "record",
+                        found,
+                    },
+                ));
+            };
+
+            if let Some(index) = cached_index
+                && fields
+                    .get(index)
+                    .is_some_and(|(existing_field, _)| existing_field == &field)
+            {
+                fields[index].1 = value;
+                index
+            } else if let Some(index) = record_field_index(fields, &field) {
+                fields[index].1 = value;
+                index
+            } else {
+                fields.push((field, value));
+                fields.len() - 1
+            }
+        };
+        self.field_cache.insert(key, index);
         Ok(())
     }
 
@@ -1761,6 +1808,7 @@ impl Vm {
     fn collect_garbage_with_extra_roots(&mut self, extra_roots: &[ObjRef]) -> GcStats {
         let roots = self.allocation_roots(extra_roots);
         let stats = self.heap.collect_garbage(&roots);
+        self.field_cache.clear();
         self.record_collection(stats);
         stats
     }
