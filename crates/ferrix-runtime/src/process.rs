@@ -2,7 +2,11 @@
 
 use std::{fmt, path::PathBuf};
 
-use crate::{RuntimeProfile, RuntimeStats, event::timestamp_ms};
+use crate::{
+    RuntimeProfile, RuntimeStats,
+    event::timestamp_ms,
+    middleware::{RuntimeCorrelationId, RuntimeRequestId},
+};
 
 /// Runtime-owned process id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -106,6 +110,10 @@ impl RuntimeProcessStatus {
 pub struct RuntimeProcessRecord {
     /// Runtime process id.
     pub id: RuntimeProcessId,
+    /// Middleware request id that created this process.
+    pub request_id: RuntimeRequestId,
+    /// Correlation id shared by logs, audit events, and metrics.
+    pub correlation_id: RuntimeCorrelationId,
     /// Optional parent process id.
     pub parent_id: Option<RuntimeProcessId>,
     /// Runtime session id.
@@ -144,6 +152,8 @@ impl RuntimeProcessRecord {
     ) -> Self {
         Self {
             id,
+            request_id: RuntimeRequestId(id.0),
+            correlation_id: RuntimeCorrelationId(session_id.0),
             parent_id: None,
             session_id,
             status: RuntimeProcessStatus::Starting,
