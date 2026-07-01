@@ -7,18 +7,65 @@ use ferrix_core::{
     Obj, Value,
     bytecode::{FunctionId, Program},
 };
-use ferrix_vm::{NativeContext, Vm, VmError, VmErrorKind};
+use ferrix_vm::{HostCapability, NativeContext, Vm, VmError, VmErrorKind};
 
 /// Signature implemented by every Ferrix native standard-library function.
 pub type NativeCall = for<'vm> fn(&mut NativeContext<'vm>, &[Value]) -> Result<Value, VmError>;
+
+/// Value shape declared by a native host function contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostValueType {
+    /// Any Ferrix value is accepted.
+    Any,
+    /// Native returns no meaningful value.
+    Nil,
+    /// Native returns an integer.
+    Int,
+    /// Native returns a heap string.
+    String,
+}
+
+/// Native host function scheduling class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCallKind {
+    /// Synchronous host call executed on the VM thread.
+    Sync,
+}
+
+/// Native function resource cost class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCostClass {
+    /// Cheap pure or near-pure helper.
+    Cheap,
+    /// Normal local host interaction.
+    Normal,
+    /// Potentially external host effect.
+    External,
+}
 
 /// Metadata and function pointer for one installable native binding.
 #[derive(Clone, Copy)]
 pub struct NativeBinding {
     /// Source-level function name, such as `print`.
     pub name: &'static str,
+    /// Stable namespaced registry name, such as `io.print`.
+    pub qualified_name: &'static str,
     /// Number of arguments expected by the native function.
     pub arity: u8,
+    /// Parameter contract used by runtime/tooling validation.
+    pub parameters: &'static [HostValueType],
+    /// Return value contract used by runtime/tooling validation.
+    pub returns: HostValueType,
+    /// Capabilities required before this binding may run.
+    pub required_capabilities: &'static [HostCapability],
+    /// Profiles where this binding is available by default.
+    pub available_profiles: &'static [&'static str],
+    /// Sync/async classification for runtime scheduling.
+    pub call_kind: HostCallKind,
+    /// Estimated host resource cost.
+    pub cost: HostCostClass,
+    /// Short documentation string for CLI/runtime inspection.
+    pub docs: &'static str,
     /// Host implementation called by the VM.
     pub call: NativeCall,
 }
@@ -33,17 +80,41 @@ pub struct InstallReport {
 const BINDINGS: &[NativeBinding] = &[
     NativeBinding {
         name: "print",
+        qualified_name: "io.print",
         arity: 1,
+        parameters: &[HostValueType::Any],
+        returns: HostValueType::Nil,
+        required_capabilities: &[HostCapability::NativeCall, HostCapability::IoOutput],
+        available_profiles: &["development", "cli", "server", "trusted"],
+        call_kind: HostCallKind::Sync,
+        cost: HostCostClass::External,
+        docs: "Writes one formatted value to the configured output sink.",
         call: print,
     },
     NativeBinding {
         name: "len",
+        qualified_name: "core.len",
         arity: 1,
+        parameters: &[HostValueType::Any],
+        returns: HostValueType::Int,
+        required_capabilities: &[HostCapability::NativeCall],
+        available_profiles: &["development", "cli", "server", "trusted"],
+        call_kind: HostCallKind::Sync,
+        cost: HostCostClass::Cheap,
+        docs: "Returns the length of a string, array, map, or record.",
         call: len,
     },
     NativeBinding {
         name: "type_of",
+        qualified_name: "core.type_of",
         arity: 1,
+        parameters: &[HostValueType::Any],
+        returns: HostValueType::String,
+        required_capabilities: &[HostCapability::NativeCall],
+        available_profiles: &["development", "cli", "server", "trusted"],
+        call_kind: HostCallKind::Sync,
+        cost: HostCostClass::Cheap,
+        docs: "Returns the runtime type name for one value.",
         call: type_of,
     },
 ];
@@ -55,6 +126,15 @@ pub fn bindings() -> &'static [NativeBinding] {
 
 /// Registers native implementations required by the given program.
 pub fn install(vm: &mut Vm, program: &Program) -> InstallReport {
+    install_with_filter(vm, program, |_| true)
+}
+
+/// Registers native implementations that pass the supplied binding filter.
+pub fn install_with_filter(
+    vm: &mut Vm,
+    program: &Program,
+    mut allow: impl FnMut(&NativeBinding) -> bool,
+) -> InstallReport {
     let mut registered = 0;
 
     for (index, function) in program.functions.iter().enumerate() {
@@ -64,6 +144,9 @@ pub fn install(vm: &mut Vm, program: &Program) -> InstallReport {
         let Some(binding) = find_binding(native_name, function.arity) else {
             continue;
         };
+        if !allow(binding) {
+            continue;
+        }
 
         vm.register_native_context_fn(FunctionId(index as u16), binding.call);
         registered += 1;
@@ -77,6 +160,33 @@ pub fn find_binding(name: &str, arity: u8) -> Option<&'static NativeBinding> {
     BINDINGS
         .iter()
         .find(|binding| binding.name == name && binding.arity == arity)
+}
+
+/// Validates static registry metadata before runtime execution.
+pub fn validate_registry() -> Result<(), String> {
+    for binding in BINDINGS {
+        if binding.parameters.len() != usize::from(binding.arity) {
+            return Err(format!(
+                "native binding `{}` declares arity {} but {} parameters",
+                binding.qualified_name,
+                binding.arity,
+                binding.parameters.len()
+            ));
+        }
+        if binding.required_capabilities.is_empty() {
+            return Err(format!(
+                "native binding `{}` declares no required capabilities",
+                binding.qualified_name
+            ));
+        }
+        if binding.available_profiles.is_empty() {
+            return Err(format!(
+                "native binding `{}` declares no profile availability",
+                binding.qualified_name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn print(ctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
