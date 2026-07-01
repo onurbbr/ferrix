@@ -5,7 +5,10 @@
 //! for tooling. Normal callers should prefer verified entry points such as
 //! [`Vm::run_program`]; unchecked methods are kept for low-level tests.
 
-use std::{collections::HashMap, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use ferrix_core::{
     Obj, ObjRef, Value,
@@ -16,8 +19,9 @@ use ferrix_core::{
 };
 
 use crate::{
-    DebugAction, DebugEvent, DebugOutcome, Debugger, GcStats, Heap, IncrementalGcPhase,
-    NativeContext, NullOutput, OutputWriter, RootSet, RuntimeLimits, TraceWriter,
+    DebugAction, DebugEvent, DebugOutcome, Debugger, GcStats, Heap, HostCapability,
+    IncrementalGcPhase, NativeContext, NullOutput, OutputWriter, RootSet, RuntimeLimits,
+    TraceWriter,
 };
 use crate::{VmError, VmErrorKind, VmStackFrame};
 
@@ -34,6 +38,8 @@ pub struct Vm {
     heap: Heap,
     gc_stats: VmGcStats,
     output: Box<dyn OutputWriter>,
+    capabilities: HashSet<HostCapability>,
+    audit_events: Vec<String>,
     native_functions: HashMap<FunctionId, Rc<NativeFunction>>,
     field_cache: HashMap<FieldCacheKey, usize>,
 }
@@ -110,6 +116,8 @@ impl Vm {
             heap: Heap::new(),
             gc_stats: VmGcStats::default(),
             output: Box::new(NullOutput),
+            capabilities: HashSet::new(),
+            audit_events: Vec::new(),
             native_functions: HashMap::new(),
             field_cache: HashMap::new(),
         }
@@ -190,6 +198,48 @@ impl Vm {
     /// Replaces the output sink used by native functions.
     pub fn set_output_writer(&mut self, output: impl OutputWriter + 'static) {
         self.output = Box::new(output);
+    }
+
+    /// Replaces the host capabilities granted to this VM.
+    pub fn set_capabilities(&mut self, capabilities: impl IntoIterator<Item = HostCapability>) {
+        self.capabilities = capabilities.into_iter().collect();
+    }
+
+    /// Grants one host capability to this VM.
+    pub fn grant_capability(&mut self, capability: HostCapability) {
+        self.capabilities.insert(capability);
+    }
+
+    /// Returns true when this VM has a host capability.
+    pub fn has_capability(&self, capability: HostCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    /// Requires a capability and emits an audit event when denied.
+    pub fn require_capability(
+        &mut self,
+        capability: HostCapability,
+        operation: &'static str,
+    ) -> Result<(), VmError> {
+        if self.has_capability(capability) {
+            return Ok(());
+        }
+        self.audit_events.push(format!(
+            "capability_denied capability={} operation={operation}",
+            capability.as_str()
+        ));
+        Err(VmError::new(
+            None,
+            VmErrorKind::CapabilityDenied {
+                capability,
+                operation,
+            },
+        ))
+    }
+
+    /// Returns audit events captured during VM execution.
+    pub fn audit_events(&self) -> &[String] {
+        &self.audit_events
     }
 
     /// Writes one line through the configured output sink.
@@ -1062,6 +1112,13 @@ impl Vm {
                 Ok(true)
             }
             FunctionKind::Native { .. } => {
+                self.require_capability(HostCapability::NativeCall, "call native function")
+                    .map_err(|mut err| {
+                        if err.instruction_ip.is_none() {
+                            err.instruction_ip = Some(ip);
+                        }
+                        err
+                    })?;
                 let native = self
                     .native_functions
                     .get(&function_id)
